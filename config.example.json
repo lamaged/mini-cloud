@@ -1,0 +1,34 @@
+{
+    "server": {
+        "listen": ":8088",
+        "username": "admin",
+        "password": "请修改为你的密码"
+    },
+    "clouds": [
+        {
+            "name": "天翼个人",
+            "type": "tianyi",
+            "username": "手机号",
+            "password": "密码"
+        },
+        {
+            "name": "天翼家庭",
+            "type": "tianyi",
+            "username": "手机号",
+            "password": "密码",
+            "family_id": "家庭云ID（可选，不填则为个人云）"
+        },
+        {
+            "name": "移动云盘",
+            "type": "mobile",
+            "authorization": "Base64编码的认证令牌，从alist等工具获取"
+        },
+        {
+            "name": "百度网盘",
+            "type": "baidu",
+            "refresh_token": "从百度OAuth获取的refresh_token",
+            "client_id": "（可选）百度OAuth client_id，不填使用内置默认值",
+            "client_secret": "（可选）百度OAuth client_secret，不填使用内置默认值"
+        }
+    ]
+}
