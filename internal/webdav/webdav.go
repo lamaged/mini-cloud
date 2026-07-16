@@ -26,6 +26,15 @@ type Reader interface {
 	Link(ctx context.Context, path string) (*model.Link, error)
 }
 
+// Close 释放底层资源（如后台 goroutine）。如果 Driver 不支持则无操作。
+func (h *Handler) Close() error {
+	type stopper interface{ Stop() }
+	if s, ok := h.Driver.(stopper); ok {
+		s.Stop()
+	}
+	return nil
+}
+
 // ServeHTTP 实现 http.Handler
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	slog.Debug("WebDAV request", "method", r.Method, "path", r.URL.Path, "user-agent", r.Header.Get("User-Agent"))

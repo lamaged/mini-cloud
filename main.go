@@ -99,12 +99,14 @@ func main() {
 	})
 
 	// 每个云盘注册到 /<prefix>/
+	var davHandlers []*webdav.Handler
 	for i := range mounts {
 		m := &mounts[i]
 		davHandler := &webdav.Handler{
 			Driver: fs.NewCachedReader(fs.NewRetryReader(m.Drv)),
 			Prefix: m.Prefix,
 		}
+		davHandlers = append(davHandlers, davHandler)
 		// 注册 /<prefix>/ 及其子路径
 		mux.HandleFunc(m.Prefix+"/", func(w http.ResponseWriter, r *http.Request) {
 			if !checkAuth(r, cfg.Server.Username, cfg.Server.Password) {
@@ -136,6 +138,11 @@ func main() {
 	if err := server.ListenAndServe(); err != http.ErrServerClosed {
 		slog.Error("服务异常退出", "err", err)
 		os.Exit(1)
+	}
+
+	// 服务停止后清理资源（缓存后台 goroutine 等）
+	for _, h := range davHandlers {
+		h.Close()
 	}
 	slog.Info("服务已停止")
 }

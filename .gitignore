@@ -15,6 +15,9 @@ mini-cloud-arm64-upx
 # 本地开发环境脚本
 env.sh
 
+# Claude Code
+.claude/
+
 # Go build artifacts
 *.exe
 *.test

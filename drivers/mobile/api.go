@@ -162,7 +162,9 @@ func (c *Client) personalRequest(pathname string, body interface{}, result inter
 		// 检测 401/认证失败 → 自动刷新 Token 并重试
 		if c.onAuthFailed != nil && isAuthError(base.Code, base.Message) {
 			if refreshErr := c.onAuthFailed(); refreshErr == nil {
-				// 更新 Authorization header 后重试
+				// 重建请求体（第一次 Do 已消耗 body），然后重试
+				req.Body = io.NopCloser(strings.NewReader(string(bodyBytes)))
+				req.ContentLength = int64(len(bodyBytes))
 				req.Header.Set("Authorization", "Basic "+c.authorization)
 				resp2, retryErr := c.httpClient.Do(req)
 				if retryErr == nil {

@@ -344,21 +344,10 @@ func (d *Driver) listFolder(ctx context.Context, folderID string) ([]model.Obj, 
 	return objs, nil
 }
 
-// listRawFolder 列出文件夹原始数据（返回 API 原始响应）
+// listRawFolder 列出文件夹原始数据（返回 API 原始响应，自动处理分页）
 func (d *Driver) listRawFolder(ctx context.Context, folderID string) (*Cloud189FilesResp, error) {
-	var result Cloud189FilesResp
-
-	params := Params{
-		"folderId":   folderID,
-		"fileType":   "0",
-		"mediaAttr":  "0",
-		"iconOption": "5",
-		"pageNum":    "1",
-		"pageSize":   "1000",
-		"recursive":  "0",
-		"orderBy":    "filename",
-		"descending": "false",
-	}
+	const pageSize = 1000
+	var merged Cloud189FilesResp
 
 	fullUrl := API_URL
 	if d.isFamily() {
@@ -366,17 +355,44 @@ func (d *Driver) listRawFolder(ctx context.Context, folderID string) (*Cloud189F
 	}
 	fullUrl += "/listFiles.action"
 
-	if d.isFamily() {
-		params.Set("familyId", d.familyID)
-		params.Set("orderBy", "1")
-		params.Set("descending", "false")
-	}
-	_, err := d.client.apiRequestEx("GET", fullUrl, params, &result, d.isFamily())
-	if err != nil {
-		return nil, err
+	for pageNum := 1; ; pageNum++ {
+		params := Params{
+			"folderId":   folderID,
+			"fileType":   "0",
+			"mediaAttr":  "0",
+			"iconOption": "5",
+			"pageNum":    fmt.Sprintf("%d", pageNum),
+			"pageSize":   fmt.Sprintf("%d", pageSize),
+			"recursive":  "0",
+			"orderBy":    "filename",
+			"descending": "false",
+		}
+
+		if d.isFamily() {
+			params.Set("familyId", d.familyID)
+			params.Set("orderBy", "1")
+			params.Set("descending", "false")
+		}
+
+		var result Cloud189FilesResp
+		_, err := d.client.apiRequestEx("GET", fullUrl, params, &result, d.isFamily())
+		if err != nil {
+			return nil, err
+		}
+
+		merged.FileListAO.FolderList = append(merged.FileListAO.FolderList, result.FileListAO.FolderList...)
+		merged.FileListAO.FileList = append(merged.FileListAO.FileList, result.FileListAO.FileList...)
+		merged.FileListAO.Count = result.FileListAO.Count // 每页返回相同的总数
+
+		// 判断是否还有下一页：当前页条目数不足 pageSize 或累积数量已达总数
+		thisPageItems := len(result.FileListAO.FolderList) + len(result.FileListAO.FileList)
+		totalItems := len(merged.FileListAO.FolderList) + len(merged.FileListAO.FileList)
+		if thisPageItems < pageSize || totalItems >= result.FileListAO.Count {
+			break
+		}
 	}
 
-	return &result, nil
+	return &merged, nil
 }
 
 // ============================================================
