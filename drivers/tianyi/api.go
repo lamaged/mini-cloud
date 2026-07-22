@@ -13,6 +13,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io"
+	"log/slog"
 	"math/big"
 	"net/http"
 	"net/url"
@@ -244,6 +245,11 @@ func (c *Client) apiRequest(method, fullUrl string, params Params, result interf
 
 // apiRequestEx 可指定 family 参数的签名请求
 func (c *Client) apiRequestEx(method, fullUrl string, params Params, result interface{}, family bool) ([]byte, error) {
+	return c.apiRequestExWithRetry(method, fullUrl, params, result, family, true)
+}
+
+// apiRequestExWithRetry 内部实现，allowRetry 控制是否允许 401 自动重试（防止无限递归）
+func (c *Client) apiRequestExWithRetry(method, fullUrl string, params Params, result interface{}, family bool, allowRetry bool) ([]byte, error) {
 	// 构建查询参数：公共参数 + 业务参数（明文，不加密）
 	queryParams := clientSuffix()
 	for k, v := range params {
@@ -273,13 +279,16 @@ func (c *Client) apiRequestEx(method, fullUrl string, params Params, result inte
 		return nil, err
 	}
 
-	// 检查是否需要刷新会话 → 自动刷新并重试一次
-	if strings.Contains(string(body), "userSessionBO is null") ||
-		strings.Contains(string(body), "InvalidSessionKey") {
+	// 检查是否需要刷新会话 → 自动刷新并重试一次（仅一次）
+	if allowRetry && (strings.Contains(string(body), "userSessionBO is null") ||
+		strings.Contains(string(body), "InvalidSessionKey") ||
+		strings.Contains(string(body), "FamilySessionKey") ||
+		strings.Contains(string(body), "familySession")) {
 		if c.onAuthFailed != nil {
+			slog.Info("天翼云盘 session 过期，自动刷新", "family", family, "body_preview", string(body)[:min(len(body), 200)])
 			if err := c.onAuthFailed(); err == nil {
-				// 刷新成功，重试请求（递归一次）
-				return c.apiRequestEx(method, fullUrl, params, result, family)
+				// 刷新成功，重试请求（仅一次，不再递归）
+				return c.apiRequestExWithRetry(method, fullUrl, params, result, family, false)
 			}
 		}
 		return nil, &sessionExpiredError{msg: "session expired"}

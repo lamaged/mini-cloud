@@ -47,9 +47,17 @@ TV / Nova Player / 网易爆米花 / Infuse
 
 | 驱动 | 策略 | 说明 |
 |------|------|------|
-| **天翼** | 被动响应 | API 返回 session 过期时触发刷新，无后台定时器（与 alist 一致） |
+| **天翼** | 被动响应 | API 返回 session 过期时触发刷新，**含家庭云 session 同步更新**；重试上限 1 次防死循环 |
 | **移动** | 被动响应 | 收到 401 时触发 token 刷新，token 有效期约 30 天 |
 | **百度** | 主动 + 被动 | OAuth2 access_token 过期前 5 分钟主动刷新 + 运行时 401 自动重试 |
+
+### 变更记录
+
+#### v0.5.1 (2026-07-22)
+
+- **修复** 天翼家庭云 session 过期后无法恢复的问题：`refreshSession()` 现在同步更新个人云和家庭云 session key；API 重试上限 1 次防止无限递归
+- **增强** 天翼云 API 错误检测：新增 `FamilySessionKey`、`familySession` 等家庭云专用过期标志的检测
+- **增强** 家庭云诊断日志：配置了 `family_id` 但未获取到 familySessionKey 时输出警告
 
 ## 快速开始
 

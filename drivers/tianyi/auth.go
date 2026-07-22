@@ -202,7 +202,14 @@ func (c *Client) refreshSession() error {
 		// 更新会话，但保留原有的 AccessToken 和 RefreshToken
 		c.sessionKey = tokenInfo.SessionKey
 		c.sessionSecret = tokenInfo.SessionSecret
-		slog.Info("会话刷新成功")
+		// 同时更新家庭云会话（如果 API 返回了）
+		if tokenInfo.FamilySessionKey != "" {
+			c.familySessionKey = tokenInfo.FamilySessionKey
+			c.familySessionSecret = tokenInfo.FamilySessionSecret
+			slog.Info("会话刷新成功（含家庭云）")
+		} else {
+			slog.Info("会话刷新成功")
+		}
 		return nil
 	}
 

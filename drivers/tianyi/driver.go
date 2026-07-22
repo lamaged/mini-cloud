@@ -74,6 +74,9 @@ func (d *Driver) Init(ctx context.Context) error {
 		if token.FamilyID != "" && token.FamilySessionKey != "" {
 			d.client.SetFamilySession(token.FamilySessionKey, token.FamilySessionSecret)
 			d.familyID = token.FamilyID
+			slog.Info("已恢复家庭云会话", "familyID", token.FamilyID)
+		} else if d.isFamily() {
+			slog.Warn("配置了 family_id 但缓存中没有家庭云会话，将在登录后重新获取")
 		}
 
 		// 尝试用现有会话请求（触发自动刷新）
@@ -98,6 +101,10 @@ func (d *Driver) Init(ctx context.Context) error {
 	token = NewTokenState(d.client.sessionKey, d.client.sessionSecret, d.client.accessToken, d.client.refreshToken, d.familyID, d.client.familySessionKey, d.client.familySessionSecret, "")
 	if err := SaveToken(d.name, d.stateDir, token); err != nil {
 		slog.Warn("保存 token 失败", "err", err)
+	}
+
+	if d.isFamily() && d.client.familySessionKey == "" {
+		slog.Warn("家庭云登录成功但未获取到 familySessionKey，家庭云功能可能不可用")
 	}
 
 	return nil
