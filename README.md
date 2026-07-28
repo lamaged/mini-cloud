@@ -179,10 +179,10 @@ nohup ./mini-cloud -config /data/mini-cloud/config/config.json > /data/mini-clou
 
 已验证的设备/播放器：
 
-- 📺 智能电视 (Android TV)
+- 路由器红米AX6
 - 🎬 Nova Player
 - 🍿 网易爆米花 (VidxPlayer)
-- 🖥️ Edge 浏览器（调试用）
+- 🖥️ Edge 浏览器
 
 ### 支持的 HTTP 方法
 
