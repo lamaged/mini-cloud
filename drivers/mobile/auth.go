@@ -19,30 +19,56 @@ import (
 // Token 刷新
 // ============================================================
 
-// refreshToken 刷新 Authorization Token
-func (c *Client) refreshToken() error {
-	decode, err := base64.StdEncoding.DecodeString(c.authorization)
+// parseAuthString 解析 Authorization 字符串（独立函数，便于比较不同 token）
+// 返回类型、账号、token 部分、过期时间（毫秒时间戳，token 第 4 个字段）
+func parseAuthString(authorization string) (tokenType, account, tokenPart string, expirationMillis int64, err error) {
+	decode, err := base64.StdEncoding.DecodeString(authorization)
 	if err != nil {
-		return fmt.Errorf("authorization decode failed: %w", err)
+		return "", "", "", 0, fmt.Errorf("authorization decode failed: %w", err)
 	}
-	decodeStr := string(decode)
-	parts := strings.Split(decodeStr, ":")
+	parts := strings.Split(string(decode), ":")
 	if len(parts) < 3 {
-		return fmt.Errorf("invalid authorization format, expected: type:account:token")
+		return "", "", "", 0, fmt.Errorf("invalid authorization format, expected: type:account:token")
 	}
 
-	c.account = parts[1]
-	tokenPart := parts[2]
+	tokenType = parts[0]
+	account = parts[1]
+	tokenPart = parts[2]
 	tokenFields := strings.Split(tokenPart, "|")
 	if len(tokenFields) < 4 {
-		return fmt.Errorf("invalid token format, expected at least 4 fields")
+		return "", "", "", 0, fmt.Errorf("invalid token format, expected at least 4 fields")
 	}
 
-	// 检查过期时间（第4个字段是毫秒时间戳）
-	expiration, err := strconv.ParseInt(tokenFields[3], 10, 64)
+	expirationMillis, err = strconv.ParseInt(tokenFields[3], 10, 64)
 	if err != nil {
-		return fmt.Errorf("invalid expiration: %w", err)
+		return "", "", "", 0, fmt.Errorf("invalid expiration: %w", err)
 	}
+	return tokenType, account, tokenPart, expirationMillis, nil
+}
+
+// parseAuthorization 解析当前 Client 的 Authorization
+func (c *Client) parseAuthorization() (tokenType, account, tokenPart string, expirationMillis int64, err error) {
+	return parseAuthString(c.authorization)
+}
+
+// needRefresh 判断 token 是否需要刷新（临近过期或已过期）
+// 解析失败时返回 true，视为需要刷新以便尽早暴露问题
+func (c *Client) needRefresh() bool {
+	_, _, _, expiration, err := c.parseAuthorization()
+	if err != nil {
+		return true
+	}
+	remaining := expiration - time.Now().UnixMilli()
+	return remaining < 1000*60*60*24*15
+}
+
+// refreshToken 刷新 Authorization Token
+func (c *Client) refreshToken() error {
+	tokenType, account, tokenPart, expiration, err := c.parseAuthorization()
+	if err != nil {
+		return err
+	}
+	c.account = account
 
 	remaining := expiration - time.Now().UnixMilli()
 	if remaining > 1000*60*60*24*15 {
@@ -51,7 +77,10 @@ func (c *Client) refreshToken() error {
 		return nil
 	}
 	if remaining < 0 {
-		return fmt.Errorf("authorization has expired, please update it")
+		// 已过期仍尝试刷新：服务端可能在宽限期内仍接受旧 token
+		slog.Warn("移动云盘 token 已过期，仍尝试刷新", "expired_days", -remaining/(1000*60*60*24))
+	} else {
+		slog.Info("移动云盘 token 临近过期，刷新", "remaining_days", remaining/(1000*60*60*24))
 	}
 
 	// 刷新 token
@@ -78,20 +107,21 @@ func (c *Client) refreshToken() error {
 
 	var refreshResp RefreshTokenResp
 	if err := xml.Unmarshal(body, &refreshResp); err != nil {
-		slog.Warn("移动云盘 token 刷新 XML 解析失败", "err", err)
-		return nil // 不阻塞启动
+		return fmt.Errorf("token refresh XML 解析失败: %w", err)
 	}
 
 	if refreshResp.Return == "0" && refreshResp.Token != "" {
-		c.authorization = base64.StdEncoding.EncodeToString([]byte(parts[0] + ":" + parts[1] + ":" + refreshResp.Token))
+		c.authorization = base64.StdEncoding.EncodeToString([]byte(tokenType + ":" + account + ":" + refreshResp.Token))
 		slog.Info("移动云盘 token 刷新成功")
 		return nil
 	}
 
-	if refreshResp.Desc != "" {
-		slog.Warn("移动云盘 token 刷新失败", "desc", refreshResp.Desc)
+	// 刷新失败：返回错误，让调用方决定如何处理
+	desc := refreshResp.Desc
+	if desc == "" {
+		desc = "return=" + refreshResp.Return
 	}
-	return nil
+	return fmt.Errorf("移动云盘 token 刷新失败: %s", desc)
 }
 
 // ============================================================

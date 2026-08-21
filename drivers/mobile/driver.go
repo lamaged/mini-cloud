@@ -48,38 +48,56 @@ func (d *Driver) Init(ctx context.Context) error {
 		return fmt.Errorf("移动云盘需要配置 authorization（Base64 编码的认证令牌）")
 	}
 
-	// 尝试从持久化状态恢复
-	token, err := LoadToken(d.name, d.stateDir)
-	if err == nil && token != nil {
-		slog.Info("从缓存恢复移动云盘会话", "account", token.Account)
-		d.client.SetAuth(token.Authorization, token.Account, token.CloudHost)
-		d.authorization = token.Authorization
-
-		// 检查主机是否仍然可用
-		if token.CloudHost != "" {
-			return nil
-		}
-	}
-
-	// 设置认证信息
-	d.client.SetAuth(d.authorization, "", "")
-
-	// 设置 401 自动刷新回调（运行时安全网）
+	// 设置 401 自动刷新回调（必须在任何 early return 之前，确保运行时安全网始终生效）
 	d.client.SetAuthRefreshCallback(func() error {
 		slog.Info("移动云盘 401，触发 Token 刷新")
 		if err := d.client.refreshToken(); err != nil {
 			return err
 		}
-		// 更新持久化状态
-		token := &TokenState{
-			Authorization: d.client.authorization,
-			Account:       d.client.account,
-			CloudHost:     d.client.cloudHost,
-			ExpiresAt:     time.Now().Unix() + 86400*30,
-		}
-		SaveToken(d.name, d.stateDir, token)
+		d.saveTokenState()
 		return nil
 	})
+
+	// 尝试从持久化状态恢复
+	token, err := LoadToken(d.name, d.stateDir)
+	if err == nil && token != nil {
+		// 比较 config 与缓存的 token 过期时间，选择更晚（更新）的：
+		// - 用户手动更新 config → config token 更新 → 用 config，丢弃缓存
+		// - 服务自动刷新 → 缓存 token 更新 → 用缓存
+		useCache := true
+		if token.Authorization != d.authorization {
+			_, _, _, cacheExp, _ := parseAuthString(token.Authorization)
+			_, _, _, configExp, _ := parseAuthString(d.authorization)
+			if configExp > cacheExp {
+				useCache = false
+			}
+		}
+
+		if useCache {
+			slog.Info("从缓存恢复移动云盘会话", "account", token.Account)
+			d.client.SetAuth(token.Authorization, token.Account, token.CloudHost)
+			d.authorization = token.Authorization
+
+			// 检查主机是否仍然可用
+			if token.CloudHost != "" {
+				// 检查 token 是否临近过期/已过期，若是则启动时刷新
+				if d.client.needRefresh() {
+					slog.Info("缓存 token 临近过期或已过期，启动时刷新")
+					if refreshErr := d.client.refreshToken(); refreshErr != nil {
+						slog.Warn("缓存 token 刷新失败，将使用现有 token（运行时 401 会再次尝试）", "err", refreshErr)
+					} else {
+						d.saveTokenState()
+					}
+				}
+				return nil
+			}
+		} else {
+			slog.Info("config 的 authorization 比缓存更新，使用 config token")
+		}
+	}
+
+	// 设置认证信息
+	d.client.SetAuth(d.authorization, "", "")
 
 	// 刷新 Token（如果需要）
 	if err := d.client.refreshToken(); err != nil {
@@ -91,18 +109,25 @@ func (d *Driver) Init(ctx context.Context) error {
 		return fmt.Errorf("发现云主机失败: %w", err)
 	}
 
-	// 保存状态
-	token = &TokenState{
+	d.saveTokenState()
+	return nil
+}
+
+// saveTokenState 保存当前认证状态到磁盘（过期时间从 Authorization 真实提取）
+func (d *Driver) saveTokenState() {
+	expiresAt := time.Now().Unix() + 86400*30 // 兜底值
+	if _, _, _, expiration, err := d.client.parseAuthorization(); err == nil {
+		expiresAt = expiration / 1000
+	}
+	token := &TokenState{
 		Authorization: d.client.authorization,
 		Account:       d.client.account,
 		CloudHost:     d.client.cloudHost,
-		ExpiresAt:     time.Now().Unix() + 86400*30,
+		ExpiresAt:     expiresAt,
 	}
 	if err := SaveToken(d.name, d.stateDir, token); err != nil {
 		slog.Warn("保存 token 失败", "err", err)
 	}
-
-	return nil
 }
 
 // ============================================================
