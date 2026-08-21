@@ -53,7 +53,7 @@ TV / Nova Player / 网易爆米花 / Infuse
 
 ### 变更记录
 
-#### v0.5.2 (2026-08-21)
+#### v0.9.1 (2026-08-21)
 
 - **修复** 移动云盘 token 过期后无法自动恢复的问题：
   - `Init()` 的 401 自动刷新回调之前被放在缓存恢复块之后，存在有效缓存时提前 return 导致回调**从未注册**，运行时 401 无法自救；现已前置到任何 early return 之前
@@ -157,8 +157,10 @@ TV / Nova Player / 网易爆米花 / Infuse
 # 本地开发
 ./mini-cloud -config config.json
 
-# 路由器后台运行
-nohup ./mini-cloud -config /data/mini-cloud/config/config.json > /data/mini-cloud/mini-cloud.log 2>&1 &
+# 红米AX6路由器后台运行
+    cd /data/mini-cloud
+    ./mini-cloud-arm64-upx -config /data/mini-cloud/config/config.json \
+    >> /dev/null 2>&1 &
 
 # 调试模式
 ./mini-cloud -config config.json -debug
