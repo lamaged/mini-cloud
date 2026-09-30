@@ -212,6 +212,29 @@ func checkAuth(r *http.Request, username, password string) bool {
 // 根索引页
 // ============================================================
 
+// cloudDisplayNames 驱动类型到中文显示名的映射
+var cloudDisplayNames = map[string]string{
+	"local":  "本地文件",
+	"tianyi": "天翼云盘",
+	"mobile": "移动云盘",
+	"baidu":  "百度网盘",
+}
+
+// displayName 返回云盘在导航/索引页的显示名。
+// 若驱动报告健康警告（如移动云盘 authorization 过期），则用警告文本覆盖显示名。
+func displayName(m mountedDriver) string {
+	label := cloudDisplayNames[m.Name]
+	if label == "" {
+		label = m.Name
+	}
+	if hr, ok := m.Drv.(driver.HealthReporter); ok {
+		if w := hr.HealthWarning(); w != "" {
+			return w
+		}
+	}
+	return label
+}
+
 // serveRootPropfind 为根路径生成 WebDAV PROPFIND 响应（列出所有云盘作为虚拟目录）
 func serveRootPropfind(w http.ResponseWriter, r *http.Request, mounts []mountedDriver) {
 	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
@@ -243,7 +266,7 @@ func serveRootPropfind(w http.ResponseWriter, r *http.Request, mounts []mountedD
 </D:prop>
 <D:status>HTTP/1.1 200 OK</D:status>
 </D:propstat>
-</D:response>`, m.Prefix, m.Name)
+</D:response>`, m.Prefix, displayName(m))
 	}
 
 	fmt.Fprint(w, "\n</D:multistatus>")
@@ -265,19 +288,8 @@ h1{font-size:22px;border-bottom:2px solid #0366d6;padding-bottom:10px}
 <p>已挂载 %d 个云盘：</p>
 `, len(mounts))
 
-	// 云盘中文名称映射
-	names := map[string]string{
-		"local":  "本地文件",
-		"tianyi": "天翼云盘",
-		"mobile": "移动云盘",
-			"baidu":  "百度网盘",
-	}
-
 	for _, m := range mounts {
-		label := names[m.Name]
-		if label == "" {
-			label = m.Name
-		}
+		label := displayName(m)
 		fmt.Fprintf(w, `<a class="card" href="%s/">
 <div class="name">%s</div>
 <div class="desc">%s</div>

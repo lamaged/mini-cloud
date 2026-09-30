@@ -32,3 +32,9 @@ type TokenManager interface {
 	// RefreshToken 刷新 Token
 	RefreshToken(ctx context.Context) error
 }
+
+// HealthReporter 健康报告（可选接口，云盘驱动可实现此接口向上层展示异常提示）
+type HealthReporter interface {
+	// HealthWarning 返回需要展示给用户的提示信息；空字符串表示正常
+	HealthWarning() string
+}

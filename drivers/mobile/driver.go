@@ -42,6 +42,14 @@ func (d *Driver) Name() string {
 	return "mobile"
 }
 
+// HealthWarning 返回健康提示：authorization 过期时提示用户更新
+func (d *Driver) HealthWarning() string {
+	if d.client.isExpired() {
+		return "移动云盘authorization已经过期，请更新"
+	}
+	return ""
+}
+
 // Init 初始化：设置认证、发现主机、刷新 Token
 func (d *Driver) Init(ctx context.Context) error {
 	if d.authorization == "" {
@@ -135,6 +143,11 @@ func (d *Driver) saveTokenState() {
 // ============================================================
 
 func (d *Driver) List(ctx context.Context, reqPath string) ([]model.Obj, error) {
+	if d.client.isExpired() {
+		// authorization 已过期：返回空目录，避免 500，由 HealthWarning 提示用户
+		return nil, nil
+	}
+
 	folderID, err := d.resolveFolderID(ctx, reqPath)
 	if err != nil {
 		return nil, err
@@ -197,6 +210,10 @@ func (d *Driver) resolveByWalk(ctx context.Context, parentID string, parts []str
 // ============================================================
 
 func (d *Driver) Link(ctx context.Context, filePath string) (*model.Link, error) {
+	if d.client.isExpired() {
+		return nil, fmt.Errorf("移动云盘 authorization 已过期，请更新 config.json")
+	}
+
 	parentPath := path.Dir(filePath)
 	fileName := path.Base(filePath)
 
@@ -341,3 +358,4 @@ func parseTime(s string) time.Time {
 }
 
 var _ driver.Driver = (*Driver)(nil)
+var _ driver.HealthReporter = (*Driver)(nil)

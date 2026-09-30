@@ -62,6 +62,16 @@ func (c *Client) needRefresh() bool {
 	return remaining < 1000*60*60*24*15
 }
 
+// isExpired 判断 token 是否已过期/无效
+// 解析失败或过期时间不晚于当前时间均视为过期
+func (c *Client) isExpired() bool {
+	_, _, _, expiration, err := c.parseAuthorization()
+	if err != nil {
+		return true
+	}
+	return expiration <= time.Now().UnixMilli()
+}
+
 // refreshToken 刷新 Authorization Token
 func (c *Client) refreshToken() error {
 	tokenType, account, tokenPart, expiration, err := c.parseAuthorization()
