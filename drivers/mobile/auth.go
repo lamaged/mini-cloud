@@ -48,7 +48,7 @@ func parseAuthString(authorization string) (tokenType, account, tokenPart string
 
 // parseAuthorization 解析当前 Client 的 Authorization
 func (c *Client) parseAuthorization() (tokenType, account, tokenPart string, expirationMillis int64, err error) {
-	return parseAuthString(c.authorization)
+	return parseAuthString(c.getAuthorization())
 }
 
 // needRefresh 判断 token 是否需要刷新（临近过期或已过期）
@@ -78,7 +78,7 @@ func (c *Client) refreshToken() error {
 	if err != nil {
 		return err
 	}
-	c.account = account
+	c.setAccount(account)
 
 	remaining := expiration - time.Now().UnixMilli()
 	if remaining > 1000*60*60*24*15 {
@@ -96,7 +96,7 @@ func (c *Client) refreshToken() error {
 	// 刷新 token
 	url := "https://aas.caiyun.feixin.10086.cn:443/tellin/authTokenRefresh.do"
 	reqBody := fmt.Sprintf("<root><token>%s</token><account>%s</account><clienttype>656</clienttype></root>",
-		tokenPart, c.account)
+		tokenPart, account)
 
 	req, err := http.NewRequest("POST", url, strings.NewReader(reqBody))
 	if err != nil {
@@ -121,7 +121,7 @@ func (c *Client) refreshToken() error {
 	}
 
 	if refreshResp.Return == "0" && refreshResp.Token != "" {
-		c.authorization = base64.StdEncoding.EncodeToString([]byte(tokenType + ":" + account + ":" + refreshResp.Token))
+		c.setAuthorization(base64.StdEncoding.EncodeToString([]byte(tokenType + ":" + account + ":" + refreshResp.Token)))
 		slog.Info("移动云盘 token 刷新成功")
 		return nil
 	}
@@ -140,9 +140,9 @@ func (c *Client) refreshToken() error {
 
 // discoverCloudHost 发现个人云 API 主机地址
 func (c *Client) discoverCloudHost() error {
-	if c.account == "" {
+	if c.getAccount() == "" {
 		// 从 authorization 解析 account
-		decode, err := base64.StdEncoding.DecodeString(c.authorization)
+		decode, err := base64.StdEncoding.DecodeString(c.getAuthorization())
 		if err != nil {
 			return fmt.Errorf("decode authorization failed: %w", err)
 		}
@@ -150,7 +150,7 @@ func (c *Client) discoverCloudHost() error {
 		if len(parts) < 2 {
 			return fmt.Errorf("invalid authorization")
 		}
-		c.account = parts[1]
+		c.setAccount(parts[1])
 	}
 
 	resp, err := c.requestRoute()
@@ -160,8 +160,9 @@ func (c *Client) discoverCloudHost() error {
 
 	for _, policy := range resp.Data.RoutePolicyList {
 		if policy.ModName == "personal" && policy.HttpsUrl != "" {
-			c.cloudHost = strings.TrimRight(policy.HttpsUrl, "/")
-			slog.Info("移动云盘主机发现成功", "host", c.cloudHost)
+			cloudHost := strings.TrimRight(policy.HttpsUrl, "/")
+			c.setCloudHost(cloudHost)
+			slog.Info("移动云盘主机发现成功", "host", cloudHost)
 			return nil
 		}
 	}

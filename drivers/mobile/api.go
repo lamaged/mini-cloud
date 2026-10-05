@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -68,9 +69,10 @@ func randomString(n int) string {
 // Client 移动云盘 API 客户端
 type Client struct {
 	httpClient    *http.Client
-	authorization string   // Base64 编码的认证令牌
-	account       string   // 账号
-	cloudHost     string   // 个人云 API 主机地址
+	mu            sync.RWMutex // 保护 authorization/account/cloudHost
+	authorization string       // Base64 编码的认证令牌
+	account       string       // 账号
+	cloudHost     string       // 个人云 API 主机地址
 	onAuthFailed  func() error // 401 回调：刷新 token 并更新 authorization
 }
 
@@ -83,9 +85,47 @@ func NewClient() *Client {
 
 // SetAuth 设置认证信息
 func (c *Client) SetAuth(authorization, account, cloudHost string) {
+	c.mu.Lock()
 	c.authorization = authorization
 	c.account = account
 	c.cloudHost = cloudHost
+	c.mu.Unlock()
+}
+
+func (c *Client) getAuthorization() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.authorization
+}
+
+func (c *Client) setAuthorization(authorization string) {
+	c.mu.Lock()
+	c.authorization = authorization
+	c.mu.Unlock()
+}
+
+func (c *Client) getAccount() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.account
+}
+
+func (c *Client) setAccount(account string) {
+	c.mu.Lock()
+	c.account = account
+	c.mu.Unlock()
+}
+
+func (c *Client) getCloudHost() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.cloudHost
+}
+
+func (c *Client) setCloudHost(cloudHost string) {
+	c.mu.Lock()
+	c.cloudHost = cloudHost
+	c.mu.Unlock()
 }
 
 // SetAuthRefreshCallback 设置 401 时的自动刷新回调
@@ -99,11 +139,12 @@ func (c *Client) SetAuthRefreshCallback(cb func() error) {
 
 // personalRequest 发送个人云 API 请求（自动签名）
 func (c *Client) personalRequest(pathname string, body interface{}, result interface{}) ([]byte, error) {
-	if c.cloudHost == "" {
+	cloudHost := c.getCloudHost()
+	if cloudHost == "" {
 		return nil, fmt.Errorf("cloud host not set")
 	}
 
-	url := c.cloudHost + pathname
+	url := cloudHost + pathname
 	bodyBytes, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
@@ -120,7 +161,7 @@ func (c *Client) personalRequest(pathname string, body interface{}, result inter
 
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Content-Type", "application/json;charset=UTF-8")
-	req.Header.Set("Authorization", "Basic "+c.authorization)
+	req.Header.Set("Authorization", "Basic "+c.getAuthorization())
 	req.Header.Set("Caller", "web")
 	req.Header.Set("Cms-Device", "default")
 	req.Header.Set("Mcloud-Channel", "1000101")
@@ -165,7 +206,12 @@ func (c *Client) personalRequest(pathname string, body interface{}, result inter
 				// 重建请求体（第一次 Do 已消耗 body），然后重试
 				req.Body = io.NopCloser(strings.NewReader(string(bodyBytes)))
 				req.ContentLength = int64(len(bodyBytes))
-				req.Header.Set("Authorization", "Basic "+c.authorization)
+				req.Header.Set("Authorization", "Basic "+c.getAuthorization())
+				// 重算签名：ts/randStr 已更新，Mcloud-Sign 需重新计算
+				newRandStr := randomString(16)
+				newTs := time.Now().Format("2006-01-02 15:04:05")
+				newSign := calSign(string(bodyBytes), newTs, newRandStr)
+				req.Header.Set("Mcloud-Sign", fmt.Sprintf("%s,%s,%s", newTs, newRandStr, newSign))
 				resp2, retryErr := c.httpClient.Do(req)
 				if retryErr == nil {
 					defer resp2.Body.Close()
@@ -217,7 +263,7 @@ func (c *Client) requestRoute() (*QueryRoutePolicyResp, error) {
 		"userInfo": map[string]interface{}{
 			"userType":    1,
 			"accountType": 1,
-			"accountName": c.account,
+			"accountName": c.getAccount(),
 		},
 		"modAddrType": 1,
 	}
@@ -234,7 +280,7 @@ func (c *Client) requestRoute() (*QueryRoutePolicyResp, error) {
 
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Content-Type", "application/json;charset=UTF-8")
-	req.Header.Set("Authorization", "Basic "+c.authorization)
+	req.Header.Set("Authorization", "Basic "+c.getAuthorization())
 	req.Header.Set("Cms-Device", "default")
 	req.Header.Set("Mcloud-Channel", "1000101")
 	req.Header.Set("Mcloud-Client", "10701")

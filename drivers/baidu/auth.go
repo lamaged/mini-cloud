@@ -50,7 +50,7 @@ func (c *Client) refreshToken(refreshToken, clientID, clientSecret string) (stri
 		return "", "", 0, fmt.Errorf("empty access_token in response")
 	}
 
-	c.accessToken = result.AccessToken
+	c.SetAccessToken(result.AccessToken)
 	expiresIn := result.ExpiresIn
 	if expiresIn <= 0 {
 		expiresIn = 2592000 // 默认 30 天

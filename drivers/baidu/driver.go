@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"sync"
 	"time"
 
 	"mini-cloud/internal/driver"
@@ -16,6 +17,7 @@ import (
 // Driver 百度网盘驱动
 type Driver struct {
 	name         string
+	mu           sync.RWMutex // 保护 refreshToken
 	refreshToken string
 	clientID     string
 	clientSecret string
@@ -46,25 +48,41 @@ func (d *Driver) Name() string {
 	return "baidu"
 }
 
+// getRefreshToken 线程安全地读取 refresh_token
+func (d *Driver) getRefreshToken() string {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.refreshToken
+}
+
+// setRefreshToken 线程安全地设置 refresh_token
+func (d *Driver) setRefreshToken(t string) {
+	d.mu.Lock()
+	d.refreshToken = t
+	d.mu.Unlock()
+}
+
 // Init 初始化：刷新 token 或从缓存恢复
 func (d *Driver) Init(ctx context.Context) error {
-	if d.refreshToken == "" {
+	if d.getRefreshToken() == "" {
 		return fmt.Errorf("百度网盘需要配置 refresh_token")
 	}
 
 	// 设置 401 自动刷新回调（运行时安全网）
 	d.client.SetAuthRefreshCallback(func() error {
 		slog.Info("百度网盘 token 过期，自动刷新")
-		accessToken, newRefresh, expiresIn, err := d.client.refreshToken(d.refreshToken, d.clientID, d.clientSecret)
+		rt := d.getRefreshToken()
+		accessToken, newRefresh, expiresIn, err := d.client.refreshToken(rt, d.clientID, d.clientSecret)
 		if err != nil {
 			return err
 		}
 		d.client.SetAccessToken(accessToken)
 		if newRefresh != "" {
-			d.refreshToken = newRefresh
+			d.setRefreshToken(newRefresh)
+			rt = newRefresh
 		}
 		SaveToken(d.name, d.stateDir, &TokenState{
-			RefreshToken: d.refreshToken,
+			RefreshToken: rt,
 			AccessToken:  accessToken,
 			ExpiresAt:    time.Now().Unix() + int64(expiresIn),
 		})
@@ -74,7 +92,7 @@ func (d *Driver) Init(ctx context.Context) error {
 	token, err := LoadToken(d.name, d.stateDir)
 	if err == nil && token != nil {
 		d.client.SetAccessToken(token.AccessToken)
-		d.refreshToken = token.RefreshToken
+		d.setRefreshToken(token.RefreshToken)
 		errno, _ := d.client.apiGetWithErrno("/nas", map[string]string{"method": "uinfo"}, nil)
 		if errno == 0 {
 			slog.Info("从缓存恢复百度网盘会话")
@@ -83,17 +101,17 @@ func (d *Driver) Init(ctx context.Context) error {
 		slog.Warn("缓存 token 已失效，重新刷新")
 	}
 
-	accessToken, newRefresh, expiresIn, err := d.client.refreshToken(d.refreshToken, d.clientID, d.clientSecret)
+	accessToken, newRefresh, expiresIn, err := d.client.refreshToken(d.getRefreshToken(), d.clientID, d.clientSecret)
 	if err != nil {
 		return fmt.Errorf("百度网盘 token 刷新失败: %w", err)
 	}
 
 	d.client.SetAccessToken(accessToken)
 	if newRefresh != "" {
-		d.refreshToken = newRefresh
+		d.setRefreshToken(newRefresh)
 	}
 
-	token = &TokenState{RefreshToken: d.refreshToken, AccessToken: accessToken, ExpiresAt: time.Now().Unix() + int64(expiresIn)}
+	token = &TokenState{RefreshToken: d.getRefreshToken(), AccessToken: accessToken, ExpiresAt: time.Now().Unix() + int64(expiresIn)}
 	if err := SaveToken(d.name, d.stateDir, token); err != nil {
 		slog.Warn("保存 token 失败", "err", err)
 	}
@@ -170,7 +188,7 @@ func (d *Driver) Link(ctx context.Context, filePath string) (*model.Link, error)
 	}
 
 	// 3. 服务端代理下载（绕过客户端 UA 限制）
-	dlink := dlResp.List[0].Dlink + "&access_token=" + d.client.accessToken
+	dlink := dlResp.List[0].Dlink + "&access_token=" + d.client.getAccessToken()
 	req, _ := http.NewRequestWithContext(ctx, "GET", dlink, nil)
 	req.Header.Set("User-Agent", "netdisk")
 
@@ -213,16 +231,18 @@ func (d *Driver) NeedRefresh() bool {
 }
 
 func (d *Driver) RefreshToken(ctx context.Context) error {
-	accessToken, newRefresh, expiresIn, err := d.client.refreshToken(d.refreshToken, d.clientID, d.clientSecret)
+	rt := d.getRefreshToken()
+	accessToken, newRefresh, expiresIn, err := d.client.refreshToken(rt, d.clientID, d.clientSecret)
 	if err != nil {
 		return err
 	}
 	d.client.SetAccessToken(accessToken)
 	if newRefresh != "" {
-		d.refreshToken = newRefresh
+		d.setRefreshToken(newRefresh)
+		rt = newRefresh
 	}
 	SaveToken(d.name, d.stateDir, &TokenState{
-		RefreshToken: d.refreshToken,
+		RefreshToken: rt,
 		AccessToken:  accessToken,
 		ExpiresAt:    time.Now().Unix() + int64(expiresIn),
 	})

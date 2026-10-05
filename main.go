@@ -23,7 +23,7 @@ import (
 	"mini-cloud/internal/webdav"
 )
 
-const version = "v0.5"
+const version = "v0.9.2"
 
 // mountedDriver 已挂载的云盘驱动信息
 type mountedDriver struct {

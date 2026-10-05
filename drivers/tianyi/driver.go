@@ -61,7 +61,8 @@ func (d *Driver) Init(ctx context.Context) error {
 		if err := d.client.refreshSession(); err != nil {
 			return err
 		}
-		token := NewTokenState(d.client.sessionKey, d.client.sessionSecret, d.client.accessToken, d.client.refreshToken, d.familyID, d.client.familySessionKey, d.client.familySessionSecret, "")
+		sk, ss, at, rt, fsk, fss := d.client.snapshot()
+		token := NewTokenState(sk, ss, at, rt, d.familyID, fsk, fss, "")
 		SaveToken(d.name, d.stateDir, token)
 		return nil
 	})
@@ -98,12 +99,13 @@ func (d *Driver) Init(ctx context.Context) error {
 	}
 
 	// 保存 token（含家庭云 session）
-	token = NewTokenState(d.client.sessionKey, d.client.sessionSecret, d.client.accessToken, d.client.refreshToken, d.familyID, d.client.familySessionKey, d.client.familySessionSecret, "")
+	sk, ss, at, rt, fsk, fss := d.client.snapshot()
+	token = NewTokenState(sk, ss, at, rt, d.familyID, fsk, fss, "")
 	if err := SaveToken(d.name, d.stateDir, token); err != nil {
 		slog.Warn("保存 token 失败", "err", err)
 	}
 
-	if d.isFamily() && d.client.familySessionKey == "" {
+	if d.isFamily() && !d.client.hasFamilySession() {
 		slog.Warn("家庭云登录成功但未获取到 familySessionKey，家庭云功能可能不可用")
 	}
 

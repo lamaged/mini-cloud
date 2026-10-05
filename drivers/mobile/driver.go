@@ -128,9 +128,9 @@ func (d *Driver) saveTokenState() {
 		expiresAt = expiration / 1000
 	}
 	token := &TokenState{
-		Authorization: d.client.authorization,
-		Account:       d.client.account,
-		CloudHost:     d.client.cloudHost,
+		Authorization: d.client.getAuthorization(),
+		Account:       d.client.getAccount(),
+		CloudHost:     d.client.getCloudHost(),
 		ExpiresAt:     expiresAt,
 	}
 	if err := SaveToken(d.name, d.stateDir, token); err != nil {

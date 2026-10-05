@@ -172,7 +172,7 @@ func (c *Client) refreshSession() error {
 
 	queryParams := clientSuffix()
 	queryParams.Set("appId", APP_ID)
-	queryParams.Set("accessToken", c.accessToken)
+	queryParams.Set("accessToken", c.getAccessToken())
 
 	reqUrl := API_URL + "/getSessionForPC.action?" + queryParams.Encode()
 	req, _ := http.NewRequest("GET", reqUrl, nil)
@@ -200,12 +200,8 @@ func (c *Client) refreshSession() error {
 
 	if tokenInfo.SessionKey != "" {
 		// 更新会话，但保留原有的 AccessToken 和 RefreshToken
-		c.sessionKey = tokenInfo.SessionKey
-		c.sessionSecret = tokenInfo.SessionSecret
-		// 同时更新家庭云会话（如果 API 返回了）
+		c.setSession(tokenInfo.SessionKey, tokenInfo.SessionSecret, tokenInfo.FamilySessionKey, tokenInfo.FamilySessionSecret)
 		if tokenInfo.FamilySessionKey != "" {
-			c.familySessionKey = tokenInfo.FamilySessionKey
-			c.familySessionSecret = tokenInfo.FamilySessionSecret
 			slog.Info("会话刷新成功（含家庭云）")
 		} else {
 			slog.Info("会话刷新成功")

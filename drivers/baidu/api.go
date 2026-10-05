@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -16,6 +17,7 @@ const (
 // Client 百度网盘 API 客户端
 type Client struct {
 	httpClient   *http.Client
+	mu           sync.RWMutex // 保护 accessToken
 	accessToken  string
 	onAuthFailed func() error // 401 回调：刷新 token 并更新状态
 }
@@ -29,7 +31,16 @@ func NewClient() *Client {
 
 // SetAccessToken 设置 access_token
 func (c *Client) SetAccessToken(token string) {
+	c.mu.Lock()
 	c.accessToken = token
+	c.mu.Unlock()
+}
+
+// getAccessToken 线程安全地读取 access_token
+func (c *Client) getAccessToken() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.accessToken
 }
 
 // SetAuthRefreshCallback 设置 401 时的自动刷新回调
@@ -39,9 +50,14 @@ func (c *Client) SetAuthRefreshCallback(cb func() error) {
 
 // apiGet 发送 GET 请求，自动附加 access_token
 func (c *Client) apiGet(path string, params map[string]string, result interface{}) ([]byte, error) {
+	return c.apiGetWithRetry(path, params, result, true)
+}
+
+// apiGetWithRetry 内部实现，allowRetry 控制是否允许 401 自动重试（防止无限递归）
+func (c *Client) apiGetWithRetry(path string, params map[string]string, result interface{}, allowRetry bool) ([]byte, error) {
 	u, _ := url.Parse(API_BASE + path)
 	q := u.Query()
-	q.Set("access_token", c.accessToken)
+	q.Set("access_token", c.getAccessToken())
 	for k, v := range params {
 		q.Set(k, v)
 	}
@@ -65,10 +81,10 @@ func (c *Client) apiGet(path string, params map[string]string, result interface{
 	json.Unmarshal(body, &base)
 
 	// errno 111 = token expired, -6 = access token invalid
-	if (base.Errno == 111 || base.Errno == -6) && c.onAuthFailed != nil {
+	if allowRetry && (base.Errno == 111 || base.Errno == -6) && c.onAuthFailed != nil {
 		if err := c.onAuthFailed(); err == nil {
-			// 刷新成功，重试请求（递归一次）
-			return c.apiGet(path, params, result)
+			// 刷新成功，重试请求（仅一次，不再递归）
+			return c.apiGetWithRetry(path, params, result, false)
 		}
 	}
 
@@ -107,7 +123,7 @@ var NoRedirectClient = &http.Client{
 func (c *Client) apiGetRaw(rawURL string, params map[string]string, result interface{}) ([]byte, error) {
 	// 手动拼接 URL，保留 target 参数中的 [ ] " 等字符
 	var parts []string
-	parts = append(parts, "access_token="+c.accessToken)
+	parts = append(parts, "access_token="+c.getAccessToken())
 	for k, v := range params {
 		parts = append(parts, k+"="+v)
 	}

@@ -20,6 +20,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -145,6 +146,7 @@ func (p Params) Encode() string {
 // Client 天翼云盘 HTTP 客户端
 type Client struct {
 	httpClient    *http.Client
+	mu            sync.RWMutex // 保护会话凭据字段
 	sessionKey    string
 	sessionSecret string
 	accessToken   string
@@ -158,16 +160,60 @@ type Client struct {
 
 // SetFamilySession 设置家庭云会话密钥
 func (c *Client) SetFamilySession(key, secret string) {
+	c.mu.Lock()
 	c.familySessionKey = key
 	c.familySessionSecret = secret
+	c.mu.Unlock()
 }
 
 // sessionFor 返回签名用的 session（家庭云用 family session）
 func (c *Client) sessionFor(family bool) (key, secret string) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	if family && c.familySessionKey != "" {
 		return c.familySessionKey, c.familySessionSecret
 	}
 	return c.sessionKey, c.sessionSecret
+}
+
+// getAccessToken 线程安全地读取 access_token
+func (c *Client) getAccessToken() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.accessToken
+}
+
+// getSessionSecret 线程安全地读取 session_secret
+func (c *Client) getSessionSecret() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.sessionSecret
+}
+
+// hasFamilySession 判断是否已配置家庭云会话
+func (c *Client) hasFamilySession() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.familySessionKey != ""
+}
+
+// snapshot 线程安全地读取全部会话字段
+func (c *Client) snapshot() (sessionKey, sessionSecret, accessToken, refreshToken, familySessionKey, familySessionSecret string) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.sessionKey, c.sessionSecret, c.accessToken, c.refreshToken, c.familySessionKey, c.familySessionSecret
+}
+
+// setSession 更新会话密钥（保留 accessToken/refreshToken 不变）
+func (c *Client) setSession(sessionKey, sessionSecret, familySessionKey, familySessionSecret string) {
+	c.mu.Lock()
+	c.sessionKey = sessionKey
+	c.sessionSecret = sessionSecret
+	if familySessionKey != "" {
+		c.familySessionKey = familySessionKey
+		c.familySessionSecret = familySessionSecret
+	}
+	c.mu.Unlock()
 }
 
 // NewClient 创建 HTTP 客户端
@@ -192,10 +238,12 @@ func (c *Client) SetAuthRefreshCallback(cb func() error) {
 
 // SetSession 设置会话信息
 func (c *Client) SetSession(sessionKey, sessionSecret, accessToken, refreshToken string) {
+	c.mu.Lock()
 	c.sessionKey = sessionKey
 	c.sessionSecret = sessionSecret
 	c.accessToken = accessToken
 	c.refreshToken = refreshToken
+	c.mu.Unlock()
 }
 
 // clientSuffix 返回所有请求都需要携带的公共参数
@@ -235,7 +283,7 @@ func (c *Client) encryptParams(params Params) string {
 	if len(params) == 0 {
 		return ""
 	}
-	return AesECBEncrypt(params.Encode(), c.sessionSecret[:16])
+	return AesECBEncrypt(params.Encode(), c.getSessionSecret()[:16])
 }
 
 // apiRequest 发送签名后的 API 请求（params 作为明文查询参数，非加密）
