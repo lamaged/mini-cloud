@@ -53,6 +53,14 @@ TV / Nova Player / 网易爆米花 / Infuse
 
 ### 变更记录
 
+#### v0.9.2 (2026-10-05)
+
+- **变更** 移动云盘 authorization 过期后不再返回 500，改为显示空目录 + 提示名：
+  - 新增 `HealthReporter` 可选接口，驱动可向上层报告健康提示
+  - 移动驱动 `List` 在 authorization 过期时返回空目录、`Link` 返回明确错误，不再发起网络请求
+  - 根导航页与根 PROPFIND 的显示名在过期时变为「移动云盘authorization已经过期，请更新」
+  - 明确移动云盘 RCS token 约 30 天硬过期、服务端不接受过期后续期，需用户手动更新 `authorization`
+
 #### v0.9.1 (2026-08-21)
 
 - **修复** 移动云盘 token 过期后无法自动恢复的问题：
