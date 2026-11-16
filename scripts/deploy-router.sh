@@ -1,8 +1,8 @@
 #!/bin/sh
 # mini-cloud 部署（路由器侧，v0.10.0）——在路由器上运行（busybox ash 兼容，无 bash 特性）
 #
-# 职责：从开发机拉取产物 → 备份旧二进制 → 停服务（确认旧进程退出）→ 安装 →
-#       脱离会话启动（start-stop-daemon/setsid）→ 健康检查轮询 → 失败自动回滚。
+# 职责：从开发机拉取产物 → 备份旧二进制 → 停服务（确认旧进程退出）→ 安装（同目录原子替换）→
+#       脱离会话启动（setsid）→ 健康检查轮询（15×1s）→ 失败自动回滚并验证恢复。
 #
 # 部署方向（铁律 5 / docs/process.md）：本脚本由路由器执行，路由器作为 SSH 客户端
 # 主动连接开发机拉取（scp 交互式输入开发机密码）；开发机不作为客户端登录路由器。
@@ -23,6 +23,67 @@ CONFIG="${CONFIG:-$INSTALL_DIR/config/config.json}"
 BINARY="mini-cloud-arm64-upx"
 NEW="/tmp/mini-cloud-new"
 LOG="$INSTALL_DIR/mini-cloud.log"
+PORT="8088"
+
+# ============================================================
+# 函数定义（必须整体先于使用：POSIX sh 执行到定义行才生效，I11）
+# ============================================================
+
+# start_daemon 脱离会话启动（P15：setsid + 显式重定向，行为可预期；回退普通后台）
+start_daemon() {
+    cd "$INSTALL_DIR" || return 1
+    if command -v setsid >/dev/null 2>&1; then
+        setsid sh -c "exec \"$INSTALL_DIR/$BINARY\" -config \"$CONFIG\" >> \"$LOG\" 2>&1" &
+    else
+        "$INSTALL_DIR/$BINARY" -config "$CONFIG" >> "$LOG" 2>&1 &
+    fi
+}
+
+# health_check 轮询健康检查（15×1s）；进程死亡提前判失败。返回 0=通过，1=失败
+health_check() {
+    _pid="$1"
+    i=0
+    while [ "$i" -lt 15 ]; do
+        _code=$(wget -q -S -O /dev/null "http://127.0.0.1:$PORT/" 2>&1 | \
+            grep -o 'HTTP/1\.[01] [0-9][0-9][0-9]' | tail -1 | awk '{print $2}') || true
+        _code="${_code:-000}"
+        if [ "$_code" = "401" ] || [ "$_code" = "200" ]; then
+            return 0
+        fi
+        if ! kill -0 "$_pid" 2>/dev/null; then
+            return 1
+        fi
+        sleep 1
+        i=$((i+1))
+    done
+    return 1
+}
+
+# rollback_old 回滚旧版本并验证恢复（P16：回滚后同样健康检查，确认「已恢复」）
+rollback_old() {
+    echo "==> 回滚旧版本"
+    pkill -f "$BINARY" 2>/dev/null || killall "$BINARY" 2>/dev/null || true
+    sleep 1
+    if [ ! -f "$INSTALL_DIR/$BINARY.prev" ]; then
+        echo "错误：无旧版本可回滚（.prev 不存在）"
+        return 1
+    fi
+    mv "$INSTALL_DIR/$BINARY.prev" "$INSTALL_DIR/$BINARY"
+    start_daemon
+    sleep 1
+    _rollback_pid=$(pgrep -f "$BINARY" 2>/dev/null | head -1)
+    _rollback_pid="${_rollback_pid:-0}"
+    if [ "$_rollback_pid" = "0" ] || ! health_check "$_rollback_pid"; then
+        echo "错误：回滚后服务仍未恢复，请人工介入"
+        return 1
+    fi
+    echo "已恢复旧版本（HTTP 401/200）"
+    return 0
+}
+
+# ============================================================
+# 主流程
+# ============================================================
 
 echo "==> 从开发机拉取产物（如提示请输入开发机登录密码）"
 scp "$DEV_USER@$DEV_HOST:$STAGING/$BINARY" "$NEW"
@@ -52,25 +113,16 @@ if [ "$OLD_PID" != "0" ] && kill -0 "$OLD_PID" 2>/dev/null; then
     exit 1
 fi
 
+# 安装（P17：/tmp 与 /data 跨文件系统，先拷到目标目录临时名，再同目录 mv 原子替换）
 echo "==> 安装新二进制"
-mv "$NEW" "$INSTALL_DIR/$BINARY"
-chmod +x "$INSTALL_DIR/$BINARY"
+cp "$NEW" "$INSTALL_DIR/$BINARY.new"
+chmod +x "$INSTALL_DIR/$BINARY.new"
+mv "$INSTALL_DIR/$BINARY.new" "$INSTALL_DIR/$BINARY"
+rm -f "$NEW"
 
 # 从配置读取监听端口（默认 8088）
 PORT=$(sed -n 's/.*"listen"[^"]*"\([^"]*\)".*/\1/p' "$CONFIG" | head -1 | sed 's/.*://')
 PORT="${PORT:-8088}"
-
-# 脱离会话启动（I9-1：断开 SSH 后进程不被杀）；日志落文件（I9-4）
-start_daemon() {
-    cd "$INSTALL_DIR" || return 1
-    if command -v start-stop-daemon >/dev/null 2>&1; then
-        start-stop-daemon -S -b -x "$INSTALL_DIR/$BINARY" -- -config "$CONFIG" >> "$LOG" 2>&1
-    elif command -v setsid >/dev/null 2>&1; then
-        setsid "$INSTALL_DIR/$BINARY" -config "$CONFIG" >> "$LOG" 2>&1 &
-    else
-        "$INSTALL_DIR/$BINARY" -config "$CONFIG" >> "$LOG" 2>&1 &
-    fi
-}
 
 echo "==> 启动服务（端口 $PORT，日志 $LOG）"
 start_daemon
@@ -85,44 +137,13 @@ if [ "$NEW_PID" = "0" ] || [ "$NEW_PID" = "$OLD_PID" ]; then
     exit 1
 fi
 
-# 健康检查轮询（I9-2：弱网下启动可能超过 3 秒）
 echo "==> 健康检查 http://127.0.0.1:$PORT/（轮询，期望 401 或 200）"
-CODE="000"
-i=0
-while [ "$i" -lt 15 ]; do
-    CODE=$(wget -q -S -O /dev/null "http://127.0.0.1:$PORT/" 2>&1 | \
-        grep -o 'HTTP/1\.[01] [0-9][0-9][0-9]' | tail -1 | awk '{print $2}') || true
-    CODE="${CODE:-000}"
-    if [ "$CODE" = "401" ] || [ "$CODE" = "200" ]; then
-        break
-    fi
-    # 新进程已死则提前判失败
-    if ! kill -0 "$NEW_PID" 2>/dev/null; then
-        break
-    fi
-    sleep 1
-    i=$((i+1))
-done
-
-if [ "$CODE" = "401" ] || [ "$CODE" = "200" ]; then
-    echo "==> 部署成功（HTTP $CODE，PID $NEW_PID）"
+if health_check "$NEW_PID"; then
+    echo "==> 部署成功（PID $NEW_PID）"
     echo "==> UPX 后体积（铁律 10 观察项，记入 PROGRESS.md）: $(wc -c < "$INSTALL_DIR/$BINARY") 字节"
     exit 0
 fi
 
-rollback_old() {
-    echo "==> 回滚旧版本"
-    pkill -f "$BINARY" 2>/dev/null || killall "$BINARY" 2>/dev/null || true
-    sleep 1
-    if [ -f "$INSTALL_DIR/$BINARY.prev" ]; then
-        mv "$INSTALL_DIR/$BINARY.prev" "$INSTALL_DIR/$BINARY"
-        start_daemon
-        echo "已恢复旧版本"
-    else
-        echo "错误：无旧版本可回滚（.prev 不存在）"
-    fi
-}
-
-echo "==> 健康检查失败（HTTP $CODE，PID $NEW_PID 存活：$(kill -0 "$NEW_PID" 2>/dev/null && echo 是 || echo 否)），回滚"
+echo "==> 健康检查失败，回滚"
 rollback_old
 exit 1
