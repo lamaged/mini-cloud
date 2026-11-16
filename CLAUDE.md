@@ -16,7 +16,7 @@ Mini Cloud WebDAV 网关 —— 一个只读 WebDAV 桥接服务，将国内云�
 
 ## 常用命令
 
-Go 工具链不在默认 PATH 中 —— 先 `source env.sh`（GOROOT/GOPATH 指向 `/home/test/go`）。
+Go 工具链不在默认 PATH 中 —— 先 `source env.sh`（GOROOT 指向 `/home/test/go`、GOPATH 指向 `/home/test/go-path`）。
 
 ```bash
 source ./env.sh

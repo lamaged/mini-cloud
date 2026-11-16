@@ -1,6 +1,6 @@
 # mini-cloud 设计文档
 
-> 状态：草案 v0.2（已按外部文档评审 RV-2026-11-16-01 修订，待 PM 批准闸门①）
+> 状态：草案 v0.3（已按外部文档评审 RV-2026-11-16-01/02 修订，待 PM 批准闸门①）
 > 日期：2026-11-16（v0.1 发布于 2026-11-15）
 > 配套文档：README.md（产品文档与变更记录）、docs/process.md（开发与审核流程：角色分工、铁律、审核闭环）、docs/vault-feasibility.md（Vault 可行性报告与实测数据）
 
@@ -10,10 +10,12 @@
 |---|---|---|
 | v0.1 | 2026-11-15 | 首版（v0.10.0 凭证网页管理 + Vault 分阶段设计） |
 | v0.2 | 2026-11-16 | 按评审 RV-2026-11-16-01 修订 D1–D5 / I1–I7 / P1–P6；落 PM 五项拍板（HTTPS 不做、绑定加固 Phase 1、三处转义缺陷入 v0.10.0、Vault 全局配置与路径语义、证据分层压缩） |
+| v0.3 | 2026-11-16 | 按评审 RV-2026-11-16-02 修订：D6（两阶段接口）、I8–I14、P7–P12；PM 追加拍板（fileID 校验提前 Phase 0、内网地址允许入库） |
 
 | 审阅 | 结论 | 意见处置 |
 |---|---|---|
 | RV-2026-11-16-01（外部文档评审） | 有条件通过 | 见 PROGRESS.md「审核意见处置记录」 |
+| RV-2026-11-16-02（复核评审） | 有条件通过（第二轮） | 见 PROGRESS.md「审核意见处置记录」 |
 
 ## 1. 背景与目标
 
@@ -48,7 +50,7 @@
 | 构建 | `go build` | `CGO_ENABLED=0 GOOS=linux GOARCH=arm64` + UPX（`~/upx-5.2.1-amd64_linux`） |
 | 测试 | `go test -race`、httptest 模拟云盘 API | 真机验收（功能/性能/内存/CA 证书） |
 
-**部署方向（PM 明确）**：路由器（192.168.2.1，SSH 密码登录）作为 SSH 客户端**主动连接开发机拉取产物**；开发机不作为客户端登录路由器。开发机局域网 IP（路由器视角）：**192.168.2.21**。计划在 scripts/ 提供两端脚本（v0.10.0 实现阶段编写）：开发机侧「编译 + 提供产物」，路由器侧「拉取 + 备份 + 重启 + 验证」（交互式输入密码）。
+**部署方向（PM 明确）**：路由器（192.168.2.1，SSH 登录；免密优先，密码回退）作为 SSH 客户端**主动连接开发机拉取产物**；开发机不作为客户端登录路由器。开发机局域网 IP（路由器视角）：**192.168.2.21**。内网地址允许入库（PM 拍板 2026-11-16：仅私有网段地址、不含凭证）。计划在 scripts/ 提供两端脚本（v0.10.0 实现阶段编写）：开发机侧「编译 + 提供产物」，路由器侧「拉取 + 备份 + 重启 + 验证」。
 
 **差异影响**：
 
@@ -77,11 +79,15 @@ type CredentialField struct {
     Kind  string // "password" 或 "text"
 }
 
-// CredentialUpdater 凭证更新（可选接口）：支持运行时更新凭证
+// CredentialUpdater 凭证更新（可选接口）：两阶段——先验证后提交（D6 修订）
 type CredentialUpdater interface {
     CredentialFields() []CredentialField
-    // UpdateCredential 校验并应用新凭证；失败时必须回滚到旧凭证
-    UpdateCredential(ctx context.Context, values map[string]string) error
+    // ValidateCredential 校验格式并做网络验证（调用方须带超时，建议 10s）。
+    // 不得改变任何状态（内存凭证、token state、config 均不动）。
+    ValidateCredential(ctx context.Context, values map[string]string) error
+    // CommitCredential 应用新凭证到内存并写入 token state；同步、不联网、不回滚。
+    // token state 写入失败时凭证仍生效（重启后以 config.json 为准），返回该错误由调用方提示。
+    CommitCredential(values map[string]string) error
 }
 ```
 
@@ -92,15 +98,12 @@ type CredentialUpdater interface {
 新增 `internal/admin` 包（渲染与表单逻辑，通过 main 注入挂载信息与持久化回调，不依赖 conf，避免循环依赖）：
 
 - `GET /admin`：管理页，Basic Auth 保护。列出所有支持 CredentialUpdater 的挂载：名称、当前健康状态（`HealthReporter.HealthWarning`）、凭证表单。每次渲染生成一次性 CSRF token（内存 map + 过期时间）。
-- `POST /admin/update`：`mount` + 字段值。流程（D5 修订，顺序与回滚点固定）：
+- `POST /admin/update`：`mount` + 字段值。流程（D5/D6 修订，两阶段零回滚）：
   1. 校验 Basic Auth + CSRF token（一次性）。
-  2. 找到挂载 → `UpdateCredential(ctx, values)`：驱动内部做格式校验 + **网络验证（`context.WithTimeout`，10 秒）**，失败自动回滚旧凭证并返回错误。
-  3. 成功 → main 按序落盘：
-     a. 原子写 config.json（temp + rename + fsync + 写前备份 `.bak` + 写后 `os.Chmod 0600`，`.bak` 同样 chmod；D2）；
-     b. 加锁切换驱动内存凭证（与请求路径互斥，见下）；
-     c. 写 token state（`state/<挂载名>_token.json`）。
-     任一步失败：回滚（config 用 `.bak` 恢复、驱动凭证换回旧值），返回明确错误与原因。
-  4. 成功页显示新 token 的过期时间；失败页显示原因。
+  2. `ValidateCredential(ctx, values)`（`context.WithTimeout`，10 秒）：格式校验 + 网络验证，**不改变任何状态**。失败 → 直接报错，内存与磁盘均保持不变。
+  3. main 原子写 config.json（temp + rename + fsync + 写前备份 `.bak` + 写后 `os.Chmod 0600`，`.bak` 同样 chmod；D2）。失败 → 报错，**状态仍为零变化**（此时尚未生效）。
+  4. `CommitCredential(values)`：加锁应用内存凭证 + 写 token state（调用点唯一）。token state 写入失败仅提示（凭证已生效，重启后以 config.json 为准）。
+  5. 成功页显示新 token 的过期时间；失败页显示原因。
 - 根导航页增加「管理」链接（仅浏览器访问时可见）。
 
 **并发模型（D5）**：`cfg` 加互斥锁保护或 copy-on-write——管理页写入不得与请求期读取（`checkAuth` 每请求读 `cfg.Server.*`）共享可写状态；`checkAuth` 读取路径纳入锁范围。
@@ -109,10 +112,11 @@ type CredentialUpdater interface {
 
 ### 3.4 移动驱动实现要点
 
-1. `UpdateCredential` 流程：`parseAuthString` 校验格式 → 保存旧值 → 应用新值到 Client（走现有互斥锁）→ 网络验证（调用个人云 API 列根目录；401/403 视为无效）→ 验证失败恢复旧值并返回错误；成功则 `discoverCloudHost` + `saveTokenState`。
-2. 网络不可达时拒绝更新并明确提示（不写入无法验证的凭证）。
-3. 更新成功后 `HealthWarning` 自动消失（`client.isExpired()` 为 false）。
-4. config.json 写入由 main 负责（驱动不持有 config 路径）。
+1. `ValidateCredential`：`parseAuthString` 校验格式 → 用**临时 Client 实例**（仅 set 新 authorization）做网络验证（列根目录；401/403 视为无效）→ 不动正式 Client 的任何状态。
+2. `CommitCredential`：应用新值到正式 Client（走现有互斥锁）→ `discoverCloudHost` → `saveTokenState`。token state 写入失败返回错误但凭证保持生效。
+3. 网络不可达时拒绝更新并明确提示（不写入无法验证的凭证）。
+4. 更新成功后 `HealthWarning` 自动消失（`client.isExpired()` 为 false）。
+5. config.json 写入由 main 负责（驱动不持有 config 路径）。
 
 ### 3.5 安全
 
@@ -141,6 +145,7 @@ type CredentialUpdater interface {
 5. 三处转义缺陷修复后：含中文/空格/`#` 文件名的 PROPFIND href 可被严格客户端访问；目录页与根 PROPFIND 对特殊字符安全。
 6. 真机 `ls -l` 核对 config.json、config.json.bak、state/* 权限为 0600（D2）。
 7. 管理页更新成功后 config.json 无空 `cloud` 块（omitempty 生效）。
+8. 两阶段语义：验证失败或 config 写失败时，内存凭证与磁盘文件均保持不变（零回滚）。
 
 ## 4. 功能 B：Vault 加密文件播放（v1.0+）
 
@@ -156,20 +161,22 @@ auth.StartWatcher(ctx, raw, 5*time.Minute)   // 必须传 raw：TokenManager 断
 cached := fs.NewCachedReader(fs.NewRetryReader(raw))
 var drv driver.Driver = cached
 if vaultCfg != nil {
-    v := vault.New(cached, raw, vaultCfg)    // List 走 cached（虚拟树在内存，不命中上游）；Link 走 raw（Vault 自管 URL 表）
+    v := vault.New(cached, raw, vaultCfg)    // /M/<vault> 前缀：List 读内存虚拟树、Link 走 raw（自管 URL 表）；其余路径：List/Link 全部委托 cached
     if err := v.Init(ctx); err != nil { ... }
     v.Start(ctx)
     drv = v
 }
 ```
 
+- **路径分流（I11 修订）**：`/M/<vault 前缀>/...` → List 直接读内存虚拟树（不经 cached，manifest 更新延迟与缓存内存可控）、Link 走 raw；其余路径 → List/Link 全部委托 `cached`（302 行为不变）。
+- **重试语义（I11 修订）**：Vault 直连 raw.Link 绕过了 RetryReader——Vault 自实现重试：**仅对网络错误重试 1 次**，"not found" 不重试（与 RetryReader 语义对齐）。
 - **URL 时效由 Vault 自管（D1）**：现有 `CachedReader` 链接缓存固定 10 分钟 TTL、无按条目指定 TTL 的扩展点，Vault 路径不走它的链接缓存；Vault 自建「URL + 绝对过期时间」表，TTL = `min(10min, expires - now - 60s)`；403 时失效旧 URL → 重新 Link → 重试一次，再失败 502；并发刷新用标准库 mutex 自实现（不引外部库）。
 - **`TokenManager` / `HealthReporter` / `CredentialUpdater` 的断言对象必须始终是 raw 驱动**；Vault 与 CachedReader 不得实现这些接口。
 - **Stop 幂等（I7）**：`CachedReader.Stop` 改 `sync.Once`（当前二次调用 panic）；所有权链唯一：`main → Handler.Close → Vault.Stop → CachedReader.Stop`，任何中间层不得被 main 单独 Stop；补「重复 Stop 不 panic」单元测试。
 
 ### 4.2 分阶段与验收（与报告 §9 对齐）
 
-- **Phase 0 / v1.0.0**：`cmd/mcrypt` + `internal/vault`（格式、解密 Reader、manifest），只接 local 驱动。验收：全文件 SHA-256 一致；Range 返回 206；随机 Seek 不整文件下载；`GET <vault 根>/_mc/...` 返回 403（I4）；空文件可解密、头部被篡改时拒绝（I2）；`go test -race` 全绿；**AX6 上 Go AES-GCM benchmark ≥ 40 MB/s**（低于则重新评估并发策略）。
+- **Phase 0 / v1.0.0**：`cmd/mcrypt` + `internal/vault`（格式、解密 Reader、manifest），只接 local 驱动。验收：全文件 SHA-256 一致；Range 返回 206；随机 Seek 不整文件下载；`GET <vault 根>/_mc/...` 返回 403（I4）；空文件可解密、头部被篡改时拒绝（I2）；**manifest 记录的 fileID 与对象头 fileID 一致性校验**（I12，PM 拍板提前到 Phase 0）；`go test -race` 全绿；**AX6 上 Go AES-GCM benchmark ≥ 40 MB/s**（低于则重新评估并发策略）。
 - **Phase 1 / v1.1.0**：接天翼家庭 → 移动（验证 403 刷新）→ 百度（OpenRange/dlink 缓存）。验收：4K remux 顺序播放 + 拖动 10 次不失败；URL 过期自动刷新不中断；响应头重写正确；**对象绑定强校验**（manifest fileID 与对象头一致、metadata.p 与请求路径比对，PM 拍板放 Phase 1）。
 - **Phase 2 / v1.2.0**：块缓存/预读、百度 4 GB 分卷、manifest 增量更新、多密钥/轮换。
 
@@ -177,8 +184,8 @@ if vaultCfg != nil {
 
 **路径语义（PM 设想，2026-11-16）**：
 
-- 配置全局一套：`vault.paths`（根目录名列表，如 `["backup", "Archive"]`，可多个）+ `vault.key_file`（全局 master key，永不传上网盘）。
-- 对每个挂载 M：请求路径 `/M/<p>/...` 的第一段 `p` 与 `vault.paths` 匹配即进入 Vault；**子目录继承**——Vault 根下任意深度的目录与文件全部按加密文件处理，虚拟视图完全由 manifest 决定。
+- 配置全局一套：`vault.paths`（根目录名列表，如 `["backup", "Archive"]`，**无前导斜杠**，可多个）+ `vault.key_file`（全局 master key，永不传上网盘）。
+- 对每个挂载 M：请求路径 `/M/<p>/...` 的第一段 `p` 与 `vault.paths` 匹配即进入 Vault（Handler 已 strip 掉 `/<mount>` 前缀，Vault 收到的是挂载内相对路径，只比较首段字符串，**大小写敏感**）；**子目录继承**——Vault 根下任意深度的目录与文件全部按加密文件处理，虚拟视图完全由 manifest 决定。
 - 物理对象名与扩展名均非原名（如 `_mc/o/7f/3a/….bin`）；每个 Vault 根独立持有自己的 `_mc/manifest.mcf` 与对象，共用全局 master key。
 - `PROPFIND`/List 虚拟树只含 manifest 记录；`_mc` 与 manifest 未记录的其他物理对象一律不出现；`GET /M/<p>/_mc/...` 及任何未记录路径 → **403**，绝不回落 302 交出密文。
 - 未找到 manifest（或损坏）→ 该 Vault 根虚拟视图为空目录 + 健康提示，服务不崩溃。
@@ -211,6 +218,6 @@ if vaultCfg != nil {
 | 移动 URL 15 分钟过期 | Vault 自管 URL 表 + 403 刷新（报告 §5.4） |
 | 路由器 Go 代理吞吐不足 | Phase 0 AX6 benchmark 前置 |
 | 凭据数据竞争 | 沿用现有互斥锁 + getter/setter 模式（be1c043）；cfg 加锁（D5） |
-| 普通文件夹恰好与 vault.paths 同名 | 显示为空目录 + 健康提示（§4.3 边界，待 PM 确认） |
+| 普通文件夹恰好与 vault.paths 同名 | 已拍板（TODO 2026-11-16）：显示为空目录 + 健康提示，用户误用不受保护 |
 | 管理页局域网明文提交凭证 | 已拍板接受（不上 HTTPS）；用户可自行前置 HTTPS 反代 |
 | AX6 存储/内存紧张 | 铁律 10：代码精简、冗余功能禁止；闸门⑤ 验收含体积与内存观察项 |
