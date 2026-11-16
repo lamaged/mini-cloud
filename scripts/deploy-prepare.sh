@@ -23,15 +23,24 @@ fi
 STAGING_DIR="${STAGING_DIR:-$HOME/mini-cloud-staging}"
 UPX_BIN="${UPX:-$HOME/upx-5.2.1-amd64_linux/upx}"
 
+if [ ! -x "$UPX_BIN" ]; then
+    echo "错误：未找到可执行的 upx（$UPX_BIN），请设置 UPX 变量" >&2
+    exit 1
+fi
+
+# 独立临时目录（P13：并发运行互不覆盖）
+BUILD_DIR=$(mktemp -d)
+trap 'rm -rf "$BUILD_DIR"' EXIT
+
 echo "==> 交叉编译（ARM64 静态）"
-CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o /tmp/mini-cloud-arm64 .
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o "$BUILD_DIR/mini-cloud-arm64" .
 
 echo "==> UPX 压缩"
-"$UPX_BIN" --best -o /tmp/mini-cloud-arm64-upx /tmp/mini-cloud-arm64 >/dev/null
+"$UPX_BIN" --best -o "$BUILD_DIR/mini-cloud-arm64-upx" "$BUILD_DIR/mini-cloud-arm64" >/dev/null
 
 echo "==> 放入暂存目录: $STAGING_DIR"
 mkdir -p "$STAGING_DIR"
-cp /tmp/mini-cloud-arm64-upx "$STAGING_DIR/mini-cloud-arm64-upx"
+cp "$BUILD_DIR/mini-cloud-arm64-upx" "$STAGING_DIR/mini-cloud-arm64-upx"
 
 SIZE=$(stat -c%s "$STAGING_DIR/mini-cloud-arm64-upx")
 echo "==> 完成：$STAGING_DIR/mini-cloud-arm64-upx"

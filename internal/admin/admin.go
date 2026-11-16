@@ -29,8 +29,9 @@ type Mount struct {
 }
 
 // PersistFunc 把验证通过的新凭证写回配置（由 main 提供）。
-// 成功时返回回滚函数（用于后续提交失败时恢复配置，实现零变化语义）；失败时 rollback 为 nil。
-type PersistFunc func(ctx context.Context, mount string, values map[string]string) (rollback func(), err error)
+// 成功时返回回滚函数（用于后续提交失败时恢复配置，实现零变化语义）；
+// 回滚函数须报告成败（I8：还原失败必须如实告知用户，不得假装已还原）。
+type PersistFunc func(ctx context.Context, mount string, values map[string]string) (rollback func() error, err error)
 
 // Handler 凭证管理页处理器
 type Handler struct {
@@ -103,11 +104,9 @@ func (h *Handler) Page(w http.ResponseWriter, r *http.Request) {
 }
 
 // Update 处理凭证更新（POST /admin/update）。
-// 全流程串行化（updateMu）：双标签并发提交时按先后完整执行，避免配置与运行时不一致（I1）。
+// 「验证→写盘→生效」全流程串行化（updateMu）：双标签并发提交按先后完整执行，避免配置与运行时不一致（I1）。
+// 锁在表单解析与 CSRF 校验之后获取（I7）：慢请求不长期占锁，串行化只覆盖需要原子性的三步。
 func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
-	h.updateMu.Lock()
-	defer h.updateMu.Unlock()
-
 	if err := r.ParseForm(); err != nil {
 		h.render(w, http.StatusBadRequest, "", "表单解析失败")
 		return
@@ -122,6 +121,9 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 		h.render(w, http.StatusBadRequest, "", "未找到挂载，或该挂载不支持在线更新")
 		return
 	}
+
+	h.updateMu.Lock()
+	defer h.updateMu.Unlock()
 
 	values := make(map[string]string)
 	values["__req"] = randomToken() // 更新请求唯一标识：驱动按它关联验证与提交，隔离并发更新
@@ -144,26 +146,36 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 	}
 
 	err = m.Update.CommitCredential(values)
-	applied := err == nil || errors.Is(err, driver.ErrStateWriteFailed)
-	if err != nil && !applied && rollback != nil {
-		// 提交失败：用备份还原配置，做到真正的零变化（I6，PM 拍板方案①）
-		rollback()
-		h.render(w, http.StatusInternalServerError, "", fmt.Sprintf("凭证生效失败，配置已还原：%v", err))
+	if err == nil || errors.Is(err, driver.ErrStateWriteFailed) {
+		// 凭证已生效（含「生效但本地缓存写入失败」的告警路径）
+		if h.OnCommitted != nil {
+			h.OnCommitted(m.Name) // 使该挂载的目录/链接缓存失效
+		}
+		if err != nil {
+			h.render(w, http.StatusOK, fmt.Sprintf("更新成功（%v）", err), "")
+			return
+		}
+		msg := "更新成功"
+		if exp, ok := values["__expiry"]; ok && exp != "" {
+			msg = fmt.Sprintf("更新成功，新凭证有效期至 %s", exp)
+		}
+		h.render(w, http.StatusOK, msg, "")
 		return
 	}
-	if applied && h.OnCommitted != nil {
-		h.OnCommitted(m.Name) // 凭证已生效：使该挂载的目录/链接缓存失效
-	}
-	if err != nil {
-		// 凭证已生效，仅本地缓存写入失败——提示而非报错
-		h.render(w, http.StatusOK, fmt.Sprintf("更新成功（%v）", err), "")
+
+	// 提交失败（凭证未生效）：回滚配置（I6，PM 拍板方案①）；
+	// 回滚失败必须如实告知（I8），不得假装已还原
+	if rollback == nil {
+		h.render(w, http.StatusInternalServerError, "", fmt.Sprintf("凭证生效失败：%v", err))
 		return
 	}
-	msg := "更新成功"
-	if exp, ok := values["__expiry"]; ok && exp != "" {
-		msg = fmt.Sprintf("更新成功，新凭证有效期至 %s", exp)
+	if rbErr := rollback(); rbErr != nil {
+		slog.Error("回滚配置失败", "err", rbErr)
+		h.render(w, http.StatusInternalServerError, "",
+			fmt.Sprintf("凭证生效失败：%v；且配置回滚失败，请手工核对 config.json（.bak 仍保留）", err))
+		return
 	}
-	h.render(w, http.StatusOK, msg, "")
+	h.render(w, http.StatusInternalServerError, "", fmt.Sprintf("凭证生效失败，配置已还原：%v", err))
 }
 
 // render 渲染管理页（message 为成功提示，errMsg 为错误提示；二者互斥）

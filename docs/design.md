@@ -174,6 +174,10 @@ type CredentialUpdater interface {
 - **Stop 幂等（P4）**：`CachedReader.Stop` 改 `sync.Once`（原属 Vault Phase 0 事项，提前在 v0.10.0 落地），补「重复 Stop 不 panic」测试。
 - **编码去重（P6）**：路径百分号编码统一为 `webdav.EncodePathSegments`（导出），main 与 webdav 共用。
 - **版本（P3）**：`version` 常量升 `v0.10.0`。
+- **更新锁位置（I7）**：`updateMu` 在表单解析与 CSRF 校验之后获取，串行化只覆盖验证→写盘→生效；`http.Server` 增 `ReadHeaderTimeout: 10s`（全站防慢连接）。
+- **回滚如实报告（I8）**：回滚函数返回 error；还原失败页面明示「回滚失败，请手工核对 config.json（.bak 仍保留）」，不得假装已还原。
+- **部署脚本强化（I9/I10）**：脱离会话启动（start-stop-daemon → setsid 回退）；旧进程退出确认 + 新 PID 校验（防旧进程死透前假通过）；健康检查轮询 15×1s（弱网启动余量）；日志落 mini-cloud.log；验收清单同步（日志核对版本号、假产物回滚演练、P14 开机自启口径入技术债）。
+- **P11–P13**：提交失败分支显式化（凭证生效/未生效两条路径，防契约变化时误报成功）；并发测试补「最后一次写盘值 == 最后一次生效值」最终一致断言；prepare 脚本改 mktemp 独立临时目录 + upx 存在性检查。
 
 ## 4. 功能 B：Vault 加密文件播放（v1.0+）
 

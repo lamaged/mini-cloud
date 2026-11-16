@@ -91,7 +91,7 @@ func main() {
 
 	// 配置写回（两阶段语义：验证通过才写；互斥保护避免并发写）
 	var cfgMu sync.Mutex
-	adminHandler := admin.New(adminMounts, func(ctx context.Context, mountName string, values map[string]string) (func(), error) {
+	adminHandler := admin.New(adminMounts, func(ctx context.Context, mountName string, values map[string]string) (func() error, error) {
 		cfgMu.Lock()
 		defer cfgMu.Unlock()
 		// 严格读取 + 以磁盘当前内容为准（尊重运行期间的手工修改）；写盘成功后才更新内存副本
@@ -100,17 +100,20 @@ func main() {
 			return nil, err
 		}
 		cfg.Clouds = fresh.Clouds // 写盘成功后才更新内存副本
-		return func() {
-			// 提交失败回滚（I6，PM 拍板方案①）：用 .bak 还原配置并同步内存副本
+		return func() error {
+			// 提交失败回滚（I6，PM 拍板方案①）：用 .bak 还原配置并同步内存副本。
+			// 失败必须如实返回（I8）：不得假装已还原。
 			if err := conf.RestoreBackup(*configPath); err != nil {
-				slog.Error("回滚配置失败", "err", err)
-				return
+				return fmt.Errorf("还原配置失败: %w", err)
 			}
 			cfgMu.Lock()
-			if restored, err := conf.LoadStrict(*configPath); err == nil {
-				cfg.Clouds = restored.Clouds
+			defer cfgMu.Unlock()
+			restored, err := conf.LoadStrict(*configPath)
+			if err != nil {
+				return fmt.Errorf("重读配置失败: %w", err)
 			}
-			cfgMu.Unlock()
+			cfg.Clouds = restored.Clouds
+			return nil
 		}, nil
 	})
 
@@ -205,8 +208,9 @@ func main() {
 
 	// 启动服务
 	server := &http.Server{
-		Addr:    cfg.Server.Listen,
-		Handler: withLogging(mux),
+		Addr:              cfg.Server.Listen,
+		Handler:           withLogging(mux),
+		ReadHeaderTimeout: 10 * time.Second, // 防慢连接长期占用（I7 附带，全站收益）
 	}
 
 	// 优雅关闭

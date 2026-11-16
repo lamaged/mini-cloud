@@ -21,7 +21,8 @@ type fakeUpdater struct {
 	validated    bool
 	committed    bool
 	lastValidate map[string]string
-	validateHook func() // 阻塞点（并发/时序测试用）
+	lastCommitVal string // 最后一次提交的凭证值（P12 最终一致性断言用）
+	validateHook func()  // 阻塞点（并发/时序测试用）
 }
 
 func (f *fakeUpdater) CredentialFields() []driver.CredentialField { return f.fields }
@@ -39,6 +40,7 @@ func (f *fakeUpdater) ValidateCredential(_ context.Context, values map[string]st
 }
 func (f *fakeUpdater) CommitCredential(values map[string]string) error {
 	f.committed = true
+	f.lastCommitVal = values["authorization"]
 	return f.commitErr
 }
 
@@ -52,12 +54,12 @@ func newTestHandler(u *fakeUpdater, persistErr error) (*Handler, *fakeUpdater, *
 			Warning: func() string { return "" },
 			Update:  u,
 		},
-	}, func(ctx context.Context, mount string, values map[string]string) (func(), error) {
-		*calls = append(*calls, "persist:"+mount)
+	}, func(ctx context.Context, mount string, values map[string]string) (func() error, error) {
+		*calls = append(*calls, "persist:"+mount+":"+values["authorization"])
 		if persistErr != nil {
 			return nil, persistErr
 		}
-		return func() {}, nil
+		return func() error { return nil }, nil
 	})
 	return h, u, calls
 }
@@ -100,7 +102,7 @@ func TestPageRendersAndEscapes(t *testing.T) {
 			Warning: func() string { return `过期<script>提示</script>` },
 			Update:  &fakeUpdater{},
 		},
-	}, func(ctx context.Context, mount string, values map[string]string) (func(), error) { return func() {}, nil })
+	}, func(ctx context.Context, mount string, values map[string]string) (func() error, error) { return func() error { return nil }, nil })
 
 	rec := httptest.NewRecorder()
 	h.Page(rec, httptest.NewRequest("GET", "/admin", nil))
@@ -125,7 +127,7 @@ func TestUpdateHappyPathOrder(t *testing.T) {
 	if !fu.validated || !fu.committed {
 		t.Errorf("validated=%v committed=%v, want both true", fu.validated, fu.committed)
 	}
-	if len(*calls) != 1 || (*calls)[0] != "persist:移动云盘" {
+	if len(*calls) != 1 || !strings.HasPrefix((*calls)[0], "persist:移动云盘") {
 		t.Errorf("persist calls = %v", *calls)
 	}
 	if !strings.Contains(rec.Body.String(), "有效期至 2026-12-16 12:00") {
@@ -148,7 +150,7 @@ func TestUpdateSerialized(t *testing.T) {
 			<-release
 		},
 	}
-	h, _, _ := newTestHandler(u, nil)
+	h, _, calls := newTestHandler(u, nil)
 	csrfA := fetchCSRF(t, h)
 	csrfB := fetchCSRF(t, h)
 
@@ -174,6 +176,14 @@ func TestUpdateSerialized(t *testing.T) {
 	if !u.committed {
 		t.Fatal("commit should have run")
 	}
+
+	// P12：最终一致性——最后一次写盘的值 == 最后一次生效的值
+	if len(*calls) < 2 || (*calls)[len(*calls)-1] != "persist:移动云盘:auth-B" {
+		t.Errorf("last persist should be auth-B, calls=%v", *calls)
+	}
+	if u.lastCommitVal != "auth-B" {
+		t.Errorf("last commit = %q, want auth-B（运行时与配置必须一致）", u.lastCommitVal)
+	}
 }
 
 // TestCommitPlainErrorRollsBack 提交失败时用回滚函数还原配置（I6）
@@ -182,8 +192,8 @@ func TestCommitPlainErrorRollsBack(t *testing.T) {
 	rolledBack := false
 	h := New([]Mount{
 		{Name: "移动云盘", Prefix: "/移动云盘", Fields: u.CredentialFields(), Update: u},
-	}, func(ctx context.Context, mount string, values map[string]string) (func(), error) {
-		return func() { rolledBack = true }, nil
+	}, func(ctx context.Context, mount string, values map[string]string) (func() error, error) {
+		return func() error { rolledBack = true; return nil }, nil
 	})
 	csrf := fetchCSRF(t, h)
 
@@ -196,6 +206,26 @@ func TestCommitPlainErrorRollsBack(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "配置已还原") {
 		t.Errorf("expected rollback message, got: %s", rec.Body.String())
+	}
+}
+
+// TestCommitPlainErrorRollbackFails 回滚失败必须如实告知（I8），不得假装已还原
+func TestCommitPlainErrorRollbackFails(t *testing.T) {
+	u := &fakeUpdater{fields: []driver.CredentialField{{Key: "authorization", Kind: "password"}}, commitErr: fmt.Errorf("没有待提交的凭证，请先验证")}
+	h := New([]Mount{
+		{Name: "移动云盘", Prefix: "/移动云盘", Fields: u.CredentialFields(), Update: u},
+	}, func(ctx context.Context, mount string, values map[string]string) (func() error, error) {
+		return func() error { return fmt.Errorf("还原配置失败: 磁盘只读") }, nil
+	})
+	csrf := fetchCSRF(t, h)
+
+	rec := postUpdate(h, csrf, "移动云盘", "new-auth-token")
+	body := rec.Body.String()
+	if strings.Contains(body, "配置已还原") {
+		t.Errorf("must not claim restored when rollback failed: %s", body)
+	}
+	if !strings.Contains(body, "回滚失败") || !strings.Contains(body, "请手工核对") {
+		t.Errorf("expected honest rollback-failure message, got: %s", body)
 	}
 }
 
