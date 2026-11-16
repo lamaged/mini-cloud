@@ -1,11 +1,22 @@
-# 个人文件夹功能可行性报告
+# 个人文件夹功能可行性报告（Vault 加密方案）
 
 > mini-cloud 加密视频/文件 WebDAV 还原方案  
-> 项目地址：https://github.com/lamaged/mini-cloud  
-> 文档版本：v1.0  
-> 日期：2026-11-14  
-> 状态：可行性验证完成，建议进入 Phase 0  
+> 项目地址：https://github.com/lamaged/mini-cloud（分支 feature/file-encryption）  
+> 文档版本：v1.1  
+> 日期：2026-11-16（v1.0 发布于 2026-11-14）  
+> 状态：可行性验证完成；已按外部文档评审 RV-2026-11-16-01 修订  
 > 说明：本报告由原《个人文件夹功能-测试总结》升级而来，整合了需求、AX6 加密性能、CDN Range 实测、URL 时效分析和代码核实结论。
+
+## 版本与审阅记录
+
+| 版本 | 日期 | 变更 |
+|---|---|---|
+| v1.0 | 2026-11-14 | 首版（AX6 性能、CDN Range、URL 时效实测与代码核实） |
+| v1.1 | 2026-11-16 | 按评审 RV-2026-11-16-01 修订：URL 缓存策略改为 Vault 自管（D1）；响应头唯一来源（D3）；包装示例修正（D4）；格式不变量与对象绑定字段（I1–I3）；`_mc` 屏蔽（I4）；上游异常分支与并发语义（I6）；Stop 幂等（I7）；改名并入 docs/ 并统一「文件+符号」引用（P6） |
+
+| 审阅 | 结论 | 意见处置 |
+|---|---|---|
+| RV-2026-11-16-01（外部文档评审） | 有条件通过 | 见 PROGRESS.md「审核意见处置记录」 |
 
 ---
 
@@ -260,7 +271,7 @@ http://192.168.2.1:8088/MobileCloudDrive/%E8%A7%86%E9%A2%91/20250905_140406.mp4
 
 百度驱动当前已经是服务端代理下载：
 
-- [`drivers/baidu/driver.go#L136`](drivers/baidu/driver.go#L136) 的 `Link` 获取 dlink 后由服务端发起 GET；
+- [`drivers/baidu/driver.go` / `Link`](drivers/baidu/driver.go) 获取 dlink 后由服务端发起 GET；
 - 把客户端 `Range` 头转发给百度 CDN；
 - 返回 `206` 给客户端。
 
@@ -303,7 +314,7 @@ http://192.168.2.1:8088/MobileCloudDrive/%E8%A7%86%E9%A2%91/20250905_140406.mp4
 
 **第一，handler 每次请求都重新取 Link。**
 
-[`internal/webdav/webdav.go#L80`](internal/webdav/webdav.go#L80) 的 `handleGetHead` 对每个 GET/HEAD 都调用：
+[`internal/webdav/webdav.go` / `handleGetHead`](internal/webdav/webdav.go) 对每个 GET/HEAD 都调用：
 
 ```go
 link, err := h.Driver.Link(ctx, reqPath)
@@ -325,13 +336,13 @@ if link.URL != "" {
 
 **第二，URL 缓存只有 10 分钟。**
 
-[`internal/fs/cache.go#L63`](internal/fs/cache.go#L63)：
+[`internal/fs/cache.go` / `linkTTL` 常量](internal/fs/cache.go)：
 
 ```go
 linkTTL: 10 * time.Minute,
 ```
 
-[`internal/fs/cache.go#L135`](internal/fs/cache.go#L135) 的 `CachedReader.Link` 只缓存 URL 类型，10 分钟后缓存过期，下次请求重新调用驱动。
+[`internal/fs/cache.go` / `CachedReader.Link`](internal/fs/cache.go) 只缓存 URL 类型，10 分钟后缓存过期，下次请求重新调用驱动。
 
 这正好比移动的 15 分钟、天翼个人的 28 分钟短：
 
@@ -341,7 +352,7 @@ linkTTL: 10 * time.Minute,
 
 **第三，驱动每次都向云盘要新地址。**
 
-天翼 [`drivers/tianyi/driver.go#L252`](drivers/tianyi/driver.go#L252)：
+天翼 [`drivers/tianyi/driver.go` / `getDownloadLink`](drivers/tianyi/driver.go)：
 
 ```go
 d.client.apiRequestEx("GET", fullUrl, params, &result, d.isFamily())
@@ -349,7 +360,7 @@ d.client.apiRequestEx("GET", fullUrl, params, &result, d.isFamily())
 return &model.Link{URL: redirectURL, ...}, nil
 ```
 
-移动 [`drivers/mobile/driver.go#L234`](drivers/mobile/driver.go#L234)：
+移动 [`drivers/mobile/driver.go` / `Link`](drivers/mobile/driver.go)：
 
 ```go
 d.client.personalRequest("/file/getDownloadUrl", ...)
@@ -369,7 +380,7 @@ Go 的 `http.Redirect` 写 302 时没有设置 `Cache-Control` / `Expires`。客
 
 **结论：现有 302 路径没有“URL 过期”bug。** 它不长期持有 URL，且 URL 缓存 10 分钟小于签名有效期。实际使用中没有遇到问题，是符合代码行为的。
 
-但也要明确：**302 路径没有 403 刷新能力。** [`internal/fs/retry.go#L55`](internal/fs/retry.go#L55) 只重试 `Link` 返回的 error；天翼/移动的 `Link` 只是拿 URL，并没有向 CDN 发请求，所以 CDN 的 403 它看不到。如果播放器自己缓存了 CDN URL 并在过期后继续用，mini-cloud 不在链路里，也无法刷新。
+但也要明确：**302 路径没有 403 刷新能力。** [`internal/fs/retry.go` / `RetryReader.Link`](internal/fs/retry.go) 只重试 `Link` 返回的 error；天翼/移动的 `Link` 只是拿 URL，并没有向 CDN 发请求，所以 CDN 的 403 它看不到。如果播放器自己缓存了 CDN URL 并在过期后继续用，mini-cloud 不在链路里，也无法刷新。
 
 ### 5.3 加密代理模式的不同
 
@@ -390,11 +401,11 @@ Go 的 `http.Redirect` 写 302 时没有设置 `Cache-Control` / `Expires`。客
 
 ### 5.4 Vault 的 URL 管理策略
 
-1. `Link` 返回的不再是 URL，而是解密 Reader；Vault 内部通过 `inner.Link` 拿上游 URL。
+1. `Link` 返回的不再是 URL，而是解密 Reader；Vault 内部通过原始驱动的 `Link` 拿上游 URL。
 2. 解析 `Expires` / `X-Amz-Date` + `X-Amz-Expires`，计算绝对过期时间。
-3. URL 缓存 TTL：`min(10min, expires - now - 60s)`。
-4. 403 时：invalidate 旧 URL → 重新 `Link` → 重试一次；第二次仍失败返回 502。
-5. 同一文件的并发 Range 共用一个刷新锁，避免同时打爆云盘 API。
+3. URL 缓存由 Vault 自建「URL + 绝对过期时间」表实现，TTL = `min(10min, expires - now - 60s)`。现有 `CachedReader` 的链接缓存只支持固定 10 分钟 TTL、无按条目指定 TTL 的扩展点，**Vault 路径不走它的链接缓存**——Vault 直接调用原始驱动的 `Link`（包装顺序见 §8.2）。
+4. 403 时：Vault 内部失效旧 URL → 重新 `Link` → 重试一次；第二次仍失败返回 502。
+5. 同一文件的并发 Range 共用一个刷新锁（标准库 mutex 自实现），避免同时打爆云盘 API。
 6. 单条已打开的流不主动中断；等它自然结束；新的 Range 再走刷新逻辑。
 
 ---
@@ -540,6 +551,8 @@ GET /天翼个人/backup/电影/a.mkv
   → 解密、返回明文 206
 ```
 
+**`_mc` 屏蔽（Phase 0 验收项）**：Vault 根为 100% 虚拟视图——`PROPFIND` 不出现 `_mc` 及其子项；`GET /天翼个人/backup/_mc/...` 及任何未出现在 manifest 中的物理路径一律返回 **403**，绝不回落 302 把密文对象直接交给客户端（否则对象名与大小可被枚举）。
+
 ### 7.3 加密格式
 
 #### 文件头（64 B）
@@ -586,6 +599,13 @@ GET /天翼个人/backup/电影/a.mkv
 
 保存原始路径、原始文件名、大小、mtime、MIME、SHA-256。
 
+#### 格式不变量（v1.1 评审后定稿）
+
+1. **fileID 不变量**：每次加密必须新生成 `fileID`；`repair` / 重加密 / 续写工具**不得复用** `fileID`；工具层对「同一 fileID 重复加密」直接拒绝。同一 fileID 下重复加密会造成 GCM (key, nonce) 重用，安全性崩塌。
+2. **空文件与头部认证**：manifest 条目增加 `header_sha256`（对象文件头的 SHA-256），服务端读取时校验。空文件（`plain_size=0`，`chunk_count=0`）没有任何分块 tag 覆盖头部，靠该哈希防止头部被篡改。
+3. **头部字段校验**（服务端读取时强制执行，违反即拒绝、绝不夹取）：`chunk_size ∈ [64 KiB, 1 MiB]`；`data_offset == 64 + meta_len`；`meta_len ≤ 4 KiB`；`plain_size ≥ 0`。
+4. **对象绑定（防跨对象替换）**：manifest 条目记录的 `fileID` 必须与对象头部 `fileID` 一致；元数据 `p`（虚拟路径）与请求路径比对。**格式字段自 Phase 0 起就位；服务端强校验在 Phase 1 实施**（PM 拍板：加固放 Phase 1）。
+
 #### 对象命名
 
 ```text
@@ -621,6 +641,17 @@ cipherOff = dataOffset + chunkIdx * (chunkSize + 16)
 - 顺序读时保持一个上游连接，不按块发请求；
 - 最多浪费一个块的前缀（1 MiB）。
 
+#### 上游异常分支（→ 动作 → 对外状态码）
+
+| 上游行为 | 动作 | 对外状态码 |
+|---|---|---|
+| Range 请求返回 200（CDN 忽略 Range） | 流式丢弃到请求起始偏移，继续解密返回 | 206（Content-Range 按明文生成） |
+| 返回 416 | 透传 | 416 |
+| 206 的 Content-Range 与请求区间不符 | 关闭流并重试一次；仍不符 | 502 |
+| 客户端断开 | ctx 传导，取消上游请求 | —（无响应） |
+| Seek 切换流 | 旧 `resp.Body` 必须 Close | — |
+| 上游 URL 过期（403） | 失效该 URL → 重新 Link → 重试一次；再失败 | 502 |
+
 ### 7.5 密钥层级
 
 ```text
@@ -648,12 +679,16 @@ master key (32B)
 | `Accept-Ranges` | `bytes` |
 | `Content-Encoding` | 强制 `identity` |
 
+- **ETag 与 MIME 的唯一来源是 Vault 虚拟树**（manifest 元数据）：通过 `model.Obj` 新增可选字段（ETag、ContentType）供 `internal/webdav/prop.go` / `buildPropsXML` 使用，PROPFIND 与 GET 同源；`prop.go` 相应改造列入修改清单（§8.2）。
+- Vault **自行构造** `Link.Header`；**禁止透传**上游的 `Content-Length`、`Content-Range`、`Content-Encoding`、`ETag`。
+
 ### 7.7 并发与内存
 
 - 每流：1 MiB 密文 + 1 MiB 明文 + 网络缓冲 ≈ 3–5 MB。
 - 4 路并发 ≈ 12–20 MB。
 - 加 manifest 和 Go runtime，总内存约 60–100 MB。
-- 建议 `max_streams = 4`，超出返回 503，防止 OOM。
+- `max_streams = 4` 为**全局信号量**（含获取超时），超出返回 503 防止 OOM；不做按挂载计数。
+- URL 并发刷新锁用标准库 mutex 自实现（依赖铁律禁止引入外部库，如 `golang.org/x/sync/singleflight`）。
 
 ### 7.8 配置示例
 
@@ -698,24 +733,26 @@ cmd/mcrypt/
 | 文件 | 改动 |
 |---|---|
 | [`internal/conf/config.go`](internal/conf/config.go) | 增加 `VaultConfig`，校验 key/paths |
-| [`main.go`](main.go) | 包装驱动；`auth.StartWatcher` 传原始驱动 |
-| [`internal/webdav/webdav.go`](internal/webdav/webdav.go) | HEAD Content-Length；Reader Stat 兼容 |
-| [`internal/webdav/prop.go`](internal/webdav/prop.go) | href URL 转义；`getObj` 错误处理 |
+| [`main.go`](main.go) | 包装驱动；`auth.StartWatcher` 传原始驱动；根 PROPFIND XML 转义（v0.10.0 独立修复） |
+| [`internal/webdav/webdav.go`](internal/webdav/webdav.go) | HEAD Content-Length；Reader Stat 兼容；`serveDirHTML` HTML 转义（v0.10.0 独立修复） |
+| [`internal/webdav/prop.go`](internal/webdav/prop.go) | href 百分号编码（v0.10.0 独立修复）；ETag/MIME 唯一来源（`model.Obj` 新字段） |
+| [`internal/model/obj.go`](internal/model/obj.go) | `Obj` 增加可选 ETag / ContentType 字段（零值 = 现有行为） |
+| [`internal/fs/cache.go`](internal/fs/cache.go) | `Stop` 改 `sync.Once` 幂等（I7） |
 | [`drivers/local/driver.go`](drivers/local/driver.go) | 可选 `OpenRange` |
 | [`drivers/baidu/driver.go`](drivers/baidu/driver.go) | 可选 `OpenRange` + dlink 缓存 |
 
-包装顺序：
+包装顺序（与 design.md §4.1 逐字一致，唯一出处）：
 
 ```go
-raw := createDriver(...)
-raw.Init(ctx)
-auth.StartWatcher(ctx, raw, 5*time.Minute)
+raw := createDriver(cc)                      // 驱动以 cc.MountName() 命名（挂载名，非类型名）
+if err := raw.Init(ctx); err != nil { ... }  // error 必须处理
+auth.StartWatcher(ctx, raw, 5*time.Minute)   // 必须传 raw：TokenManager 断言在 raw 上
 
 cached := fs.NewCachedReader(fs.NewRetryReader(raw))
 var drv driver.Driver = cached
 if vaultCfg != nil {
-    v := vault.New(cached, vaultCfg, raw.Name())
-    v.Init(ctx)
+    v := vault.New(cached, raw, vaultCfg)    // List 走 cached（虚拟树在内存，不命中上游）；Link 走 raw（Vault 自管 URL 表）
+    if err := v.Init(ctx); err != nil { ... }
     v.Start(ctx)
     drv = v
 }
@@ -724,11 +761,11 @@ if vaultCfg != nil {
 ### 8.3 必须注意
 
 - `auth.StartWatcher` 必须传 `raw`，不能传 Vault 包装层，否则 TokenManager 接口会丢。
-- `Vault.Stop` 要向下调用 `CachedReader.Stop`。
+- **Stop 幂等**：`CachedReader.Stop` 改为 `sync.Once`（当前二次调用 panic）；所有权链唯一：`main → Handler.Close → Vault.Stop → CachedReader.Stop`，任何中间层不得被 main 单独 Stop。补单元测试：重复 Stop 不 panic。
 - 所有 offset/size 用 `int64`。
 - 不要改现有 302 分支。
-- `href` 要 URL 转义；中文、空格、`#` 文件名在严格客户端上会 404。
-- `serveDirHTML` 要 HTML 转义，避免文件名 XSS。
+- `href` 要百分号编码；中文、空格、`#` 文件名在严格客户端上会 404（v0.10.0 独立修复）。
+- `serveDirHTML` 要 HTML 转义，避免文件名 XSS（v0.10.0 独立修复）。
 
 ---
 
@@ -741,14 +778,17 @@ if vaultCfg != nil {
 - 接 `local` 驱动，用 100 MB–2 GB 文件验证：
   - 全文件 SHA-256 一致；
   - `Range` 返回 206；
-  - 随机 Seek 不重新下载整个文件。
+  - 随机 Seek 不重新下载整个文件；
+  - `GET /<vault 根>/_mc/...` 返回 403（I4）；
+  - 空文件可解密、头部被篡改时拒绝（I2）。
 - 用 55 GB 文件走一遍代理，测 4K 播放、拖动、`top`、`free`。
 
 ### Phase 1：云端 MVP（1–2 周）
 
-- 接天翼个人/家庭、移动、百度。
+- 接天翼个人/家庭、移动、百度（首个接天翼家庭）。
 - URL 过期解析 + 403 刷新。
 - 响应头重写、并发限制、错误处理。
+- 对象绑定强校验：manifest fileID 与对象头一致、metadata.p 与请求路径比对（I3，PM 拍板放 Phase 1）。
 - 播放器兼容性测试。
 
 ### Phase 2：加固（1–2 周）
@@ -888,19 +928,19 @@ date -u -d @1795091763
 date -u -d '2026-11-14 15:10:08' +%s
 ```
 
-### C. 相关代码位置
+### C. 相关代码位置（统一「文件 + 符号」引用，避免行号漂移）
 
-- [`main.go#L105`](main.go#L105)：驱动包装
-- [`internal/webdav/webdav.go#L80`](internal/webdav/webdav.go#L80)：GET/HEAD 处理
-- [`internal/webdav/webdav.go#L109`](internal/webdav/webdav.go#L109)：URL → 302
-- [`internal/fs/cache.go#L63`](internal/fs/cache.go#L63)：URL 缓存 10 分钟
-- [`internal/fs/cache.go#L135`](internal/fs/cache.go#L135)：Link 缓存实现
-- [`internal/fs/retry.go#L55`](internal/fs/retry.go#L55)：Link 重试
-- [`drivers/tianyi/driver.go#L252`](drivers/tianyi/driver.go#L252)：天翼取下载地址
-- [`drivers/mobile/driver.go#L234`](drivers/mobile/driver.go#L234)：移动取下载地址
-- [`drivers/baidu/driver.go#L136`](drivers/baidu/driver.go#L136)：百度代理下载
-- [`internal/webdav/prop.go#L162`](internal/webdav/prop.go#L162)：href 构建
+- [`main.go` / 驱动包装循环](main.go)：驱动包装
+- [`internal/webdav/webdav.go` / `handleGetHead`](internal/webdav/webdav.go)：GET/HEAD 处理
+- [`internal/webdav/webdav.go` / `handleGetHead`（URL 分支）](internal/webdav/webdav.go)：URL → 302
+- [`internal/fs/cache.go` / `linkTTL` 常量](internal/fs/cache.go)：URL 缓存 10 分钟
+- [`internal/fs/cache.go` / `CachedReader.Link`](internal/fs/cache.go)：Link 缓存实现
+- [`internal/fs/retry.go` / `RetryReader.Link`](internal/fs/retry.go)：Link 重试
+- [`drivers/tianyi/driver.go` / `getDownloadLink`](drivers/tianyi/driver.go)：天翼取下载地址
+- [`drivers/mobile/driver.go` / `Link`](drivers/mobile/driver.go)：移动取下载地址
+- [`drivers/baidu/driver.go` / `Link`](drivers/baidu/driver.go)：百度代理下载
+- [`internal/webdav/prop.go` / `buildHref`](internal/webdav/prop.go)：href 构建
 
 ---
 
-*本报告基于当前仓库代码与 2026-11-14 实测数据；除本 Markdown 文档外，未修改任何其他文件。*
+*实测数据基于 2026-11-14 环境；v1.1 修订仅限文档内容（按评审 RV-2026-11-16-01），未修改任何代码文件。*

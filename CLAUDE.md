@@ -9,10 +9,10 @@ Mini Cloud WebDAV 网关 —— 一个只读 WebDAV 桥接服务，将国内云�
 **开发环境是 x86 Ubuntu 虚机，真实运行设备是红米 AX6（OpenWrt ARM64）**：性能数据（AES-GCM、代理吞吐）必须以 AX6 实测为准；发版/真机验收必须用静态交叉编译（CGO_ENABLED=0）。
 
 **进行中的路线**（详见 [docs/design.md](docs/design.md)）：
-- v0.10.0：凭证网页管理 —— 浏览器页面直接更新移动云盘 authorization，免 SSH（解决移动 token 约 30 天硬过期痛点）。
-- v1.0+：Vault 加密文件 WebDAV 还原播放（可行性实测见 个人文件夹功能-测试总结.md）。
+- v0.10.0：凭证网页管理 —— 浏览器页面直接更新移动云盘 authorization，免 SSH（解决移动 token 约 30 天硬过期痛点）；附带独立修复 3 处现存转义缺陷（href 编码、目录页 HTML 转义、根 PROPFIND XML 转义）。
+- v1.0+：Vault 加密文件 WebDAV 还原播放（可行性实测见 [docs/vault-feasibility.md](docs/vault-feasibility.md)）。
 
-开发与审核流程见 [docs/process.md](docs/process.md)：角色分工（PM 非程序员，对话用交易语言）、9 条铁律、沟通协议、审核闭环（外部审核员每功能审一次）、6 道闸门、回滚策略。每个功能必须先过设计评审再写代码；进度与审核意见留痕在 PROGRESS.md / TODO.md。
+开发与审核流程见 [docs/process.md](docs/process.md)：角色分工（PM 非程序员，对话用交易语言）、10 条铁律、沟通协议、审核闭环（外部审核员每功能审一次）、6 道闸门、回滚策略。每个功能必须先过设计评审再写代码；进度与审核意见留痕在 PROGRESS.md / TODO.md。
 
 ## 常用命令
 
@@ -27,7 +27,7 @@ go build -o mini-cloud .
 
 # 交叉编译（OpenWrt ARM64 路由器，发版/真机验收必用）
 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o mini-cloud-arm64 .
-upx --best -o mini-cloud-arm64-upx mini-cloud-arm64
+~/upx-5.2.1-amd64_linux/upx --best -o mini-cloud-arm64-upx mini-cloud-arm64
 
 # 测试（提交前跑 -race；云盘驱动用 httptest 假服务器，不得使用真实凭证）
 go vet ./...
@@ -35,7 +35,7 @@ go test ./... -race
 go test ./internal/webdav -run TestXxx   # 运行单个测试
 ```
 
-如需在本开发环境中访问 GitHub/国外网站，请使用代理 `http://192.168.2.1:7890`。
+如需访问外部网络，请按开发机本地笔记配置代理（代理地址属本机环境，不入库）。
 
 ## 架构
 
@@ -52,7 +52,7 @@ main.go（Basic Auth、路由、根索引页）
 
 - `Driver` 接口（[internal/driver/driver.go](internal/driver/driver.go)）非常精简：`Name()`、`Init(ctx)`、`List(ctx, path)`、`Link(ctx, path)`。`List` 返回 `[]model.Obj`（Name/Size/ModTime/IsDir）；`Link` 返回 `model.Link`，且恰好只有两种模式之一：
   - `URL != ""` → handler 返回 302 重定向到云盘 CDN（天翼、移动）。客户端直连下载，无法转发 Range。
-  - `Reader != nil` → handler 在服务端代理数据流，通过 `http.ServeContent` 支持 Range（百度，必须设置 `User-Agent: netdisk`）。`Link.StatusCode` 透传上游状态码（如 206）。
+  - `Reader != nil` → handler 在服务端代理数据流，通过 `http.ServeContent` 支持 Range（百度，必须设置 `User-Agent: netdisk`）。`Link.StatusCode` 仅用于非 seekable 数据流（`streamReader`）；seekable Reader 的 200/206/416 由 `http.ServeContent` 依据 Range 自行计算。
 - 可选能力接口（全部通过类型断言检测，**断言对象必须是原始驱动，不是包装层**）：
   - `TokenManager`（`NeedRefresh`/`RefreshToken` —— 仅百度实现；[internal/auth/watcher.go](internal/auth/watcher.go) 的后台维护器每 5 分钟轮询一次）。
   - `HealthReporter`（`HealthWarning` —— 移动云盘上报 authorization 过期；挂载显示空目录 + 提示性显示名）。
@@ -85,4 +85,5 @@ main.go（Basic Auth、路由、根索引页）
 - docs/process.md —— 开发与审核流程（角色分工、铁律、沟通协议、审核闭环、6 道闸门、回滚策略）。
 - PROGRESS.md —— 开发进度与审核意见处置（专业语言，外部审核员阅读）。
 - TODO.md —— 待拍板事项、技术债、驳回待裁决。
-- 个人文件夹功能-测试总结.md —— Vault 加密方案可行性报告（AX6 性能、CDN Range、URL 时效实测数据）。
+- docs/vault-feasibility.md —— Vault 加密方案可行性报告（AX6 性能、CDN Range、URL 时效实测数据）。
+- docs/review/ —— 外部评审报告归档。

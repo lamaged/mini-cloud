@@ -1,38 +1,61 @@
 # mini-cloud 设计文档
 
-> 状态：草案 v0.1（待评审）
-> 日期：2026-11-15
-> 配套文档：README.md（产品文档与变更记录）、docs/process.md（开发与审核流程：角色分工、铁律、审核闭环）、个人文件夹功能-测试总结.md（Vault 可行性报告）
+> 状态：草案 v0.2（已按外部文档评审 RV-2026-11-16-01 修订，待 PM 批准闸门①）
+> 日期：2026-11-16（v0.1 发布于 2026-11-15）
+> 配套文档：README.md（产品文档与变更记录）、docs/process.md（开发与审核流程：角色分工、铁律、审核闭环）、docs/vault-feasibility.md（Vault 可行性报告与实测数据）
+
+## 版本与审阅记录
+
+| 版本 | 日期 | 变更 |
+|---|---|---|
+| v0.1 | 2026-11-15 | 首版（v0.10.0 凭证网页管理 + Vault 分阶段设计） |
+| v0.2 | 2026-11-16 | 按评审 RV-2026-11-16-01 修订 D1–D5 / I1–I7 / P1–P6；落 PM 五项拍板（HTTPS 不做、绑定加固 Phase 1、三处转义缺陷入 v0.10.0、Vault 全局配置与路径语义、证据分层压缩） |
+
+| 审阅 | 结论 | 意见处置 |
+|---|---|---|
+| RV-2026-11-16-01（外部文档评审） | 有条件通过 | 见 PROGRESS.md「审核意见处置记录」 |
 
 ## 1. 背景与目标
 
-当前版本 v0.9.2。接下来两个开发方向：
+当前版本 v0.9.2。两个开发方向：
 
 | 编号 | 目标 | 版本 | 动机 |
 |---|---|---|---|
-| A | 凭证网页管理：通过 Web 页面更新云盘凭证（首期：移动 authorization） | v0.10.0 | 移动 authorization 约 30 天硬过期，目前需 SSH 登录路由器改 config.json，非常不便 |
-| B | Vault 加密文件 WebDAV 还原播放 | v1.0+ | 可行性已验证（见测试总结报告，结论：可行，建议进入 Phase 0） |
+| A | 凭证网页管理：通过 Web 页面更新云盘凭证（首期：移动 authorization）；同时独立修复 3 处现存转义缺陷 | v0.10.0 | 移动 authorization 约 30 天硬过期，目前需 SSH 登录路由器改 config.json，非常不便 |
+| B | Vault 加密文件 WebDAV 还原播放 | v1.0+ | 可行性已验证（见 docs/vault-feasibility.md，结论：可行） |
+
+**PM 拍板记录（2026-11-16）**：
+
+1. 管理页**不上 HTTPS**，HTTP 明文即可（局域网使用，风险接受；如用户自行前置 HTTPS 反向代理亦可，不在本项目实现）。
+2. 防「云端偷换 / 回滚文件」的强校验放 **Phase 1**（格式字段自 Phase 0 起就位）。
+3. 三处现存转义缺陷（href 编码、目录页 HTML 转义、根 PROPFIND XML 转义）在 **v0.10.0 顺手修**，独立提交、独立验收。
+4. Vault 配置**全局一套**；路径语义按 PM 设想：某云盘根目录下的 `backup` / `Archive`（可设多个）及以下全部视为加密文件，子目录继承（详见 §4.3）。
+5. 「接口行为证据分层」规则**保留**，压缩为一段话（docs/process.md 铁律 4）。
 
 **共同原则**：
 
 - 未加密路径的 302 直连行为完全不变（回归测试保护）。
 - 只读 WebDAV 不变；不引入外部依赖（纯标准库，go.mod 保持现状）。
 - 代码注释与用户可见字符串用中文。
+- 资源约束：AX6 可用存储仅数 MB，代码必须精简、冗余功能绝对禁止（铁律 10）。
 
 ## 2. 开发环境与目标设备差异
 
 | 项目 | 开发机 | 目标设备 |
 |---|---|---|
 | 硬件 | x86 Ubuntu 24.04 虚机 | Redmi AX6 / OpenWrt ARM64 |
-| Go | 1.24.5（/home/test/go，先 `source env.sh`） | 交叉编译静态二进制 |
-| 构建 | `go build` | `CGO_ENABLED=0 GOOS=linux GOARCH=arm64` + UPX |
+| Go | 1.24.5（/home/test/go，先 `source env.sh`；模板 env.example.sh 入库，env.sh 不入库） | 交叉编译静态二进制 |
+| 构建 | `go build` | `CGO_ENABLED=0 GOOS=linux GOARCH=arm64` + UPX（`~/upx-5.2.1-amd64_linux`） |
 | 测试 | `go test -race`、httptest 模拟云盘 API | 真机验收（功能/性能/内存/CA 证书） |
+
+**部署方向（PM 明确）**：路由器（192.168.2.1，SSH 密码登录）作为 SSH 客户端**主动连接开发机拉取产物**；开发机不作为客户端登录路由器。开发机局域网 IP（路由器视角）：**192.168.2.21**。计划在 scripts/ 提供两端脚本（v0.10.0 实现阶段编写）：开发机侧「编译 + 提供产物」，路由器侧「拉取 + 备份 + 重启 + 验证」（交互式输入密码）。
 
 **差异影响**：
 
 - 性能数字（AES-GCM 吞吐、代理转发吞吐）必须以 AX6 实测为准，开发机测得的只能作参考。OpenSSL 实测 AX6 AES-256-GCM ≈ 136 MB/s，Go 实现需真机 benchmark 确认（Phase 0 前置项）。
 - 路由器 CA bundle 可能不全 → 云盘 HTTPS 请求失败时的排查项。
 - 测试策略：单元/集成测试全部在 x86 跑（含 -race）；云盘驱动用 `httptest` 起假服务器（正常响应 + 过期/403 场景），**不使用真实凭证**。现有云盘驱动无测试的历史问题借此解决。
+- 测试视频/文件：**从天翼家庭开始**（URL 时效长、55 GB 样本现成）。
 
 ## 3. 功能 A：凭证网页管理（v0.10.0）
 
@@ -40,6 +63,7 @@
 
 1. 移动云盘 authorization 过期后（当前表现为空目录 + 提示名），用户用浏览器打开 mini-cloud 网页输入新 authorization 即可更新，无需 SSH。
 2. 更新后立即生效（运行时热更新），并持久化：重启后仍有效。
+3. 附带独立修复 3 处现存转义缺陷（§3.6，独立提交）。
 
 ### 3.2 接口设计
 
@@ -68,71 +92,111 @@ type CredentialUpdater interface {
 新增 `internal/admin` 包（渲染与表单逻辑，通过 main 注入挂载信息与持久化回调，不依赖 conf，避免循环依赖）：
 
 - `GET /admin`：管理页，Basic Auth 保护。列出所有支持 CredentialUpdater 的挂载：名称、当前健康状态（`HealthReporter.HealthWarning`）、凭证表单。每次渲染生成一次性 CSRF token（内存 map + 过期时间）。
-- `POST /admin/update`：`mount` + 字段值。流程：
+- `POST /admin/update`：`mount` + 字段值。流程（D5 修订，顺序与回滚点固定）：
   1. 校验 Basic Auth + CSRF token（一次性）。
-  2. 找到挂载 → `UpdateCredential(ctx, values)`。
-  3. 成功 → main 将新值写回 config.json 对应 cloud 条目（原子写 temp+rename，写前备份 config.json.bak），返回成功页（含新 token 的过期时间）。
-  4. 失败 → 驱动内部已回滚旧凭证，返回错误页与原因。
+  2. 找到挂载 → `UpdateCredential(ctx, values)`：驱动内部做格式校验 + **网络验证（`context.WithTimeout`，10 秒）**，失败自动回滚旧凭证并返回错误。
+  3. 成功 → main 按序落盘：
+     a. 原子写 config.json（temp + rename + fsync + 写前备份 `.bak` + 写后 `os.Chmod 0600`，`.bak` 同样 chmod；D2）；
+     b. 加锁切换驱动内存凭证（与请求路径互斥，见下）；
+     c. 写 token state（`state/<挂载名>_token.json`）。
+     任一步失败：回滚（config 用 `.bak` 恢复、驱动凭证换回旧值），返回明确错误与原因。
+  4. 成功页显示新 token 的过期时间；失败页显示原因。
 - 根导航页增加「管理」链接（仅浏览器访问时可见）。
+
+**并发模型（D5）**：`cfg` 加互斥锁保护或 copy-on-write——管理页写入不得与请求期读取（`checkAuth` 每请求读 `cfg.Server.*`）共享可写状态；`checkAuth` 读取路径纳入锁范围。
+
+**config.json 写回副作用（D5-4）**：`conf.Save` 目前会输出空 `cloud` 旧字段（无 omitempty），首次网页写回后 config.json 会多出一个空 `"cloud": {}` 块。v0.10.0 给 `CloudConfig` 加 `omitempty`（列入修改清单），避免用户误判配置损坏。
 
 ### 3.4 移动驱动实现要点
 
-1. `UpdateCredential` 流程：`parseAuthString` 校验格式 → 保存旧值 → 应用新值到 Client（走现有互斥锁）→ 网络验证（调用个人云 API 列根目录；401/403 视为无效）→ 验证失败恢复旧值并返回错误；成功则 `discoverCloudHost` + `saveTokenState`（`state/<挂载名>_token.json`）。
+1. `UpdateCredential` 流程：`parseAuthString` 校验格式 → 保存旧值 → 应用新值到 Client（走现有互斥锁）→ 网络验证（调用个人云 API 列根目录；401/403 视为无效）→ 验证失败恢复旧值并返回错误；成功则 `discoverCloudHost` + `saveTokenState`。
 2. 网络不可达时拒绝更新并明确提示（不写入无法验证的凭证）。
 3. 更新成功后 `HealthWarning` 自动消失（`client.isExpired()` 为 false）。
-4. config.json 写入由 main 负责（驱动不持有 config 路径）；`conf.Save` 权限从 0644 改为 0600（含真实凭证）。
+4. config.json 写入由 main 负责（驱动不持有 config 路径）。
 
 ### 3.5 安全
 
 - 复用现有 Basic Auth（单用户体系）；管理页不再单独设密码。
+- **已拍板：不上 HTTPS**，HTTP 明文（局域网内使用；同网段设备理论上可截获 authorization，风险接受）。如需加密，由用户在路由器前置 HTTPS 反向代理，本项目不实现。
 - CSRF token：GET 生成、POST 校验、一次性。
 - 所有页面输出 HTML 转义；日志不打印凭证全文（只打账号与过期时间）。
-- config.json、state/* 文件权限 0600。
+- config.json、state/* 文件权限 0600（写入后显式 chmod）。
 
-### 3.6 验收标准（v0.10.0）
+### 3.6 附带独立修复：3 处现存转义缺陷（P4）
+
+| 缺陷 | 位置 | 影响 | 修复 |
+|---|---|---|---|
+| href 无百分号编码 | `internal/webdav/prop.go` / `buildHref` | 中文/空格/`#`/`?` 文件名在严格客户端 404 | `url.PathEscape` 逐段编码 |
+| 目录页文件名未 HTML 转义 | `internal/webdav/webdav.go` / `serveDirHTML` | 文件名可注入脚本（XSS） | `html/template` 或 `html.EscapeString` |
+| 根 PROPFIND 挂载名未 XML 转义 | `main.go` / `serveRootPropfind` | 挂载名含 `&` 等字符时产出非法 XML | `xml.EscapeText` |
+
+三条独立提交、独立验收，纳入 v0.10.0；与 Vault 无耦合。
+
+### 3.7 验收标准（v0.10.0）
 
 1. x86 VM + mock 驱动：更新成功 / 格式错误 / 网络验证失败三条路径 UI 与回滚行为正确。
 2. 真机 AX6：输入新 authorization → 挂载恢复、可列目录、可播放；重启后仍有效（config.json 已更新）。
 3. 旧 302 行为不受影响（现有测试全绿）。
 4. 未登录访问 /admin 返回 401；CSRF token 无效时 POST 被拒绝。
+5. 三处转义缺陷修复后：含中文/空格/`#` 文件名的 PROPFIND href 可被严格客户端访问；目录页与根 PROPFIND 对特殊字符安全。
+6. 真机 `ls -l` 核对 config.json、config.json.bak、state/* 权限为 0600（D2）。
+7. 管理页更新成功后 config.json 无空 `cloud` 块（omitempty 生效）。
 
 ## 4. 功能 B：Vault 加密文件播放（v1.0+）
 
-可行性、加密格式（MCF1 文件头 + 1 MiB 分块 AES-256-GCM）、密钥层级、URL 403 刷新、组件划分详见《个人文件夹功能-测试总结.md》v1.0。本节只记录与现有代码的集成契约。
+可行性、加密格式（MCF1）、密钥层级、URL 时效详见 docs/vault-feasibility.md（v1.1）。本节记录与现有代码的集成契约与评审后定稿的语义。
 
-### 4.1 包装顺序（新增 Vault 与 CredentialUpdater 之后）
+### 4.1 包装顺序（D1/D4 修订后，与报告 §8.2 逐字一致）
 
 ```go
-raw := createDriver(...)                       // tianyi / mobile / baidu / local
-raw.Init(ctx)
-auth.StartWatcher(ctx, raw, 5*time.Minute)     // 必须传 raw：TokenManager 断言在 raw 上
+raw := createDriver(cc)                      // 驱动以 cc.MountName() 命名（挂载名，非类型名）
+if err := raw.Init(ctx); err != nil { ... }  // error 必须处理
+auth.StartWatcher(ctx, raw, 5*time.Minute)   // 必须传 raw：TokenManager 断言在 raw 上
 
 cached := fs.NewCachedReader(fs.NewRetryReader(raw))
-drv := driver.Driver = cached
+var drv driver.Driver = cached
 if vaultCfg != nil {
-    v := vault.New(cached, vaultCfg)
-    v.Init(ctx)
+    v := vault.New(cached, raw, vaultCfg)    // List 走 cached（虚拟树在内存，不命中上游）；Link 走 raw（Vault 自管 URL 表）
+    if err := v.Init(ctx); err != nil { ... }
     v.Start(ctx)
     drv = v
 }
 ```
 
-- Vault 只拦截 `<mount>/<vaultPath>/...`（如 /backup、/Archive）；其余路径原样委托 → 302 行为不变。
-- **`TokenManager` / `HealthReporter` / `CredentialUpdater` 的断言对象必须始终是 raw 驱动**；Vault 与 CachedReader 不得实现这些接口（避免误断言到包装层）。
+- **URL 时效由 Vault 自管（D1）**：现有 `CachedReader` 链接缓存固定 10 分钟 TTL、无按条目指定 TTL 的扩展点，Vault 路径不走它的链接缓存；Vault 自建「URL + 绝对过期时间」表，TTL = `min(10min, expires - now - 60s)`；403 时失效旧 URL → 重新 Link → 重试一次，再失败 502；并发刷新用标准库 mutex 自实现（不引外部库）。
+- **`TokenManager` / `HealthReporter` / `CredentialUpdater` 的断言对象必须始终是 raw 驱动**；Vault 与 CachedReader 不得实现这些接口。
+- **Stop 幂等（I7）**：`CachedReader.Stop` 改 `sync.Once`（当前二次调用 panic）；所有权链唯一：`main → Handler.Close → Vault.Stop → CachedReader.Stop`，任何中间层不得被 main 单独 Stop；补「重复 Stop 不 panic」单元测试。
 
 ### 4.2 分阶段与验收（与报告 §9 对齐）
 
-- **Phase 0 / v1.0.0**：`cmd/mcrypt` + `internal/vault`（格式、解密 Reader、manifest），只接 local 驱动。验收：全文件 SHA-256 一致；Range 返回 206；随机 Seek 不整文件下载；`go test -race` 全绿；**AX6 上 Go AES-GCM benchmark ≥ 40 MB/s**（低于则重新评估并发策略）。
-- **Phase 1 / v1.1.0**：接天翼家庭 → 移动（验证 403 刷新）→ 百度（OpenRange/dlink 缓存）。验收：4K remux 顺序播放 + 拖动 10 次不失败；URL 过期自动刷新不中断；响应头重写正确。
+- **Phase 0 / v1.0.0**：`cmd/mcrypt` + `internal/vault`（格式、解密 Reader、manifest），只接 local 驱动。验收：全文件 SHA-256 一致；Range 返回 206；随机 Seek 不整文件下载；`GET <vault 根>/_mc/...` 返回 403（I4）；空文件可解密、头部被篡改时拒绝（I2）；`go test -race` 全绿；**AX6 上 Go AES-GCM benchmark ≥ 40 MB/s**（低于则重新评估并发策略）。
+- **Phase 1 / v1.1.0**：接天翼家庭 → 移动（验证 403 刷新）→ 百度（OpenRange/dlink 缓存）。验收：4K remux 顺序播放 + 拖动 10 次不失败；URL 过期自动刷新不中断；响应头重写正确；**对象绑定强校验**（manifest fileID 与对象头一致、metadata.p 与请求路径比对，PM 拍板放 Phase 1）。
 - **Phase 2 / v1.2.0**：块缓存/预读、百度 4 GB 分卷、manifest 增量更新、多密钥/轮换。
+
+### 4.3 Vault 路径语义与格式要点（评审后定稿）
+
+**路径语义（PM 设想，2026-11-16）**：
+
+- 配置全局一套：`vault.paths`（根目录名列表，如 `["backup", "Archive"]`，可多个）+ `vault.key_file`（全局 master key，永不传上网盘）。
+- 对每个挂载 M：请求路径 `/M/<p>/...` 的第一段 `p` 与 `vault.paths` 匹配即进入 Vault；**子目录继承**——Vault 根下任意深度的目录与文件全部按加密文件处理，虚拟视图完全由 manifest 决定。
+- 物理对象名与扩展名均非原名（如 `_mc/o/7f/3a/….bin`）；每个 Vault 根独立持有自己的 `_mc/manifest.mcf` 与对象，共用全局 master key。
+- `PROPFIND`/List 虚拟树只含 manifest 记录；`_mc` 与 manifest 未记录的其他物理对象一律不出现；`GET /M/<p>/_mc/...` 及任何未记录路径 → **403**，绝不回落 302 交出密文。
+- 未找到 manifest（或损坏）→ 该 Vault 根虚拟视图为空目录 + 健康提示，服务不崩溃。
+- **边界语义（PM 拍板，2026-11-16）**：名字匹配即视为 Vault——若某云盘根下存在恰好同名的**普通**文件夹且无 manifest，将显示为空目录（内容不可见）。此属用户误用 vault 路径名，不受保护，按此语义实现。
+
+**格式不变量（v1.1 定稿，详见报告 §7.3）**：fileID 每次加密新生成、禁止复用；manifest 条目含 header_sha256（空文件防头部篡改）；头部字段校验（chunk_size ∈ [64 KiB, 1 MiB]、data_offset == 64+meta_len、meta_len ≤ 4 KiB、plain_size ≥ 0）；对象绑定字段（fileID 一致 + metadata.p 路径比对）自 Phase 0 起就位、强校验 Phase 1。
+
+**响应头（D3 定稿）**：ETag 与 MIME 唯一来源 = Vault 虚拟树（`model.Obj` 增可选字段 ETag/ContentType，`prop.go` / `buildPropsXML` 改造入修改清单）；Vault 自行构造 `Link.Header`，禁止透传上游 `Content-Length` / `Content-Range` / `Content-Encoding` / `ETag`；`Content-Encoding` 强制 identity。
+
+**上游异常分支**（I6，完整表见报告 §7.4）：200 忽略 Range → 流式丢弃到起始偏移后继续；416 → 透传；Content-Range 不符 → 关闭重试一次，再失败 502；客户端断开 → ctx 取消上游；Seek 换流 → 旧 body 必须 Close；`max_streams` 为全局信号量（含获取超时），超限 503。
 
 ## 5. 里程碑
 
 | 版本 | 内容 | 依据 |
 |---|---|---|
-| v0.10.0 | 凭证网页管理（mobile authorization） | 本文 §3 |
+| v0.10.0 | 凭证网页管理（mobile authorization）+ 3 处转义缺陷独立修复 + 部署脚本（scripts/） | 本文 §3 |
 | v1.0.0 | Vault Phase 0 本地 PoC | 报告 §9 |
-| v1.1.0 | Vault Phase 1 云端 MVP | 报告 §9 |
+| v1.1.0 | Vault Phase 1 云端 MVP（首接天翼家庭） | 报告 §9 |
 | v1.2.0 | Vault Phase 2 加固 | 报告 §9 |
 
 每个版本按 docs/process.md 的 6 道闸门执行。
@@ -141,10 +205,12 @@ if vaultCfg != nil {
 
 | 风险 | 对策 |
 |---|---|
-| 网页更新写坏 config.json | 原子写（temp+rename）+ 写前备份 .bak |
-| 写入无法验证的凭证 | 网络验证失败即拒绝并回滚 |
+| 网页更新写坏 config.json | 原子写（temp+rename+fsync）+ 写前备份 .bak + chmod 0600 |
+| 写入无法验证的凭证 | 网络验证（10s 超时）失败即拒绝并回滚 |
 | Vault 改动破坏 302 路径 | 不改 302 分支；回归测试 + 验收标准 3 |
-| 移动 URL 15 分钟过期 | Vault 代理层 403 刷新（报告 §5.4） |
+| 移动 URL 15 分钟过期 | Vault 自管 URL 表 + 403 刷新（报告 §5.4） |
 | 路由器 Go 代理吞吐不足 | Phase 0 AX6 benchmark 前置 |
-| 凭据数据竞争 | 沿用现有互斥锁 + getter/setter 模式（be1c043） |
-| 管理页暴露给局域网内攻击面 | Basic Auth + CSRF + 输出转义 + 日志脱敏 |
+| 凭据数据竞争 | 沿用现有互斥锁 + getter/setter 模式（be1c043）；cfg 加锁（D5） |
+| 普通文件夹恰好与 vault.paths 同名 | 显示为空目录 + 健康提示（§4.3 边界，待 PM 确认） |
+| 管理页局域网明文提交凭证 | 已拍板接受（不上 HTTPS）；用户可自行前置 HTTPS 反代 |
+| AX6 存储/内存紧张 | 铁律 10：代码精简、冗余功能禁止；闸门⑤ 验收含体积与内存观察项 |
