@@ -158,14 +158,12 @@ func (h *Handler) getObj(ctx context.Context, reqPath string) (*model.Obj, error
 	return nil, fmt.Errorf("not found: %s", reqPath)
 }
 
-// buildHref 构建 WebDAV href
+// buildHref 构建 WebDAV href（经 escPath 逐段百分号编码：
+// 中文、空格、#、? 文件名在严格客户端上需要编码，v0.10.0 独立修复）
 func (h *Handler) buildHref(reqPath string, isDir bool) string {
-	href := path.Join(h.Prefix, reqPath)
+	href := h.escPath(reqPath)
 	if isDir && !strings.HasSuffix(href, "/") {
 		href += "/"
-	}
-	if !strings.HasPrefix(href, "/") {
-		href = "/" + href
 	}
 	return href
 }

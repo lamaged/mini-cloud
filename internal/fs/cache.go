@@ -217,6 +217,14 @@ func (c *CachedReader) InvalidateDir(path string) {
 	c.mu.Unlock()
 }
 
+// InvalidateAll 清空全部目录与链接缓存（凭证/账号变更后调用，防止旧账号数据残留）
+func (c *CachedReader) InvalidateAll() {
+	c.mu.Lock()
+	c.dirCache = make(map[string]*cacheEntry)
+	c.linkCache = make(map[string]*linkCacheEntry)
+	c.mu.Unlock()
+}
+
 // InvalidateLink 使指定文件链接缓存失效
 func (c *CachedReader) InvalidateLink(path string) {
 	c.mu.Lock()

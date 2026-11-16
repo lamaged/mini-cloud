@@ -8,9 +8,9 @@ import (
 
 // Config 应用配置
 type Config struct {
-	Server ServerConfig  `json:"server"`
-	Cloud  CloudConfig   `json:"cloud"`  // 单云盘（向后兼容）
-	Clouds []CloudConfig `json:"clouds"` // 多云盘（优先）
+	Server ServerConfig   `json:"server"`
+	Cloud  *CloudConfig   `json:"cloud,omitempty"` // 单云盘（向后兼容）；指针 + omitempty：指针保证空值被省略（struct 值的 omitempty 不生效），避免 Save 输出空 "cloud" 块
+	Clouds []CloudConfig  `json:"clouds"`          // 多云盘（优先）
 }
 
 // ServerConfig WebDAV 服务配置
@@ -49,7 +49,7 @@ func DefaultConfig() *Config {
 			Username: "admin",
 			Password: "admin",
 		},
-		Cloud: CloudConfig{
+		Cloud: &CloudConfig{
 			Type: "local",
 		},
 	}
@@ -75,18 +75,24 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 	cfg.normalize()
+	// 存量文件收紧权限（旧版 Save 写 0644；升级后启动即改为 0600）。
+	// 只读文件系统等场景下失败可忽略：下次 Save 会再次尝试。
+	os.Chmod(path, 0600)
 	return cfg, nil
 }
 
-// normalize 向后兼容：如果用了旧的 cloud 字段，包装为 clouds 数组
+// normalize 向后兼容：如果用了旧的 cloud 字段，包装为 clouds 数组；
+// clouds 存在时清空 Cloud（clouds 优先，且避免默认值残留导致 Save 输出伪 cloud 块）
 func (c *Config) normalize() {
-	if len(c.Clouds) == 0 && c.Cloud.Type != "" {
-		c.Clouds = []CloudConfig{c.Cloud}
-		c.Cloud = CloudConfig{} // 清空旧字段
+	if len(c.Clouds) == 0 && c.Cloud != nil && c.Cloud.Type != "" {
+		c.Clouds = []CloudConfig{*c.Cloud}
+	}
+	if len(c.Clouds) > 0 {
+		c.Cloud = nil
 	}
 }
 
-// Save 保存配置到文件
+// Save 保存配置到文件（原子写：temp + fsync + rename；写后 chmod 0600，含真实凭证）
 func (c *Config) Save(path string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return err
@@ -95,5 +101,49 @@ func (c *Config) Save(path string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0644)
+
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
+		return err
+	}
+	// 显式 chmod 在替换前完成：os.WriteFile 的 perm 只对新建文件生效，
+	// 且 rename 会保留 temp 的权限，替换后正式文件即为 0600（D2）。
+	// 若文件系统不支持 chmod，在此失败时尚未替换正式文件，无副作用。
+	if err := os.Chmod(tmp, 0600); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	// fsync：确保内容落盘后再替换（防止断电/崩溃产生半截文件）；错误不得吞掉
+	f, err := os.OpenFile(tmp, os.O_WRONLY, 0)
+	if err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+// Backup 备份配置到 path+".bak"（0600），供写回前留底与失败恢复
+func Backup(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	bak := path + ".bak"
+	if err := os.WriteFile(bak, data, 0600); err != nil {
+		return err
+	}
+	return os.Chmod(bak, 0600)
 }

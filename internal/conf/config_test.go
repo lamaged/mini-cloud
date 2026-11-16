@@ -1,6 +1,7 @@
 package conf
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -167,5 +168,90 @@ func TestSaveCreatesDirectory(t *testing.T) {
 
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		t.Error("Save should create parent directories")
+	}
+}
+
+func TestSavePermissions0600(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+
+	cfg := DefaultConfig()
+	if err := cfg.Save(path); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	checkPerm(t, path, 0600)
+
+	// 存量文件（如旧版 0644）再次 Save 后也必须是 0600
+	if err := os.Chmod(path, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.Save(path); err != nil {
+		t.Fatalf("Save existing: %v", err)
+	}
+	checkPerm(t, path, 0600)
+
+	// 无残留临时文件
+	if _, err := os.Stat(path + ".tmp"); !os.IsNotExist(err) {
+		t.Error("Save should not leave .tmp behind")
+	}
+}
+
+func TestSaveOmitsEmptyCloud(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+
+	cfg := DefaultConfig()
+	cfg.Clouds = []CloudConfig{{Name: "test", Type: "local"}}
+	cfg.Cloud = nil // 归一化后 Cloud 为空指针，输出中不得出现 "cloud" 键
+	if err := cfg.Save(path); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(data, []byte(`"cloud"`)) {
+		t.Errorf("saved config should not contain empty cloud block: %s", data)
+	}
+}
+
+func TestBackup(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+
+	cfg := DefaultConfig()
+	cfg.Server.Listen = ":1"
+	if err := cfg.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Server.Listen = ":2"
+	if err := cfg.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := Backup(path); err != nil {
+		t.Fatalf("Backup: %v", err)
+	}
+	bakData, err := os.ReadFile(path + ".bak")
+	if err != nil {
+		t.Fatalf("read .bak: %v", err)
+	}
+	var bak Config
+	if err := json.Unmarshal(bakData, &bak); err != nil {
+		t.Fatal(err)
+	}
+	if bak.Server.Listen != ":2" {
+		t.Errorf("backup should contain latest config, got listen %q", bak.Server.Listen)
+	}
+	checkPerm(t, path+".bak", 0600)
+}
+
+func checkPerm(t *testing.T, path string, want os.FileMode) {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	if got := info.Mode().Perm(); got != want {
+		t.Errorf("%s perm = %o, want %o", path, got, want)
 	}
 }

@@ -1,6 +1,7 @@
 package mobile
 
 import (
+	"context"
 	"crypto/md5"
 	"crypto/rand"
 	"encoding/base64"
@@ -137,8 +138,8 @@ func (c *Client) SetAuthRefreshCallback(cb func() error) {
 // 个人云新版 API 请求
 // ============================================================
 
-// personalRequest 发送个人云 API 请求（自动签名）
-func (c *Client) personalRequest(pathname string, body interface{}, result interface{}) ([]byte, error) {
+// personalRequest 发送个人云 API 请求（自动签名；ctx 传导以支持取消与超时）
+func (c *Client) personalRequest(ctx context.Context, pathname string, body interface{}, result interface{}) ([]byte, error) {
 	cloudHost := c.getCloudHost()
 	if cloudHost == "" {
 		return nil, fmt.Errorf("cloud host not set")
@@ -154,7 +155,7 @@ func (c *Client) personalRequest(pathname string, body interface{}, result inter
 	ts := time.Now().Format("2006-01-02 15:04:05")
 	sign := calSign(string(bodyBytes), ts, randStr)
 
-	req, err := http.NewRequest("POST", url, strings.NewReader(string(bodyBytes)))
+	req, err := http.NewRequestWithContext(ctx, "POST", url, strings.NewReader(string(bodyBytes)))
 	if err != nil {
 		return nil, err
 	}
@@ -256,7 +257,7 @@ func isAuthError(code, msg string) bool {
 // ============================================================
 
 // requestRoute 查询路由策略获取个人云主机地址
-func (c *Client) requestRoute() (*QueryRoutePolicyResp, error) {
+func (c *Client) requestRoute(ctx context.Context) (*QueryRoutePolicyResp, error) {
 	url := "https://user-njs.yun.139.com/user/route/qryRoutePolicy"
 
 	body := map[string]interface{}{
@@ -273,7 +274,7 @@ func (c *Client) requestRoute() (*QueryRoutePolicyResp, error) {
 	ts := time.Now().Format("2006-01-02 15:04:05")
 	sign := calSign(string(bodyBytes), ts, randStr)
 
-	req, err := http.NewRequest("POST", url, strings.NewReader(string(bodyBytes)))
+	req, err := http.NewRequestWithContext(ctx, "POST", url, strings.NewReader(string(bodyBytes)))
 	if err != nil {
 		return nil, err
 	}

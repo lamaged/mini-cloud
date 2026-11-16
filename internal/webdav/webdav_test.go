@@ -443,6 +443,52 @@ func TestBuildHrefWithPrefix(t *testing.T) {
 	}
 }
 
+func TestBuildHrefEscapesSpecialChars(t *testing.T) {
+	h := &Handler{Prefix: "/dav"}
+	tests := []struct {
+		path  string
+		isDir bool
+		want  string
+	}{
+		{"/我的 视频/星际穿越#4K.mkv", false, "/dav/%E6%88%91%E7%9A%84%20%E8%A7%86%E9%A2%91/%E6%98%9F%E9%99%85%E7%A9%BF%E8%B6%8A%234K.mkv"},
+		{"/a b/c?d", false, "/dav/a%20b/c%3Fd"},
+		{"/中文目录", true, "/dav/%E4%B8%AD%E6%96%87%E7%9B%AE%E5%BD%95/"},
+	}
+	for _, tc := range tests {
+		got := h.buildHref(tc.path, tc.isDir)
+		if got != tc.want {
+			t.Errorf("buildHref(%q, %v) = %q, want %q", tc.path, tc.isDir, got, tc.want)
+		}
+	}
+}
+
+func TestServeDirHTMLEscapesNames(t *testing.T) {
+	m := newMockDriver()
+	// 注意：注入名不能含 "/"，否则 mockDriver.List 会把它当作深层路径过滤掉
+	m.files["/<img src=x onerror=alert(1)>.txt"] = &fileEntry{
+		obj:  model.Obj{Name: "<img src=x onerror=alert(1)>.txt", Size: 5, ModTime: time.Now(), IsDir: false},
+		data: []byte("hello"),
+	}
+	h := &Handler{Driver: m}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/dav/", nil)
+	status, err := h.serveDirHTML(rec, req, "/")
+	if err != nil {
+		t.Fatalf("serveDirHTML: %v", err)
+	}
+	if status != 0 {
+		t.Fatalf("serveDirHTML status = %d", status)
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, "<img src=x onerror=alert(1)>.txt") {
+		t.Error("file name not HTML-escaped")
+	}
+	if !strings.Contains(body, "&lt;img src=x onerror=alert(1)&gt;.txt") {
+		t.Errorf("expected escaped name in output, got: %s", body)
+	}
+}
+
 // ============================================================
 // XML props 测试
 // ============================================================

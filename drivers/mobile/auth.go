@@ -1,6 +1,7 @@
 package mobile
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/xml"
@@ -139,7 +140,7 @@ func (c *Client) refreshToken() error {
 // ============================================================
 
 // discoverCloudHost 发现个人云 API 主机地址
-func (c *Client) discoverCloudHost() error {
+func (c *Client) discoverCloudHost(ctx context.Context) error {
 	if c.getAccount() == "" {
 		// 从 authorization 解析 account
 		decode, err := base64.StdEncoding.DecodeString(c.getAuthorization())
@@ -153,7 +154,7 @@ func (c *Client) discoverCloudHost() error {
 		c.setAccount(parts[1])
 	}
 
-	resp, err := c.requestRoute()
+	resp, err := c.requestRoute(ctx)
 	if err != nil {
 		return fmt.Errorf("query route failed: %w", err)
 	}

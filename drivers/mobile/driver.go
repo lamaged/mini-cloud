@@ -8,6 +8,7 @@ import (
 	"path"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"mini-cloud/internal/driver"
@@ -24,6 +25,28 @@ type Driver struct {
 	rootID   string   // 根目录 ID
 	pathCache map[string]string // 路径→ID 缓存
 	cacheMu   sync.RWMutex
+
+	// 待提交凭证（CredentialUpdater 两阶段：Validate 暂存、Commit 生效；按 __req 隔离并发更新）
+	pendingMu sync.Mutex
+	pending   map[string]*pendingCred
+
+	// 已提交凭证快照与代次：401 回调刷新期间若发生管理页提交，丢弃过期刷新结果
+	credGen      atomic.Uint64
+	commitMu     sync.Mutex
+	commitAuth   string
+	commitAccount string
+	commitHost   string
+
+	// 路径缓存代次：提交新凭证时递增，使在途解析结果作废
+	cacheGen atomic.Uint64
+}
+
+// pendingCred 一次 ValidateCredential 暂存的待提交凭证
+type pendingCred struct {
+	auth      string
+	account   string
+	host      string
+	createdAt time.Time
 }
 
 // New 创建移动云盘驱动
@@ -35,6 +58,7 @@ func New(name, authorization, stateDir string) *Driver {
 		client:        NewClient(),
 		rootID:        "/",
 		pathCache:     make(map[string]string),
+		pending:       make(map[string]*pendingCred),
 	}
 }
 
@@ -59,10 +83,26 @@ func (d *Driver) Init(ctx context.Context) error {
 	// 设置 401 自动刷新回调（必须在任何 early return 之前，确保运行时安全网始终生效）
 	d.client.SetAuthRefreshCallback(func() error {
 		slog.Info("移动云盘 401，触发 Token 刷新")
+		gen := d.credGen.Load()
 		if err := d.client.refreshToken(); err != nil {
 			return err
 		}
-		d.saveTokenState()
+		if d.credGen.Load() != gen {
+			// 刷新期间管理页提交了新凭证：丢弃本次刷新结果，恢复已提交凭证
+			d.commitMu.Lock()
+			a, ac, h := d.commitAuth, d.commitAccount, d.commitHost
+			d.commitMu.Unlock()
+			if a != "" {
+				d.client.SetAuth(a, ac, h)
+				if err := d.saveTokenState(); err != nil {
+					slog.Warn("保存 token 失败", "err", err)
+				}
+			}
+			return nil
+		}
+		if err := d.saveTokenState(); err != nil {
+			slog.Warn("保存 token 失败", "err", err)
+		}
 		return nil
 	})
 
@@ -93,8 +133,8 @@ func (d *Driver) Init(ctx context.Context) error {
 					slog.Info("缓存 token 临近过期或已过期，启动时刷新")
 					if refreshErr := d.client.refreshToken(); refreshErr != nil {
 						slog.Warn("缓存 token 刷新失败，将使用现有 token（运行时 401 会再次尝试）", "err", refreshErr)
-					} else {
-						d.saveTokenState()
+					} else if err := d.saveTokenState(); err != nil {
+						slog.Warn("保存 token 失败", "err", err)
 					}
 				}
 				return nil
@@ -113,16 +153,18 @@ func (d *Driver) Init(ctx context.Context) error {
 	}
 
 	// 发现云主机
-	if err := d.client.discoverCloudHost(); err != nil {
+	if err := d.client.discoverCloudHost(ctx); err != nil {
 		return fmt.Errorf("发现云主机失败: %w", err)
 	}
 
-	d.saveTokenState()
+	if err := d.saveTokenState(); err != nil {
+		slog.Warn("保存 token 失败", "err", err)
+	}
 	return nil
 }
 
 // saveTokenState 保存当前认证状态到磁盘（过期时间从 Authorization 真实提取）
-func (d *Driver) saveTokenState() {
+func (d *Driver) saveTokenState() error {
 	expiresAt := time.Now().Unix() + 86400*30 // 兜底值
 	if _, _, _, expiration, err := d.client.parseAuthorization(); err == nil {
 		expiresAt = expiration / 1000
@@ -134,8 +176,9 @@ func (d *Driver) saveTokenState() {
 		ExpiresAt:     expiresAt,
 	}
 	if err := SaveToken(d.name, d.stateDir, token); err != nil {
-		slog.Warn("保存 token 失败", "err", err)
+		return fmt.Errorf("保存 token 失败: %w", err)
 	}
+	return nil
 }
 
 // ============================================================
@@ -170,15 +213,18 @@ func (d *Driver) resolveFolderID(ctx context.Context, reqPath string) (string, e
 	}
 	d.cacheMu.RUnlock()
 
-	// 逐级查找
+	// 逐级查找（记录代次：若期间凭证被提交并清空了缓存，本次结果作废）
 	parts := splitPath(reqPath)
+	gen := d.cacheGen.Load()
 	id, err := d.resolveByWalk(ctx, d.rootID, parts)
 	if err != nil {
 		return "", err
 	}
 
 	d.cacheMu.Lock()
-	d.pathCache[reqPath] = id
+	if d.cacheGen.Load() == gen {
+		d.pathCache[reqPath] = id
+	}
 	d.cacheMu.Unlock()
 	return id, nil
 }
@@ -252,7 +298,7 @@ func (d *Driver) Link(ctx context.Context, filePath string) (*model.Link, error)
 func (d *Driver) getDownloadLink(ctx context.Context, fileID string) (*model.Link, error) {
 	var result DownloadUrlResp
 
-	_, err := d.client.personalRequest("/file/getDownloadUrl", map[string]interface{}{
+	_, err := d.client.personalRequest(ctx, "/file/getDownloadUrl", map[string]interface{}{
 		"fileId": fileID,
 	}, &result)
 	if err != nil {
@@ -303,7 +349,7 @@ func (d *Driver) listRawFolder(ctx context.Context, folderID string) ([]Personal
 
 	for {
 		var result PersonalListResp
-		_, err := d.client.personalRequest("/file/list", map[string]interface{}{
+		_, err := d.client.personalRequest(ctx, "/file/list", map[string]interface{}{
 			"imageThumbnailStyleList": []string{"Small", "Large"},
 			"orderBy":                 "updated_at",
 			"orderDirection":          "DESC",

@@ -108,7 +108,7 @@ type CredentialUpdater interface {
 
 **并发模型（D5）**：`cfg` 加互斥锁保护或 copy-on-write——管理页写入不得与请求期读取（`checkAuth` 每请求读 `cfg.Server.*`）共享可写状态；`checkAuth` 读取路径纳入锁范围。
 
-**config.json 写回副作用（D5-4）**：`conf.Save` 目前会输出空 `cloud` 旧字段（无 omitempty），首次网页写回后 config.json 会多出一个空 `"cloud": {}` 块。v0.10.0 给 `CloudConfig` 加 `omitempty`（列入修改清单），避免用户误判配置损坏。
+**config.json 写回副作用（D5-4）**：`conf.Save` 会输出空 `cloud` 旧字段。v0.10.0 将 `Cloud` 字段改为**指针 + `omitempty`**（Go 中 struct 值的 omitempty 不生效，指针才能省略），避免用户误判配置损坏。
 
 ### 3.4 移动驱动实现要点
 
@@ -146,6 +146,18 @@ type CredentialUpdater interface {
 6. 真机 `ls -l` 核对 config.json、config.json.bak、state/* 权限为 0600（D2）。
 7. 管理页更新成功后 config.json 无空 `cloud` 块（omitempty 生效）。
 8. 两阶段语义：验证失败或 config 写失败时，内存凭证与磁盘文件均保持不变（零回滚）。
+
+### 3.8 实现期修订（v0.3.1，2026-11-16 实现与自查后补充）
+
+按代码自查（15 条）落地的实现细节，与 §3.2/§3.3 共同构成最终契约：
+
+- **保留键**：values 增加 `__req`（更新请求唯一标识，admin 生成；驱动按它关联 Validate 与 Commit，隔离并发更新）与 `__expiry`（驱动回填显示用）。
+- **哨兵错误**：`driver.ErrStateWriteFailed`——CommitCredential 在「凭证已生效但 token state 写盘失败」时用 `%w` 返回；admin 据此显示「更新成功（警告）」，其余提交错误显示「凭证生效失败」。
+- **提交生效后清缓存**：admin 在提交生效后回调 main（`OnCommitted`），使该挂载的目录/链接缓存全部失效（`CachedReader.InvalidateAll`），避免旧账号数据残留 30s/10min。
+- **移动驱动并发防护**：① 待提交凭证按 `__req` 隔离并 5 分钟过期清理；② 凭证代次计数（`credGen`）——401 自动刷新回调若发现刷新期间有新提交，丢弃过期刷新结果并恢复已提交凭证；③ 路径缓存代次（`cacheGen`）——在途路径解析结果在提交后作废；④ token state 写盘失败时删除旧缓存文件，保证重启后以 config.json 为准。
+- **config 写回细节**：以磁盘当前内容为基准（尊重运行期间手工修改），写盘成功后才更新内存副本；`conf.Load` 启动时收紧存量 config.json 权限至 0600；`Save` 在 rename 前完成 chmod 并检查 fsync 错误；`config.json.bak`/`.tmp` 加入 .gitignore。
+- **ctx 传导**：`discoverCloudHost`/`personalRequest` 全面接受 ctx（10 秒管理页超时真正生效）。
+- **Cloud 字段**：改为指针 + `omitempty`（Go 的 struct 值 omitempty 不生效，指针才能省略）；`normalize` 在 clouds 存在时清空 Cloud，避免输出伪 `"cloud"` 块。
 
 ## 4. 功能 B：Vault 加密文件播放（v1.0+）
 
