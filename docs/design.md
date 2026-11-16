@@ -144,6 +144,8 @@ type CredentialUpdater interface {
 
 ### 3.7 验收标准（v0.10.0）
 
+> 真机验收对照清单见 docs/acceptance-v0.10.0.md（闸门⑤ 对着勾执行）。
+
 1. x86 VM + mock 驱动：更新成功 / 格式错误 / 网络验证失败三条路径 UI 与回滚行为正确。
 2. 真机 AX6：输入新 authorization → 挂载恢复、可列目录、可播放；重启后仍有效（config.json 已更新）。
 3. 旧 302 行为不受影响（现有测试全绿）。

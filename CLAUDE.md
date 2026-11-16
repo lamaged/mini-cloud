@@ -86,4 +86,5 @@ main.go（Basic Auth、路由、根索引页）
 - PROGRESS.md —— 开发进度与审核意见处置（专业语言，外部审核员阅读）。
 - TODO.md —— 待拍板事项、技术债、驳回待裁决。
 - docs/vault-feasibility.md —— Vault 加密方案可行性报告（AX6 性能、CDN Range、URL 时效实测数据）。
+- docs/acceptance-v0.10.0.md —— v0.10.0 真机验收清单（闸门⑤ 对着勾执行）。
 - docs/review/ —— 外部评审报告归档。
