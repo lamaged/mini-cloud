@@ -9,7 +9,6 @@ import (
 	"html"
 	"log/slog"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -29,7 +28,7 @@ import (
 	"mini-cloud/internal/webdav"
 )
 
-const version = "v0.9.2"
+const version = "v0.10.0"
 
 // mountedDriver 已挂载的云盘驱动信息
 type mountedDriver struct {
@@ -92,34 +91,27 @@ func main() {
 
 	// 配置写回（两阶段语义：验证通过才写；互斥保护避免并发写）
 	var cfgMu sync.Mutex
-	adminHandler := admin.New(adminMounts, func(ctx context.Context, mountName string, values map[string]string) error {
+	adminHandler := admin.New(adminMounts, func(ctx context.Context, mountName string, values map[string]string) (func(), error) {
 		cfgMu.Lock()
 		defer cfgMu.Unlock()
-		// 以磁盘当前内容为准（尊重运行期间的手工修改）；写盘成功后才更新内存副本
-		fresh, err := conf.Load(*configPath)
+		// 严格读取 + 以磁盘当前内容为准（尊重运行期间的手工修改）；写盘成功后才更新内存副本
+		fresh, err := conf.WriteCredential(*configPath, mountName, values)
 		if err != nil {
-			return fmt.Errorf("读取配置失败: %w", err)
-		}
-		found := false
-		for i := range fresh.Clouds {
-			if fresh.Clouds[i].MountName() == mountName {
-				// 目前仅移动云盘实现：字段固定为 authorization；后续驱动扩展时按字段映射
-				fresh.Clouds[i].Authorization = values["authorization"]
-				found = true
-				break
-			}
-		}
-		if !found {
-			return fmt.Errorf("未找到挂载: %s", mountName)
-		}
-		if err := conf.Backup(*configPath); err != nil {
-			return fmt.Errorf("备份配置失败: %w", err)
-		}
-		if err := fresh.Save(*configPath); err != nil {
-			return fmt.Errorf("写入配置失败: %w", err)
+			return nil, err
 		}
 		cfg.Clouds = fresh.Clouds // 写盘成功后才更新内存副本
-		return nil
+		return func() {
+			// 提交失败回滚（I6，PM 拍板方案①）：用 .bak 还原配置并同步内存副本
+			if err := conf.RestoreBackup(*configPath); err != nil {
+				slog.Error("回滚配置失败", "err", err)
+				return
+			}
+			cfgMu.Lock()
+			if restored, err := conf.LoadStrict(*configPath); err == nil {
+				cfg.Clouds = restored.Clouds
+			}
+			cfgMu.Unlock()
+		}, nil
 	})
 
 	// HTTP 路由
@@ -358,7 +350,7 @@ func serveRootPropfind(w http.ResponseWriter, r *http.Request, mounts []mountedD
 </D:prop>
 <D:status>HTTP/1.1 200 OK</D:status>
 </D:propstat>
-</D:response>`, xmlText(encodeURLPath(m.Prefix)), xmlText(displayName(m)))
+</D:response>`, xmlText(webdav.EncodePathSegments(m.Prefix)), xmlText(displayName(m)))
 	}
 
 	fmt.Fprint(w, "\n</D:multistatus>")
@@ -369,15 +361,6 @@ func xmlText(s string) string {
 	var b strings.Builder
 	xml.EscapeText(&b, []byte(s))
 	return b.String()
-}
-
-// encodeURLPath 对 URL 路径逐段百分号编码（挂载名/文件名含中文、空格、# 等字符时保证链接可访问）
-func encodeURLPath(p string) string {
-	segs := strings.Split(p, "/")
-	for i := range segs {
-		segs[i] = url.PathEscape(segs[i])
-	}
-	return strings.Join(segs, "/")
 }
 
 func serveRootIndex(w http.ResponseWriter, mounts []mountedDriver, hasAdmin bool) {
@@ -399,7 +382,7 @@ h1{font-size:22px;border-bottom:2px solid #0366d6;padding-bottom:10px}
 
 	for _, m := range mounts {
 		label := displayName(m)
-		href := encodeURLPath(m.Prefix) + "/"
+		href := webdav.EncodePathSegments(m.Prefix) + "/"
 		fmt.Fprintf(w, `<a class="card" href="%s">
 <div class="name">%s</div>
 <div class="desc">%s</div>

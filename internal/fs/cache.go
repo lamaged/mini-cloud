@@ -51,6 +51,7 @@ type CachedReader struct {
 	linkTTL time.Duration
 
 	stopCleanup chan struct{}
+	stopOnce    sync.Once // Stop 幂等（I7/P4：重复 Stop 不得 panic）
 }
 
 // NewCachedReader 创建缓存包装器，自动启动定期清理
@@ -205,9 +206,11 @@ func (c *CachedReader) evictOldestLinkLocked() {
 // 对外接口
 // ============================================================
 
-// Stop 停止后台清理
+// Stop 停止后台清理（幂等：重复调用无副作用）
 func (c *CachedReader) Stop() {
-	close(c.stopCleanup)
+	c.stopOnce.Do(func() {
+		close(c.stopCleanup)
+	})
 }
 
 // InvalidateDir 使指定目录缓存失效

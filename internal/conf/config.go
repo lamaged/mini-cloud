@@ -2,6 +2,8 @@ package conf
 
 import (
 	"encoding/json"
+	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 )
@@ -55,21 +57,30 @@ func DefaultConfig() *Config {
 	}
 }
 
-// Load 从文件加载配置，如果文件不存在则创建默认配置
+// Load 从文件加载配置，如果文件不存在则创建默认配置（仅限启动路径使用）
 func Load(path string) (*Config, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if !os.IsNotExist(err) {
-			return nil, err
-		}
-		// 文件不存在，创建默认配置
-		cfg := DefaultConfig()
-		if err := cfg.Save(path); err != nil {
-			return nil, err
-		}
+	cfg, err := LoadStrict(path)
+	if err == nil {
 		return cfg, nil
 	}
+	if !os.IsNotExist(err) {
+		return nil, err
+	}
+	// 文件不存在，创建默认配置
+	cfg = DefaultConfig()
+	if err := cfg.Save(path); err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
 
+// LoadStrict 严格读取配置：文件缺失或解析失败直接报错，绝不自动创建默认配置。
+// 供管理页写回路径使用（避免 config.json 被误删后重建出 admin/admin 默认认证）。
+func LoadStrict(path string) (*Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
 	cfg := DefaultConfig()
 	if err := json.Unmarshal(data, cfg); err != nil {
 		return nil, err
@@ -102,6 +113,12 @@ func (c *Config) Save(path string) error {
 		return err
 	}
 
+	return writeFileAtomic(path, data)
+}
+
+// writeFileAtomic 原子写：temp + chmod + fsync + rename + 父目录 fsync。
+// 父目录 fsync 保证 rename 本身断电可持久（I3，尽力而为：失败仅记 WARN）。
+func writeFileAtomic(path string, data []byte) error {
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, data, 0600); err != nil {
 		return err
@@ -132,7 +149,20 @@ func (c *Config) Save(path string) error {
 		os.Remove(tmp)
 		return err
 	}
+	syncDir(filepath.Dir(path))
 	return nil
+}
+
+// syncDir 对目录 fsync，使其中文件的新建/替换断电可持久（Linux 支持；失败仅 WARN）
+func syncDir(dir string) {
+	f, err := os.Open(dir)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	if err := f.Sync(); err != nil {
+		slog.Warn("目录 fsync 失败（尽力而为）", "dir", dir, "err", err)
+	}
 }
 
 // Backup 备份配置到 path+".bak"（0600），供写回前留底与失败恢复
@@ -145,5 +175,47 @@ func Backup(path string) error {
 	if err := os.WriteFile(bak, data, 0600); err != nil {
 		return err
 	}
-	return os.Chmod(bak, 0600)
+	if err := os.Chmod(bak, 0600); err != nil {
+		return err
+	}
+	syncDir(filepath.Dir(path))
+	return nil
+}
+
+// RestoreBackup 用 .bak 还原配置（管理页提交失败回滚用）；.bak 缺失时报错
+func RestoreBackup(path string) error {
+	data, err := os.ReadFile(path + ".bak")
+	if err != nil {
+		return fmt.Errorf("读取备份失败: %w", err)
+	}
+	return writeFileAtomic(path, data)
+}
+
+// WriteCredential 严格读取配置并把 mount 的凭证字段写回（先备份后原子写）。
+// 文件缺失/解析失败直接报错，绝不重建默认配置（I2）。
+// 返回写入后的完整配置，供调用方更新内存副本。
+func WriteCredential(path, mountName string, values map[string]string) (*Config, error) {
+	cfg, err := LoadStrict(path)
+	if err != nil {
+		return nil, fmt.Errorf("读取配置失败: %w", err)
+	}
+	found := false
+	for i := range cfg.Clouds {
+		if cfg.Clouds[i].MountName() == mountName {
+			// 目前仅移动云盘实现：字段固定为 authorization；后续驱动扩展时按字段映射
+			cfg.Clouds[i].Authorization = values["authorization"]
+			found = true
+			break
+		}
+	}
+	if !found {
+		return nil, fmt.Errorf("未找到挂载: %s", mountName)
+	}
+	if err := Backup(path); err != nil {
+		return nil, fmt.Errorf("备份配置失败: %w", err)
+	}
+	if err := cfg.Save(path); err != nil {
+		return nil, fmt.Errorf("写入配置失败: %w", err)
+	}
+	return cfg, nil
 }

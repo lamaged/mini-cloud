@@ -95,7 +95,7 @@ func (c *Client) refreshToken() error {
 	}
 
 	// 刷新 token
-	url := "https://aas.caiyun.feixin.10086.cn:443/tellin/authTokenRefresh.do"
+	url := c.refreshURL
 	reqBody := fmt.Sprintf("<root><token>%s</token><account>%s</account><clienttype>656</clienttype></root>",
 		tokenPart, account)
 

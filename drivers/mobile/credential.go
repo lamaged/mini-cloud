@@ -51,6 +51,11 @@ func (d *Driver) validateAuthorization(ctx context.Context, auth, verifyHost str
 	if !expiry.After(time.Now()) {
 		return "", "", time.Time{}, fmt.Errorf("authorization 已过期，请获取新的 authorization")
 	}
+	// 门槛（P7）：剩余不足 24 小时拒绝接收，防止刚更新完就过期
+	if time.Until(expiry) < 24*time.Hour {
+		return "", "", time.Time{}, fmt.Errorf("该凭证剩余有效期不足 24 小时（至 %s），请获取新的 authorization",
+			expiry.Format("2006-01-02 15:04"))
+	}
 
 	// 一次性临时客户端：只验证，不碰正式客户端
 	temp := NewClient()
@@ -98,6 +103,7 @@ func (d *Driver) CommitCredential(values map[string]string) error {
 	// 记录已提交凭证并递增代次：401 刷新回调据此丢弃过期刷新结果
 	d.commitMu.Lock()
 	d.commitAuth, d.commitAccount, d.commitHost = p.auth, p.account, p.host
+	d.authorization = p.auth // 同步 Init 期字段（P5）：防止未来重新 Init 回退旧值
 	d.commitMu.Unlock()
 	d.credGen.Add(1)
 

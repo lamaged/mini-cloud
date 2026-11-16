@@ -196,6 +196,69 @@ func TestPendingIsolationByReq(t *testing.T) {
 	}
 }
 
+func TestValidateAuthorizationTooShort(t *testing.T) {
+	// P7：剩余不足 24 小时拒绝接收（防止刚更新完就过期）
+	d := &Driver{}
+	auth := makeAuth("13800000000", time.Now().Add(23*time.Hour))
+	_, _, _, err := d.validateAuthorization(context.Background(), auth, "http://127.0.0.1:1")
+	if err == nil || !strings.Contains(err.Error(), "不足 24 小时") {
+		t.Errorf("short-lived auth should be rejected, got err=%v", err)
+	}
+}
+
+// TestAuthRefreshRaceWithCommit I5：401 刷新进行中发生提交，最终必须使用已提交凭证
+func TestAuthRefreshRaceWithCommit(t *testing.T) {
+	stateDir := t.TempDir()
+	oldAuth := makeAuth("13800000000", time.Now().Add(30*24*time.Hour)) // 旧凭证（未过期但被替换）
+	d := New("移动云盘", oldAuth, stateDir)
+	d.client.SetAuth(oldAuth, "13800000000", "https://cloud-old.example.com")
+
+	// 可控刷新端点：阻塞到测试放行，再返回一个「新」token
+	release := make(chan struct{})
+	refreshSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+		w.Header().Set("Content-Type", "application/xml")
+		fmt.Fprint(w, `<root><return>0</return><token>a|b|c|9999999999999</token></root>`)
+	}))
+	defer refreshSrv.Close()
+	d.client.refreshURL = refreshSrv.URL
+
+	// 刷新开始（内部会阻塞在 refreshSrv）
+	refreshDone := make(chan error, 1)
+	go func() { refreshDone <- d.handleAuthFailed() }()
+
+	// 刷新阻塞期间提交新凭证
+	newAuth := makeAuth("13800000001", time.Now().Add(30*24*time.Hour))
+	d.setPending("req-1", newAuth, "13800000001", "https://cloud-new.example.com")
+	if err := d.CommitCredential(map[string]string{"__req": "req-1", "authorization": newAuth}); err != nil {
+		t.Fatalf("CommitCredential: %v", err)
+	}
+	if d.credGen.Load() != 1 {
+		t.Fatalf("credGen = %d, want 1", d.credGen.Load())
+	}
+
+	// 放行刷新
+	close(release)
+	if err := <-refreshDone; err != nil {
+		t.Fatalf("handleAuthFailed: %v", err)
+	}
+
+	// 最终：内存与 token state 都必须是已提交凭证（刷新结果被丢弃）
+	if got := d.client.getAuthorization(); got != newAuth {
+		t.Errorf("client auth = %q, want committed %q", got, newAuth)
+	}
+	if got := d.client.getCloudHost(); got != "https://cloud-new.example.com" {
+		t.Errorf("client host = %q, want committed host", got)
+	}
+	token, err := LoadToken(d.name, stateDir)
+	if err != nil {
+		t.Fatalf("LoadToken: %v", err)
+	}
+	if token.Authorization != newAuth {
+		t.Errorf("token state auth = %q, want committed %q", token.Authorization, newAuth)
+	}
+}
+
 func TestValidateAuthorizationWithMockHost(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `{"success":true,"code":"","message":"","data":{"items":[],"nextPageCursor":""}}`)
@@ -203,7 +266,7 @@ func TestValidateAuthorizationWithMockHost(t *testing.T) {
 	defer ts.Close()
 
 	d := &Driver{}
-	auth := makeAuth("13800000000", time.Now().Add(24*time.Hour))
+	auth := makeAuth("13800000000", time.Now().Add(30*24*time.Hour))
 	account, host, expiry, err := d.validateAuthorization(context.Background(), auth, ts.URL)
 	if err != nil {
 		t.Fatalf("validateAuthorization: %v", err)

@@ -101,9 +101,10 @@ type CredentialUpdater interface {
 - `POST /admin/update`：`mount` + 字段值。流程（D5/D6 修订，两阶段零回滚）：
   1. 校验 Basic Auth + CSRF token（一次性）。
   2. `ValidateCredential(ctx, values)`（`context.WithTimeout`，10 秒）：格式校验 + 网络验证，**不改变任何状态**。失败 → 直接报错，内存与磁盘均保持不变。
-  3. main 原子写 config.json（temp + rename + fsync + 写前备份 `.bak` + 写后 `os.Chmod 0600`，`.bak` 同样 chmod；D2）。失败 → 报错，**状态仍为零变化**（此时尚未生效）。
-  4. `CommitCredential(values)`：加锁应用内存凭证 + 写 token state（调用点唯一）。token state 写入失败仅提示（凭证已生效，重启后以 config.json 为准）。
+  3. main 原子写 config.json（temp + chmod + fsync + rename + **父目录 fsync**，写前备份 `.bak`；I3）。失败 → 报错，**状态仍为零变化**（此时尚未生效）。
+  4. `CommitCredential(values)`：加锁应用内存凭证 + 写 token state（调用点唯一）。token state 写入失败仅提示（凭证已生效，重启后以 config.json 为准）。**提交失败（非哨兵错误）→ 用 `.bak` 还原配置**（I6，PM 拍板方案①），真正零变化。
   5. 成功页显示新 token 的过期时间；失败页显示原因。
+- 全流程串行化（I1）：`Handler.updateMu` 覆盖验证→写盘→生效，双标签并发提交按先后完整执行，杜绝「磁盘存 A、运行用 B」的错位。
 - 根导航页增加「管理」链接（仅浏览器访问时可见）。
 
 **并发模型（D5）**：`cfg` 加互斥锁保护或 copy-on-write——管理页写入不得与请求期读取（`checkAuth` 每请求读 `cfg.Server.*`）共享可写状态；`checkAuth` 读取路径纳入锁范围。
@@ -113,7 +114,7 @@ type CredentialUpdater interface {
 ### 3.4 移动驱动实现要点
 
 1. `ValidateCredential`：`parseAuthString` 校验格式 → 用**临时 Client 实例**（仅 set 新 authorization）做网络验证（列根目录；401/403 视为无效）→ 不动正式 Client 的任何状态。
-2. `CommitCredential`：应用新值到正式 Client（走现有互斥锁）→ `discoverCloudHost` → `saveTokenState`。token state 写入失败返回错误但凭证保持生效。
+2. `CommitCredential`：应用 Validate 阶段暂存的凭证（含已验证发现的云主机）到正式 Client（走现有互斥锁）→ `saveTokenState`；**不联网**。token state 写入失败返回错误但凭证保持生效。
 3. 网络不可达时拒绝更新并明确提示（不写入无法验证的凭证）。
 4. 更新成功后 `HealthWarning` 自动消失（`client.isExpired()` 为 false）。
 5. config.json 写入由 main 负责（驱动不持有 config 路径）。
@@ -145,19 +146,27 @@ type CredentialUpdater interface {
 5. 三处转义缺陷修复后：含中文/空格/`#` 文件名的 PROPFIND href 可被严格客户端访问；目录页与根 PROPFIND 对特殊字符安全。
 6. 真机 `ls -l` 核对 config.json、config.json.bak、state/* 权限为 0600（D2）。
 7. 管理页更新成功后 config.json 无空 `cloud` 块（omitempty 生效）。
-8. 两阶段语义：验证失败或 config 写失败时，内存凭证与磁盘文件均保持不变（零回滚）。
+8. 两阶段语义：验证失败、config 写失败或提交失败（.bak 还原）时，内存凭证与磁盘文件均保持不变（零回滚）。
 
-### 3.8 实现期修订（v0.3.1，2026-11-16 实现与自查后补充）
+### 3.8 实现期修订（v0.3.2，2026-11-16 实现、自查与 RV-03 审核后补充）
 
-按代码自查（15 条）落地的实现细节，与 §3.2/§3.3 共同构成最终契约：
+按代码自查（15 条，PROGRESS.md 有逐条留痕）与外部代码审核 RV-2026-11-16-03（I1–I6、P1–P9）落地的实现细节，与 §3.2/§3.3 共同构成最终契约：
 
 - **保留键**：values 增加 `__req`（更新请求唯一标识，admin 生成；驱动按它关联 Validate 与 Commit，隔离并发更新）与 `__expiry`（驱动回填显示用）。
 - **哨兵错误**：`driver.ErrStateWriteFailed`——CommitCredential 在「凭证已生效但 token state 写盘失败」时用 `%w` 返回；admin 据此显示「更新成功（警告）」，其余提交错误显示「凭证生效失败」。
 - **提交生效后清缓存**：admin 在提交生效后回调 main（`OnCommitted`），使该挂载的目录/链接缓存全部失效（`CachedReader.InvalidateAll`），避免旧账号数据残留 30s/10min。
-- **移动驱动并发防护**：① 待提交凭证按 `__req` 隔离并 5 分钟过期清理；② 凭证代次计数（`credGen`）——401 自动刷新回调若发现刷新期间有新提交，丢弃过期刷新结果并恢复已提交凭证；③ 路径缓存代次（`cacheGen`）——在途路径解析结果在提交后作废；④ token state 写盘失败时删除旧缓存文件，保证重启后以 config.json 为准。
-- **config 写回细节**：以磁盘当前内容为基准（尊重运行期间手工修改），写盘成功后才更新内存副本；`conf.Load` 启动时收紧存量 config.json 权限至 0600；`Save` 在 rename 前完成 chmod 并检查 fsync 错误；`config.json.bak`/`.tmp` 加入 .gitignore。
+- **移动驱动并发防护**：① 待提交凭证按 `__req` 隔离并 5 分钟过期清理；② 凭证代次计数（`credGen`）——401 自动刷新回调（提取为 `handleAuthFailed`，刷新端点 `refreshURL` 可注入测试）若发现刷新期间有新提交，丢弃过期刷新结果并恢复已提交凭证；③ 路径缓存代次（`cacheGen`）——在途路径解析结果在提交后作废；④ token state 写盘失败时删除旧缓存文件，保证重启后以 config.json 为准；⑤ 提交后同步 `d.authorization` 字段（防未来重新 Init 回退）。
+- **config 写回细节**：写回路径用 `conf.LoadStrict`（文件缺失/损坏直接报错，**绝不重建默认配置**，防认证降级）+ `conf.WriteCredential`（严格读取→按挂载映射字段→备份→原子写）；以磁盘当前内容为基准（尊重运行期间手工修改），写盘成功后才更新内存副本；`Save`/`writeFileAtomic` 在 rename 后 **fsync 父目录**（断电可持久，尽力而为）；`conf.Load` 启动时收紧存量 config.json 权限至 0600；`config.json.bak`/`.tmp` 加入 .gitignore。
+- **提交失败回滚（I6，PM 拍板方案①）**：persist 成功返回回滚函数，提交失败时 admin 调用它用 `.bak` 还原配置并同步内存副本，做到真正的零变化。
+- **更新串行化（I1）**：`Handler.updateMu` 覆盖验证→写盘→生效全流程。
 - **ctx 传导**：`discoverCloudHost`/`personalRequest` 全面接受 ctx（10 秒管理页超时真正生效）。
 - **Cloud 字段**：改为指针 + `omitempty`（Go 的 struct 值 omitempty 不生效，指针才能省略）；`normalize` 在 clouds 存在时清空 Cloud，避免输出伪 `"cloud"` 块。
+- **状态码（P1）**：400 输入错误（表单/CSRF/挂载）；502 验证失败（无法区分凭证无效与上游不可达）；500 写盘/提交失败；200 成功。
+- **安全响应头（P2）**：管理页返回 `Cache-Control: no-store`、`X-Frame-Options: DENY`、CSP（`default-src 'none'; style-src 'unsafe-inline'; form-action 'self'`）。
+- **有效期门槛（P7，PM 拍板）**：剩余有效期不足 24 小时的 authorization 拒绝接收。
+- **Stop 幂等（P4）**：`CachedReader.Stop` 改 `sync.Once`（原属 Vault Phase 0 事项，提前在 v0.10.0 落地），补「重复 Stop 不 panic」测试。
+- **编码去重（P6）**：路径百分号编码统一为 `webdav.EncodePathSegments`（导出），main 与 webdav 共用。
+- **版本（P3）**：`version` 常量升 `v0.10.0`。
 
 ## 4. 功能 B：Vault 加密文件播放（v1.0+）
 

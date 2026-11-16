@@ -75,12 +75,14 @@ type Client struct {
 	account       string       // 账号
 	cloudHost     string       // 个人云 API 主机地址
 	onAuthFailed  func() error // 401 回调：刷新 token 并更新 authorization
+	refreshURL    string       // token 刷新端点（测试可注入 httptest；构造后不再修改）
 }
 
 // NewClient 创建客户端
 func NewClient() *Client {
 	return &Client{
 		httpClient: &http.Client{Timeout: 30 * time.Second},
+		refreshURL: "https://aas.caiyun.feixin.10086.cn:443/tellin/authTokenRefresh.do",
 	}
 }
 

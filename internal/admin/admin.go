@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"html/template"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -28,8 +29,8 @@ type Mount struct {
 }
 
 // PersistFunc 把验证通过的新凭证写回配置（由 main 提供）。
-// 失败时运行时状态必须保持零变化（两阶段语义）。
-type PersistFunc func(ctx context.Context, mount string, values map[string]string) error
+// 成功时返回回滚函数（用于后续提交失败时恢复配置，实现零变化语义）；失败时 rollback 为 nil。
+type PersistFunc func(ctx context.Context, mount string, values map[string]string) (rollback func(), err error)
 
 // Handler 凭证管理页处理器
 type Handler struct {
@@ -38,6 +39,8 @@ type Handler struct {
 	mounts      []Mount
 	persist     PersistFunc
 	OnCommitted func(mount string) // 凭证生效后回调（main 用于使该挂载缓存失效）
+
+	updateMu sync.Mutex // 更新锁：串行化「验证→写盘→生效」全流程（I1：防双标签交错导致配置与运行时不一致）
 }
 
 // New 创建管理页处理器
@@ -96,23 +99,27 @@ func (h *Handler) findMount(name string) *Mount {
 
 // Page 渲染管理页（GET /admin）
 func (h *Handler) Page(w http.ResponseWriter, r *http.Request) {
-	h.render(w, "", "")
+	h.render(w, http.StatusOK, "", "")
 }
 
-// Update 处理凭证更新（POST /admin/update）
+// Update 处理凭证更新（POST /admin/update）。
+// 全流程串行化（updateMu）：双标签并发提交时按先后完整执行，避免配置与运行时不一致（I1）。
 func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
+	h.updateMu.Lock()
+	defer h.updateMu.Unlock()
+
 	if err := r.ParseForm(); err != nil {
-		h.render(w, "", "表单解析失败")
+		h.render(w, http.StatusBadRequest, "", "表单解析失败")
 		return
 	}
 	if !h.checkToken(r.PostFormValue("csrf")) {
-		h.render(w, "", "安全校验失败，请返回管理页重试")
+		h.render(w, http.StatusBadRequest, "", "安全校验失败，请返回管理页重试")
 		return
 	}
 
 	m := h.findMount(r.PostFormValue("mount"))
 	if m == nil || m.Update == nil {
-		h.render(w, "", "未找到挂载，或该挂载不支持在线更新")
+		h.render(w, http.StatusBadRequest, "", "未找到挂载，或该挂载不支持在线更新")
 		return
 	}
 
@@ -126,37 +133,41 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 	if err := m.Update.ValidateCredential(ctx, values); err != nil {
-		h.render(w, "", fmt.Sprintf("验证失败，未做任何修改：%v", err))
+		// 502：验证涉及上游网络，无法区分「凭证无效」与「上游不可达」
+		h.render(w, http.StatusBadGateway, "", fmt.Sprintf("验证失败，未做任何修改：%v", err))
 		return
 	}
-	if err := h.persist(ctx, m.Name, values); err != nil {
-		h.render(w, "", fmt.Sprintf("写入配置文件失败，未做任何修改：%v", err))
+	rollback, err := h.persist(ctx, m.Name, values)
+	if err != nil {
+		h.render(w, http.StatusInternalServerError, "", fmt.Sprintf("写入配置文件失败，未做任何修改：%v", err))
 		return
 	}
 
-	err := m.Update.CommitCredential(values)
+	err = m.Update.CommitCredential(values)
 	applied := err == nil || errors.Is(err, driver.ErrStateWriteFailed)
+	if err != nil && !applied && rollback != nil {
+		// 提交失败：用备份还原配置，做到真正的零变化（I6，PM 拍板方案①）
+		rollback()
+		h.render(w, http.StatusInternalServerError, "", fmt.Sprintf("凭证生效失败，配置已还原：%v", err))
+		return
+	}
 	if applied && h.OnCommitted != nil {
 		h.OnCommitted(m.Name) // 凭证已生效：使该挂载的目录/链接缓存失效
 	}
 	if err != nil {
-		if errors.Is(err, driver.ErrStateWriteFailed) {
-			// 凭证已生效，仅本地缓存写入失败——提示而非报错
-			h.render(w, fmt.Sprintf("更新成功（%v）", err), "")
-		} else {
-			h.render(w, "", fmt.Sprintf("凭证生效失败：%v", err))
-		}
+		// 凭证已生效，仅本地缓存写入失败——提示而非报错
+		h.render(w, http.StatusOK, fmt.Sprintf("更新成功（%v）", err), "")
 		return
 	}
 	msg := "更新成功"
 	if exp, ok := values["__expiry"]; ok && exp != "" {
 		msg = fmt.Sprintf("更新成功，新凭证有效期至 %s", exp)
 	}
-	h.render(w, msg, "")
+	h.render(w, http.StatusOK, msg, "")
 }
 
 // render 渲染管理页（message 为成功提示，errMsg 为错误提示；二者互斥）
-func (h *Handler) render(w http.ResponseWriter, message, errMsg string) {
+func (h *Handler) render(w http.ResponseWriter, status int, message, errMsg string) {
 	type formMount struct {
 		Name   string
 		Prefix string
@@ -180,9 +191,14 @@ func (h *Handler) render(w http.ResponseWriter, message, errMsg string) {
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	// 安全响应头（P2）：页面含凭证输入框，禁止缓存/嵌入/外部脚本
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'")
+	w.WriteHeader(status)
 	if err := pageTmpl.Execute(w, data); err != nil {
 		// 响应已开始写入，仅记录
-		http.Error(w, "render failed", http.StatusInternalServerError)
+		slog.Error("管理页渲染失败", "err", err)
 	}
 }
 

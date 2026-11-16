@@ -81,30 +81,7 @@ func (d *Driver) Init(ctx context.Context) error {
 	}
 
 	// 设置 401 自动刷新回调（必须在任何 early return 之前，确保运行时安全网始终生效）
-	d.client.SetAuthRefreshCallback(func() error {
-		slog.Info("移动云盘 401，触发 Token 刷新")
-		gen := d.credGen.Load()
-		if err := d.client.refreshToken(); err != nil {
-			return err
-		}
-		if d.credGen.Load() != gen {
-			// 刷新期间管理页提交了新凭证：丢弃本次刷新结果，恢复已提交凭证
-			d.commitMu.Lock()
-			a, ac, h := d.commitAuth, d.commitAccount, d.commitHost
-			d.commitMu.Unlock()
-			if a != "" {
-				d.client.SetAuth(a, ac, h)
-				if err := d.saveTokenState(); err != nil {
-					slog.Warn("保存 token 失败", "err", err)
-				}
-			}
-			return nil
-		}
-		if err := d.saveTokenState(); err != nil {
-			slog.Warn("保存 token 失败", "err", err)
-		}
-		return nil
-	})
+	d.client.SetAuthRefreshCallback(d.handleAuthFailed)
 
 	// 尝试从持久化状态恢复
 	token, err := LoadToken(d.name, d.stateDir)
@@ -157,6 +134,33 @@ func (d *Driver) Init(ctx context.Context) error {
 		return fmt.Errorf("发现云主机失败: %w", err)
 	}
 
+	if err := d.saveTokenState(); err != nil {
+		slog.Warn("保存 token 失败", "err", err)
+	}
+	return nil
+}
+
+// handleAuthFailed 401 回调：刷新 token 并更新状态。
+// 若刷新期间管理页提交了新凭证（credGen 变化），丢弃本次刷新结果并恢复已提交凭证。
+func (d *Driver) handleAuthFailed() error {
+	slog.Info("移动云盘 401，触发 Token 刷新")
+	gen := d.credGen.Load()
+	if err := d.client.refreshToken(); err != nil {
+		return err
+	}
+	if d.credGen.Load() != gen {
+		// 刷新期间管理页提交了新凭证：丢弃本次刷新结果，恢复已提交凭证
+		d.commitMu.Lock()
+		a, ac, h := d.commitAuth, d.commitAccount, d.commitHost
+		d.commitMu.Unlock()
+		if a != "" {
+			d.client.SetAuth(a, ac, h)
+			if err := d.saveTokenState(); err != nil {
+				slog.Warn("保存 token 失败", "err", err)
+			}
+		}
+		return nil
+	}
 	if err := d.saveTokenState(); err != nil {
 		slog.Warn("保存 token 失败", "err", err)
 	}

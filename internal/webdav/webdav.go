@@ -307,9 +307,9 @@ td{padding:6px 10px;border-bottom:1px solid #eee}
 
 // escPath 返回带 Prefix 的完整 URL 路径（Prefix 与路径均逐段百分号编码）
 func (h *Handler) escPath(p string) string {
-	p = encodePathSegments(p)
+	p = EncodePathSegments(p)
 	if h.Prefix != "" {
-		p = path.Join("/", encodePathSegments(h.Prefix), p)
+		p = path.Join("/", EncodePathSegments(h.Prefix), p)
 	}
 	if !strings.HasPrefix(p, "/") {
 		p = "/" + p
@@ -317,9 +317,10 @@ func (h *Handler) escPath(p string) string {
 	return p
 }
 
-// encodePathSegments 对路径逐段百分号编码（保留 "/" 分隔符）：
-// 中文、空格、#、? 等在严格客户端与浏览器中需要编码才能正确访问
-func encodePathSegments(p string) string {
+// EncodePathSegments 对路径逐段百分号编码（保留 "/" 分隔符）：
+// 中文、空格、#、? 等在严格客户端与浏览器中需要编码才能正确访问。
+// 导出供 main 的根页面/根 PROPFIND 复用（P6：避免两份实现漂移）。
+func EncodePathSegments(p string) string {
 	segs := strings.Split(p, "/")
 	for i := range segs {
 		segs[i] = url.PathEscape(segs[i])

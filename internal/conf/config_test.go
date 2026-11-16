@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -254,4 +255,147 @@ func checkPerm(t *testing.T, path string, want os.FileMode) {
 	if got := info.Mode().Perm(); got != want {
 		t.Errorf("%s perm = %o, want %o", path, got, want)
 	}
+}
+
+// writeCloudsConfig 写入一个含 server + 两个 clouds 的配置文件
+func writeCloudsConfig(t *testing.T, path string) {
+	t.Helper()
+	content := `{
+    "server": {"listen": ":8088", "username": "admin", "password": "pw"},
+    "clouds": [
+        {"name": "移动云盘", "type": "mobile", "authorization": "old-auth"},
+        {"name": "天翼个人", "type": "tianyi", "username": "u", "password": "p"}
+    ]
+}`
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWriteCredentialNormal(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	writeCloudsConfig(t, path)
+
+	cfg, err := WriteCredential(path, "移动云盘", map[string]string{"authorization": "new-auth"})
+	if err != nil {
+		t.Fatalf("WriteCredential: %v", err)
+	}
+	// 其它 clouds 条目必须保留
+	if len(cfg.Clouds) != 2 || cfg.Clouds[1].Name != "天翼个人" || cfg.Clouds[1].Username != "u" {
+		t.Errorf("other cloud entries changed: %+v", cfg.Clouds)
+	}
+	// 磁盘内容一致 + 权限 0600 + 备份存在
+	reloaded, err := LoadStrict(path)
+	if err != nil {
+		t.Fatalf("LoadStrict: %v", err)
+	}
+	if reloaded.Clouds[0].Authorization != "new-auth" {
+		t.Errorf("disk auth = %q, want new-auth", reloaded.Clouds[0].Authorization)
+	}
+	checkPerm(t, path, 0600)
+	checkPerm(t, path+".bak", 0600)
+	// 无残留 temp
+	if _, err := os.Stat(path + ".tmp"); !os.IsNotExist(err) {
+		t.Error(".tmp should not remain")
+	}
+}
+
+func TestWriteCredentialMountNotFound(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	writeCloudsConfig(t, path)
+	before, _ := os.ReadFile(path)
+
+	_, err := WriteCredential(path, "不存在的挂载", map[string]string{"authorization": "x"})
+	if err == nil || !strings.Contains(err.Error(), "未找到挂载") {
+		t.Fatalf("expected mount-not-found error, got %v", err)
+	}
+	after, _ := os.ReadFile(path)
+	if string(before) != string(after) {
+		t.Error("file must not be modified when mount not found")
+	}
+	if _, err := os.Stat(path + ".bak"); !os.IsNotExist(err) {
+		t.Error(".bak should not be created on failure")
+	}
+}
+
+func TestWriteCredentialMigratesLegacyCloud(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	legacy := `{
+    "server": {"listen": ":8088", "username": "admin", "password": "pw"},
+    "cloud": {"name": "移动云盘", "type": "mobile", "authorization": "legacy-auth"}
+}`
+	if err := os.WriteFile(path, []byte(legacy), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := WriteCredential(path, "移动云盘", map[string]string{"authorization": "new-auth"})
+	if err != nil {
+		t.Fatalf("WriteCredential on legacy config: %v", err)
+	}
+	if len(cfg.Clouds) != 1 || cfg.Clouds[0].Authorization != "new-auth" {
+		t.Errorf("legacy cloud not migrated correctly: %+v", cfg.Clouds)
+	}
+	reloaded, err := LoadStrict(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reloaded.Clouds) != 1 || reloaded.Clouds[0].Name != "移动云盘" || reloaded.Clouds[0].Type != "mobile" {
+		t.Errorf("legacy migration lost fields: %+v", reloaded.Clouds)
+	}
+	if reloaded.Clouds[0].Authorization != "new-auth" {
+		t.Errorf("legacy migration lost new auth: %+v", reloaded.Clouds[0])
+	}
+}
+
+func TestWriteCredentialMissingFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+
+	_, err := WriteCredential(path, "移动云盘", map[string]string{"authorization": "x"})
+	if err == nil {
+		t.Fatal("WriteCredential on missing file must fail")
+	}
+	// 不得重建默认配置（I2：防止认证降级为 admin/admin）
+	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+		t.Error("missing file must not be recreated by write path")
+	}
+}
+
+func TestWriteCredentialInvalidJSON(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(path, []byte("not json"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := WriteCredential(path, "移动云盘", map[string]string{"authorization": "x"}); err == nil {
+		t.Fatal("WriteCredential on invalid JSON must fail")
+	}
+}
+
+func TestRestoreBackup(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	writeCloudsConfig(t, path)
+
+	// 模拟：备份 → 写入新值 → 还原
+	if err := Backup(path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := WriteCredential(path, "移动云盘", map[string]string{"authorization": "new-auth"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := RestoreBackup(path); err != nil {
+		t.Fatalf("RestoreBackup: %v", err)
+	}
+	reloaded, err := LoadStrict(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.Clouds[0].Authorization != "old-auth" {
+		t.Errorf("after restore auth = %q, want old-auth", reloaded.Clouds[0].Authorization)
+	}
+	checkPerm(t, path, 0600)
 }
