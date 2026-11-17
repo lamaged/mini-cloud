@@ -68,7 +68,7 @@ health_check() {
 # rollback_old 回滚旧版本并验证恢复（P16：回滚后同样健康检查，确认「已恢复」）
 rollback_old() {
     echo "==> 回滚旧版本"
-    killall "$BINARY" 2>/dev/null || true
+    kill $(pgrep -f "$BINARY") 2>/dev/null || true
     sleep 1
     if [ ! -f "$INSTALL_DIR/$BINARY.prev" ]; then
         echo "错误：无旧版本可回滚（.prev 不存在）"
@@ -108,7 +108,8 @@ if [ -f "$INSTALL_DIR/$BINARY" ]; then
 fi
 
 echo "==> 停止服务并确认旧进程退出"
-pkill -f "$BINARY" 2>/dev/null || killall "$BINARY" 2>/dev/null || true
+# pgrep -f 按完整命令行匹配（AX6 已确认有 pgrep；二进制名超 15 字符时 killall 按 comm 会截断失效，I13）
+kill $(pgrep -f "$BINARY") 2>/dev/null || true
 i=0
 while [ "$OLD_PID" != "0" ] && kill -0 "$OLD_PID" 2>/dev/null && [ "$i" -lt 15 ]; do
     sleep 1

@@ -178,6 +178,9 @@ TV / Nova Player / 网易爆米花 / Infuse
     ./mini-cloud-arm64-upx -config /data/mini-cloud/config/config.json \
     >> /dev/null 2>&1 &
 
+# 或使用部署脚本（推荐，v0.10.0+）：自动备份旧版本、健康检查、失败自动回滚
+# 开发机执行 ./scripts/deploy-prepare.sh；路由器执行 sh scripts/deploy-router.sh
+
 # 调试模式
 ./mini-cloud -config config.json -debug
 
