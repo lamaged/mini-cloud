@@ -84,7 +84,6 @@ func (s *streamSem) release() {
 // acquireTimeout 信号量获取超时（测试可缩短）
 var acquireTimeout = 5 * time.Second
 
-// httpClient 云盘取数层 HTTP 客户端（测试可替换）
 // httpClient 云盘取数层 HTTP 客户端（测试可替换）。
 // 超时 90s（P4）：4 MiB 窗口在 1 Mbps 弱网约需 32s，30s 总超时必然误杀；90s 给足余量。
 var httpClient = &http.Client{Timeout: 90 * time.Second}
@@ -156,6 +155,13 @@ func (v *Vault) loadRoot(ctx context.Context, name string) {
 	var src io.ReadCloser
 	switch {
 	case link.Reader != nil:
+		// 铁律 2（P11）：加密不支持百度——代理流非 ReaderAt 的驱动不建虚拟树，
+		// 挂载完全普通模式（密文目录按普通目录可见）
+		if _, ok := link.Reader.(io.ReaderAt); !ok {
+			link.Reader.Close()
+			slog.Info("vault: 该驱动不支持 Vault（仅天翼/移动），跳过该挂载的 vault 根", "root", name)
+			return
+		}
 		src = link.Reader
 	case link.URL != "":
 		// Phase 1 接线：URL 型驱动经取数层读 manifest（Range 请求）

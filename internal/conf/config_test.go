@@ -3,6 +3,7 @@ package conf
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -473,5 +474,88 @@ func TestLoadBrokenJSONNoBackup(t *testing.T) {
 	}
 	if _, err := Load(path); err == nil {
 		t.Error("无备份的损坏配置应报错")
+	}
+}
+
+// TestLoadCreatesBackupIfMissing I6：从未用过 /admin 的机器加载成功后自动补 .bak
+func TestLoadCreatesBackupIfMissing(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	writeCloudsConfig(t, path)
+
+	if _, err := os.Stat(path + ".bak"); !os.IsNotExist(err) {
+		t.Fatal("前置：.bak 不应存在")
+	}
+	if _, err := Load(path); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	bak, err := os.ReadFile(path + ".bak")
+	if err != nil {
+		t.Fatalf("加载成功后应生成 .bak: %v", err)
+	}
+	var bakCfg Config
+	if err := json.Unmarshal(bak, &bakCfg); err != nil || len(bakCfg.Clouds) != 2 {
+		t.Errorf(".bak 内容不符: %v", err)
+	}
+	checkPerm(t, path+".bak", 0600)
+}
+
+// TestLoadSelfHealEmptyFile I7：0 字节 config.json 同样自愈（编辑器截断/断电形态）
+func TestLoadSelfHealEmptyFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	writeCloudsConfig(t, path)
+	if err := Backup(path); err != nil {
+		t.Fatal(err)
+	}
+	// 清成 0 字节
+	if err := os.WriteFile(path, nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("空文件应自愈: %v", err)
+	}
+	if len(cfg.Clouds) != 2 {
+		t.Errorf("自愈后配置不符: %+v", cfg.Clouds)
+	}
+	// 空文件无需损坏副本
+	if matches, _ := filepath.Glob(path + ".broken-*"); len(matches) != 0 {
+		t.Errorf("空文件不应产生损坏副本: %v", matches)
+	}
+}
+
+// TestLoadSelfHealPrunesBroken P10：损坏副本保留最近 3 份
+func TestLoadSelfHealPrunesBroken(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	writeCloudsConfig(t, path)
+	if err := Backup(path); err != nil {
+		t.Fatal(err)
+	}
+	// 预置 5 份历史损坏副本（名字带时间戳、各不相同；同秒冲突用递增序号规避）
+	for i := 0; i < 5; i++ {
+		old := fmt.Sprintf("%s.broken-1000000%d", path, i)
+		if err := os.WriteFile(old, []byte("x"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 再触发一次自愈（产生新副本 → 总数 6 → 剪到 3）
+	if err := os.WriteFile(path, []byte(`{broken-now}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err != nil {
+		t.Fatalf("自愈: %v", err)
+	}
+	matches, _ := filepath.Glob(path + ".broken-*")
+	if len(matches) != 3 {
+		t.Errorf("应保留最近 3 份损坏副本，实际 %d 份 %v", len(matches), matches)
+	}
+	// 最旧的两份（…000、…001）应被删除
+	for _, old := range []string{path + ".broken-10000000", path + ".broken-10000001"} {
+		if _, err := os.Stat(old); !os.IsNotExist(err) {
+			t.Errorf("最旧副本应被清理: %s", old)
+		}
 	}
 }

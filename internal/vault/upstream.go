@@ -160,7 +160,7 @@ func (u *Upstream) ensureFreshURL(ctx context.Context) error {
 		return nil
 	}
 	if err := u.refreshURL(ctx, nil); err != nil {
-		return fmt.Errorf("vault upstream: 刷新签名失败: %w", err)
+		return fmt.Errorf("vault upstream: 刷新签名失败: %v: %w", err, driver.ErrUpstream) // P8
 	}
 	slog.Info("vault upstream: 签名已刷新", "obj", u.objPath, "ttl", u.urlTTL())
 	return nil
@@ -280,20 +280,23 @@ func (u *Upstream) doRange(ctx context.Context, p []byte, off int64, length int)
 	case resp.StatusCode == http.StatusPartialContent:
 		// 校验 Content-Range 与请求区间一致（I10：不符 → 失效重试）
 		cr := resp.Header.Get("Content-Range")
-		var crStart, crEnd, crTotal int64
+		var crStart, crEnd, crTotal int64 = 0, 0, -1 // -1 = 总额未知（bytes a-b/*）
 		if _, err := fmt.Sscanf(cr, "bytes %d-%d/%d", &crStart, &crEnd, &crTotal); err != nil {
-			return 0, fmt.Errorf("vault upstream: Content-Range 解析失败 %q: %w", cr, driver.ErrUpstream)
+			// P7：个别 CDN 返回「总额未知」——仅校验起点，跳过截断判定
+			if _, err2 := fmt.Sscanf(cr, "bytes %d-%d/*", &crStart, &crEnd); err2 != nil {
+				return 0, fmt.Errorf("vault upstream: Content-Range 解析失败 %q: %w", cr, driver.ErrUpstream)
+			}
 		}
 		if crStart != off {
 			return 0, fmt.Errorf("vault upstream: Content-Range 与请求区间不符: %q: %w", cr, driver.ErrUpstream)
 		}
 		data, err := io.ReadAll(io.LimitReader(resp.Body, int64(length)+1))
 		if err != nil {
-			return 0, fmt.Errorf("vault upstream: 读取失败: %w", err)
+			return 0, fmt.Errorf("vault upstream: 读取失败: %v: %w", err, driver.ErrUpstream) // P8
 		}
 		// I1：实际收到的字节数少于 Content-Range 声称的区间长度 = 传输截断——
-		// 必须换签名重试，不得误报文件损坏（与「正常到文件尾」的短窗口区分）
-		if int64(len(data)) < crEnd-crStart+1 {
+		// 必须换签名重试，不得误报文件损坏（总额未知时跳过判定，P7）
+		if crTotal >= 0 && int64(len(data)) < crEnd-crStart+1 {
 			return 0, fmt.Errorf("vault upstream: 传输截断（%d/%d）: %w", len(data), crEnd-crStart+1, driver.ErrUpstream)
 		}
 		// U2：无论顺序/随机都写入缓冲（随机读替换旧缓冲，后续顺序读自然延续）
@@ -304,6 +307,11 @@ func (u *Upstream) doRange(ctx context.Context, p []byte, off int64, length int)
 		u.mu.Unlock()
 		n := copy(p, data)
 		if n < len(p) {
+			// P9：合法短窗口（CDN 返回比请求更短的区间且未到文件尾/总额未知）
+			// → 返回 (n, nil) 由 ReadAt 循环续拉，不得误报 EOF
+			if crTotal < 0 || crEnd+1 < crTotal {
+				return n, nil
+			}
 			return n, io.EOF
 		}
 		return n, nil

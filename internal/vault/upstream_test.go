@@ -77,6 +77,8 @@ type rangeCDN struct {
 	failNext      atomic.Bool // 下一次请求失败一次后恢复（缓冲中途 403 测试）
 	mismatchNext  atomic.Bool // 下一次请求 Content-Range 错位一次后恢复
 	truncateNext  atomic.Bool // 下一次 206 响应短 body（Content-Range 声称未到文件尾）一次
+	unknownTotal atomic.Bool // Content-Range 返回 bytes a-b/*（总额未知，P7）
+	shortWindow  atomic.Bool // 每次 206 只返回 ≤128 KiB 的合法短窗口（P9）
 	lastUA        atomic.Value // 最近一次请求的 User-Agent
 }
 
@@ -114,8 +116,14 @@ func (c *rangeCDN) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if end >= int64(len(c.data)) {
 		end = int64(len(c.data)) - 1
 	}
+	// P9 合法短窗口：先截短，再写头（头必须与实际发送一致）
+	if c.shortWindow.Load() && end-start+1 > 128<<10 {
+		end = start + (128<<10) - 1
+	}
 	if c.mismatchNext.CompareAndSwap(true, false) {
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start+1, end, len(c.data)))
+	} else if c.unknownTotal.Load() {
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/*", start, end))
 	} else {
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(c.data)))
 	}
@@ -458,5 +466,55 @@ func TestUpstreamTruncatedBodyRetries(t *testing.T) {
 	}
 	if delta := cdn.requests.Load() - before; delta != 2 {
 		t.Errorf("应恰好 2 次请求（截断 + 换签名重试），实际 %d", delta)
+	}
+}
+
+// TestUpstreamUnknownTotal P7：Content-Range 总额未知（bytes a-b/*）可正常读取
+func TestUpstreamUnknownTotal(t *testing.T) {
+	data := make([]byte, 1<<20)
+	for i := range data {
+		data[i] = byte(i % 43)
+	}
+	u, cdn, _ := newTestUpstream(t, data, "")
+	defer u.Close()
+	cdn.unknownTotal.Store(true)
+
+	p := make([]byte, 1000)
+	n, err := u.ReadAt(p, 3000)
+	if err != nil {
+		t.Fatalf("总额未知应可读取: %v", err)
+	}
+	if n != 1000 || p[0] != byte(3000%43) {
+		t.Errorf("内容不符: n=%d", n)
+	}
+}
+
+// TestUpstreamShortWindowContinuation P9：CDN 合法返回短窗口时自动续拉，
+// 1 MiB+16 的块读仍完整返回
+func TestUpstreamShortWindowContinuation(t *testing.T) {
+	chunkLen := DefaultChunkSize + TagSize
+	data := make([]byte, 4<<20)
+	for i := range data {
+		data[i] = byte(i % 101)
+	}
+	u, cdn, _ := newTestUpstream(t, data, "")
+	defer u.Close()
+	cdn.shortWindow.Store(true) // 每次最多 128 KiB 合法短窗口
+
+	p := make([]byte, chunkLen)
+	before := cdn.requests.Load()
+	n, err := u.ReadAt(p, 0)
+	if err != nil && err != io.EOF {
+		t.Fatalf("短窗口续拉读取: %v", err)
+	}
+	if n != chunkLen {
+		t.Fatalf("短读: %d/%d", n, chunkLen)
+	}
+	if p[0] != 0 || p[chunkLen-1] != byte((chunkLen-1)%101) {
+		t.Error("内容不符")
+	}
+	// 128 KiB 窗口 → 约 9 次请求续拉
+	if reqs := cdn.requests.Load() - before; reqs < 2 {
+		t.Errorf("应发生多次续拉请求，实际 %d", reqs)
 	}
 }

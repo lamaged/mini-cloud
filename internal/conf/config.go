@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 )
 
@@ -73,6 +74,7 @@ func DefaultConfig() *Config {
 func Load(path string) (*Config, error) {
 	cfg, err := LoadStrict(path)
 	if err == nil {
+		ensureBackup(path) // I6：从未用过管理页的机器没有 .bak——加载成功后补一份
 		return cfg, nil
 	}
 	if !os.IsNotExist(err) {
@@ -81,23 +83,29 @@ func Load(path string) (*Config, error) {
 		// ② 损坏原文件另存副本 config.json.broken-<时间戳>（0600），不静默丢失；
 		// ③ 恢复成功日志为 ERROR 并明示旧凭证风险。
 		if bakCfg, bakErr := LoadStrict(path + ".bak"); bakErr == nil {
-			broken := fmt.Sprintf("%s.broken-%d", path, time.Now().Unix())
+			// ① 非空损坏文件另存副本（I7：空文件无需副本、恢复照常执行）
+			broken := ""
 			if data, rdErr := os.ReadFile(path); rdErr == nil && len(data) > 0 {
-				if wErr := os.WriteFile(broken, data, 0600); wErr == nil {
-					if rbErr := RestoreBackup(path); rbErr == nil {
-						if cfg2, loadErr := LoadStrict(path); loadErr == nil {
-							bakInfo := ""
-							if fi, statErr := os.Stat(path + ".bak"); statErr == nil {
-								bakInfo = fi.ModTime().Format("2006-01-02 15:04:05")
-							}
-							slog.Error("config.json 语法损坏，已自动回退到备份并恢复——其中凭证可能已过期，请在 /admin 核对或更新",
-								"broken_saved", broken,
-								"bak_mtime", bakInfo,
-								"bak_clouds", len(bakCfg.Clouds),
-								"orig_err", err)
-							return cfg2, nil
-						}
+				broken = fmt.Sprintf("%s.broken-%d", path, time.Now().Unix())
+				if wErr := os.WriteFile(broken, data, 0600); wErr != nil {
+					broken = ""
+				} else {
+					pruneBroken(path) // P10：只保留最近 3 份损坏副本
+				}
+			}
+			// ② 恢复
+			if rbErr := RestoreBackup(path); rbErr == nil {
+				if cfg2, loadErr := LoadStrict(path); loadErr == nil {
+					bakInfo := ""
+					if fi, statErr := os.Stat(path + ".bak"); statErr == nil {
+						bakInfo = fi.ModTime().Format("2006-01-02 15:04:05")
 					}
+					logArgs := []interface{}{"bak_mtime", bakInfo, "bak_clouds", len(bakCfg.Clouds), "orig_err", err}
+					if broken != "" {
+						logArgs = append([]interface{}{"broken_saved", broken}, logArgs...)
+					}
+					slog.Error("config.json 语法损坏，已自动回退到备份并恢复——其中凭证可能已过期，请在 /admin 核对或更新", logArgs...)
+					return cfg2, nil
 				}
 			}
 		}
@@ -108,7 +116,29 @@ func Load(path string) (*Config, error) {
 	if err := cfg.Save(path); err != nil {
 		return nil, err
 	}
+	ensureBackup(path)
 	return cfg, nil
+}
+
+// pruneBroken 保留最近 3 份损坏副本，删除更旧的（P10：路由器 flash 有限）
+func pruneBroken(path string) {
+	matches, _ := filepath.Glob(path + ".broken-*")
+	if len(matches) <= 3 {
+		return
+	}
+	sort.Strings(matches) // 时间戳后缀：字典序 = 时间序
+	for _, m := range matches[:len(matches)-3] {
+		os.Remove(m)
+	}
+}
+
+// ensureBackup 无 .bak 时写一份（I6：自愈的前提；启动路径调用，写回路径不受影响）
+func ensureBackup(path string) {
+	if _, err := os.Stat(path + ".bak"); os.IsNotExist(err) {
+		if err := Backup(path); err != nil {
+			slog.Warn("生成配置备份失败", "err", err)
+		}
+	}
 }
 
 // LoadStrict 严格读取配置：文件缺失或解析失败直接报错，绝不自动创建默认配置。
