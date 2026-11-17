@@ -16,6 +16,10 @@ func EncryptObject(dst io.Writer, master []byte, plain io.Reader, size int64, fi
 	if err != nil {
 		return nil, "", err
 	}
+	// P10：强制元数据大小与头部一致（消除调用方传入不一致 meta.S 的隐患）
+	if meta != nil {
+		meta.S = size
+	}
 	h := &Header{
 		Magic:     [4]byte{'M', 'C', 'F', '1'},
 		Version:   Version1,

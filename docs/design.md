@@ -203,6 +203,7 @@ if vaultCfg != nil {
 - **路径分流（I11 修订）**：`/M/<vault 前缀>/...` → List 直接读内存虚拟树（不经 cached，manifest 更新延迟与缓存内存可控）、Link 走 raw；其余路径 → List/Link 全部委托 `cached`（302 行为不变）。
 - **重试语义（I11 修订）**：Vault 直连 raw.Link 绕过了 RetryReader——Vault 自实现重试：**仅对网络错误重试 1 次**，"not found" 不重试（与 RetryReader 语义对齐）。
 - **顺序读取数（I3，PM 拍板 2026-11-17 方案 b）**：Phase 1 的 upstream.go 实现顺序流式 RangeSource（长连接 + 内部缓冲，顺序播放不按块发请求）；随机 Seek 走单块 Range。Phase 0 本地文件按块 ReadAt，无网络开销。
+- **顺序流式 RangeSource 契约（P9，Phase 1 验收口径）**：① 预读/缓冲窗口 4–8 MiB（与 AX6 内存预算对齐，计入每流账）；② 相邻 ReadAt 偏移差 ≤ 缓冲窗口即视为顺序（命中缓冲直接返回，不发新请求）；③ 反向 Seek、跨块跳跃、403 重签后缓冲立即失效并重新拉取；④ 缓冲内存计入全局 max_streams 信号量（每流 ≤ 8 MiB 上限），与 URL 刷新锁同一互斥域。
 - **URL 时效由 Vault 自管（D1）**：现有 `CachedReader` 链接缓存固定 10 分钟 TTL、无按条目指定 TTL 的扩展点，Vault 路径不走它的链接缓存；Vault 自建「URL + 绝对过期时间」表，TTL = `min(10min, expires - now - 60s)`；403 时失效旧 URL → 重新 Link → 重试一次，再失败 502；并发刷新用标准库 mutex 自实现（不引外部库）。
 - **`TokenManager` / `HealthReporter` / `CredentialUpdater` 的断言对象必须始终是 raw 驱动**；Vault 与 CachedReader 不得实现这些接口。
 - **Stop 幂等（I7）**：`CachedReader.Stop` 改 `sync.Once`（当前二次调用 panic）；所有权链唯一：`main → Handler.Close → Vault.Stop → CachedReader.Stop`，任何中间层不得被 main 单独 Stop；补「重复 Stop 不 panic」单元测试。

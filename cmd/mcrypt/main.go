@@ -182,7 +182,8 @@ func cmdEncrypt(args []string) error {
 		in.Close()
 		if err != nil {
 			f.Close()
-			return fmt.Errorf("加密 %s 失败: %w", virtual, err)
+			os.Remove(objFull) // P10：删除半成品，避免 _mc 累积无主对象
+			return fmt.Errorf("加密 %s 失败（半成品已删除）: %w", virtual, err)
 		}
 		if err := f.Close(); err != nil {
 			return err
