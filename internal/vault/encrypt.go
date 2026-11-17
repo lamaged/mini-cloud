@@ -1,0 +1,96 @@
+package vault
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"io"
+)
+
+// EncryptObject 流式加密单个文件到 dst（内存占用 = 一个分块 + 元数据，支持 55GB 级大文件）。
+// 返回最终文件头（供 manifest 条目记录 header_sha256 与 fileID）。
+// 不变量（I1）：fileID 必须每次新生成；调用方负责随机生成并保证不复用。
+func EncryptObject(dst io.Writer, master []byte, plain io.Reader, size int64, fileID [16]byte, meta *Metadata) (*Header, error) {
+	prefix, err := randomBytes(4)
+	if err != nil {
+		return nil, err
+	}
+	h := &Header{
+		Magic:     [4]byte{'M', 'C', 'F', '1'},
+		Version:   Version1,
+		Flags:     0,
+		ChunkSize: DefaultChunkSize,
+		PlainSize: size,
+		FileID:    fileID,
+	}
+	copy(h.NoncePrefix[:], prefix)
+
+	// 元数据先加密（AAD 绑定占位头，见 meta.go），再定 MetaLen/DataOffset
+	metaBlob, err := SealMeta(FileMetaKey(master, fileID), h, meta)
+	if err != nil {
+		return nil, err
+	}
+	if len(metaBlob) > MaxMetaLen {
+		return nil, fmt.Errorf("vault: 元数据超上限 %d", MaxMetaLen)
+	}
+	h.MetaLen = uint32(len(metaBlob))
+	h.DataOffset = HeaderSize + uint64(len(metaBlob))
+
+	// 写头 + 元数据
+	if _, err := dst.Write(h.Marshal()); err != nil {
+		return nil, err
+	}
+	if _, err := dst.Write(metaBlob); err != nil {
+		return nil, err
+	}
+
+	// 流式分块加密
+	key := FileDataKey(master, fileID)
+	hasher := sha256.New()
+	buf := make([]byte, h.ChunkSize)
+	var idx uint64
+	for {
+		n, rerr := io.ReadFull(plain, buf)
+		if n > 0 {
+			hasher.Write(buf[:n])
+			ct, err := seal(key, h.ChunkNonce(idx), buf[:n], h.ChunkAAD(idx))
+			if err != nil {
+				return nil, err
+			}
+			if _, err := dst.Write(ct); err != nil {
+				return nil, err
+			}
+			idx++
+		}
+		if rerr == io.EOF || rerr == io.ErrUnexpectedEOF {
+			break
+		}
+		if rerr != nil {
+			return nil, rerr
+		}
+	}
+	if idx != h.ChunkCount() {
+		return nil, fmt.Errorf("vault: 明文大小不符：期望 %d 块，实际 %d 块", h.ChunkCount(), idx)
+	}
+	if meta != nil {
+		meta.H = hex.EncodeToString(hasher.Sum(nil))
+		meta.S = size
+	}
+	return h, nil
+}
+
+// NewFileID 生成全新 fileID（I1：每次加密必须新生成，禁止复用）
+func NewFileID() ([16]byte, error) {
+	var id [16]byte
+	b, err := randomBytes(16)
+	if err != nil {
+		return id, err
+	}
+	copy(id[:], b)
+	return id, nil
+}
+
+// NewMasterKey 生成 32B master key
+func NewMasterKey() ([]byte, error) {
+	return randomBytes(32)
+}
