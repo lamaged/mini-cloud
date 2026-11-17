@@ -29,6 +29,9 @@ go build -o mini-cloud .
 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o mini-cloud-arm64 .
 ~/upx-5.2.1-amd64_linux/upx --best -o mini-cloud-arm64-upx mini-cloud-arm64
 
+# 加密工具 Windows 版（铁律 5 跨平台：云盘上传在 Windows，每次发版必交付）
+GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o mcrypt.exe ./cmd/mcrypt/
+
 # 测试（提交前跑 -race；云盘驱动用 httptest 假服务器，不得使用真实凭证）
 go vet ./...
 go test ./... -race

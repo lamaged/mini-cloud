@@ -42,6 +42,10 @@ echo "==> 放入暂存目录: $STAGING_DIR"
 mkdir -p "$STAGING_DIR"
 cp "$BUILD_DIR/mini-cloud-arm64-upx" "$STAGING_DIR/mini-cloud-arm64-upx"
 
+# 加密工具 Windows 版（铁律 5 跨平台：PM 在 Windows 上传云盘文件，发版必交付）
+echo "==> 编译加密工具 Windows 版（mcrypt.exe）"
+GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o "$STAGING_DIR/mcrypt.exe" ./cmd/mcrypt/
+
 SIZE=$(stat -c%s "$STAGING_DIR/mini-cloud-arm64-upx")
 echo "==> 完成：$STAGING_DIR/mini-cloud-arm64-upx"
 echo "==> UPX 后体积（铁律 10 观察项，记入 PROGRESS.md）: $SIZE 字节"

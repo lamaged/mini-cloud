@@ -162,7 +162,7 @@ func cmdEncrypt(args []string) error {
 		objPath := vault.ObjectPath(idStr)
 		meta := &vault.Metadata{
 			V: 1, P: virtual, N: filepath.Base(rel), S: info.Size(),
-			M: info.ModTime().Unix(), T: mime.TypeByExtension(filepath.Ext(rel)),
+			M: info.ModTime().Unix(), T: mimeForExt(filepath.Ext(rel)),
 		}
 
 		objFull := filepath.Join(*outDir, filepath.FromSlash(objPath))
@@ -356,6 +356,47 @@ func cmdVerify(args []string) error {
 		return fmt.Errorf("%d 个文件校验失败", failCount)
 	}
 	return nil
+}
+
+// mimeForExt 扩展名 → MIME：内置表优先（视频/音频/字幕类型跨平台一致——
+// 部分平台系统表对 .ts 等返回错误类型），再回退系统表
+func mimeForExt(ext string) string {
+	if ct := builtinMIME[strings.ToLower(ext)]; ct != "" {
+		return ct
+	}
+	return mime.TypeByExtension(ext)
+}
+
+var builtinMIME = map[string]string{
+	".mkv":  "video/x-matroska",
+	".mp4":  "video/mp4",
+	".m4v":  "video/x-m4v",
+	".mov":  "video/quicktime",
+	".ts":   "video/mp2t",
+	".m2ts": "video/mp2t",
+	".mts":  "video/mp2t",
+	".avi":  "video/x-msvideo",
+	".wmv":  "video/x-ms-wmv",
+	".flv":  "video/x-flv",
+	".webm": "video/webm",
+	".mp3":  "audio/mpeg",
+	".flac": "audio/flac",
+	".aac":  "audio/aac",
+	".wav":  "audio/wav",
+	".m4a":  "audio/mp4",
+	".srt":  "application/x-subrip",
+	".ass":  "text/x-ssa",
+	".ssa":  "text/x-ssa",
+	".iso":  "application/x-iso9660-image",
+	".rar":  "application/vnd.rar",
+	".7z":   "application/x-7z-compressed",
+	".zip":  "application/zip",
+	".jpg":  "image/jpeg",
+	".jpeg": "image/jpeg",
+	".png":  "image/png",
+	".gif":  "image/gif",
+	".pdf":  "application/pdf",
+	".txt":  "text/plain",
 }
 
 func loadManifestFile(inDir string, key []byte) (*vault.Manifest, error) {
