@@ -41,8 +41,9 @@ type Vault struct {
 type root struct {
 	name     string
 	warning  string
-	entries  map[string]Entry // 虚拟文件路径（"/电影/a.mkv"）→ 条目
-	dirs     map[string]bool  // 虚拟目录集合（含 "/"）
+	entries  map[string]Entry       // 虚拟文件路径（"/电影/a.mkv"）→ 条目
+	dirs     map[string]bool        // 虚拟目录集合（含 "/"）
+	children map[string][]model.Obj // 虚拟目录 → 直接子项（loadRoot 一次性构建并排序，P15）
 }
 
 // streamSem 全局解密流信号量（I6：max_streams，超限 503 语义由调用方决定）
@@ -52,9 +53,14 @@ type streamSem struct {
 	max   int
 }
 
-func (s *streamSem) acquire(timeout time.Duration) bool {
+func (s *streamSem) acquire(ctx context.Context, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for {
+		select {
+		case <-ctx.Done():
+			return false // P16：客户端断开不再傻等
+		default:
+		}
 		s.mu.Lock()
 		if s.avail > 0 {
 			s.avail--
@@ -78,7 +84,7 @@ func (s *streamSem) release() {
 // acquireTimeout 信号量获取超时（测试可缩短）
 var acquireTimeout = 5 * time.Second
 
-// New 创建 Vault 包装层（签名与 docs/design.md §4.1 一致：vault.New(cached, raw, vaultCfg)）
+// New 创建 Vault 包装层（签名以本实现为准：vault.New(cached, raw, master, cfg)）
 func New(cached driver.Reader, raw driver.Driver, master []byte, cfg Config) *Vault {
 	if cfg.MaxStreams <= 0 {
 		cfg.MaxStreams = 4
@@ -127,15 +133,22 @@ func (v *Vault) isVaultRoot(name string) bool {
 
 // loadRoot 加载单个 vault 根（manifest 唯一真值源）
 func (v *Vault) loadRoot(ctx context.Context, name string) {
-	r := &root{name: name, entries: make(map[string]Entry), dirs: map[string]bool{"/": true}}
+	r := &root{name: name, entries: make(map[string]Entry), dirs: map[string]bool{"/": true}, children: make(map[string][]model.Obj)}
 
 	link, err := v.raw.Link(ctx, path.Join(name, "_mc", "manifest.mcf"))
-	if err != nil || link.Reader == nil {
+	if err != nil {
 		r.warning = fmt.Sprintf("vault 根 %s：manifest 缺失或不可读，虚拟视图为空目录", name)
 		slog.Warn("vault: "+r.warning, "err", err)
+		r.buildChildren() // 空虚拟树：List 返回空列表而非 not found
 		v.mu.Lock()
 		v.roots[name] = r
 		v.mu.Unlock()
+		return
+	}
+	if link.Reader == nil {
+		// I1：Link 返回 URL 的驱动（天翼/移动 302 模式）不支持流式读取——
+		// 不建 vault 根、不接管同名目录，挂载完全按普通模式工作（Phase 1 接 OpenRange 后启用）
+		slog.Info("vault: 驱动不支持流式读取，跳过该挂载的 vault 根", "root", name)
 		return
 	}
 	defer link.Reader.Close()
@@ -151,6 +164,11 @@ func (v *Vault) loadRoot(ctx context.Context, name string) {
 	}
 
 	for _, e := range m.Files {
+		if !strings.HasPrefix(path.Clean(e.Obj), "_mc/o/") {
+			// P18：manifest 异常条目不得把任意路径交给驱动
+			slog.Warn("vault: 跳过对象路径非法的条目", "path", e.Path, "obj", e.Obj)
+			continue
+		}
 		r.entries[e.Path] = e
 		for d := path.Dir(e.Path); ; d = path.Dir(d) {
 			r.dirs[d] = true
@@ -162,10 +180,48 @@ func (v *Vault) loadRoot(ctx context.Context, name string) {
 	for _, d := range m.Dirs {
 		r.dirs[d] = true
 	}
+	r.buildChildren()
 	slog.Info("vault: 虚拟树就绪", "root", name, "files", len(m.Files))
 	v.mu.Lock()
 	v.roots[name] = r
 	v.mu.Unlock()
+}
+
+// etagFor 虚拟文件 ETag（I3：PROPFIND 与 GET 同一字符串、同一来源）
+func etagFor(e Entry) string {
+	return fmt.Sprintf(`"%s-%d"`, e.FileID, e.Size)
+}
+
+// buildChildren 构建目录 → 子项索引（P15：List 不再全表扫描）
+func (r *root) buildChildren() {
+	for d := range r.dirs {
+		r.children[d] = r.children[d][:0]
+	}
+	for p, e := range r.entries {
+		parent := path.Dir(p)
+		if r.dirs[parent] {
+			r.children[parent] = append(r.children[parent], model.Obj{
+				Name:        e.Name,
+				Size:        e.Size,
+				ModTime:     time.Unix(e.MTime, 0),
+				IsDir:       false,
+				ETag:        etagFor(e),
+				ContentType: e.MIME,
+			})
+		}
+	}
+	for d := range r.dirs {
+		if d == "/" {
+			continue
+		}
+		parent := path.Dir(d)
+		if r.dirs[parent] {
+			r.children[parent] = append(r.children[parent], model.Obj{Name: path.Base(d), IsDir: true})
+		}
+	}
+	for d := range r.children {
+		sort.Slice(r.children[d], func(i, j int) bool { return r.children[d][i].Name < r.children[d][j].Name })
+	}
 }
 
 // findRoot 判定挂载内路径是否命中 vault 根；返回 (根, vault 内相对路径, 是否命中)
@@ -198,37 +254,10 @@ func (v *Vault) List(ctx context.Context, reqPath string) ([]model.Obj, error) {
 	if isMcPath(inner) {
 		return nil, driver.ErrForbidden
 	}
-	if !r.dirs[inner] {
+	objs, ok := r.children[inner]
+	if !ok {
 		return nil, fmt.Errorf("not found: %s", reqPath)
 	}
-
-	var objs []model.Obj
-	seen := make(map[string]bool)
-	for p, e := range r.entries {
-		if path.Dir(p) != inner {
-			continue
-		}
-		objs = append(objs, model.Obj{
-			Name:        e.Name,
-			Size:        e.Size,
-			ModTime:     time.Unix(e.MTime, 0),
-			IsDir:       false,
-			ETag:        fmt.Sprintf(`"%s-%d"`, e.FileID, e.Size),
-			ContentType: e.MIME,
-		})
-		seen[e.Name] = true
-	}
-	for d := range r.dirs {
-		if d == "/" || path.Dir(d) != inner {
-			continue
-		}
-		name := path.Base(d)
-		if seen[name] {
-			continue
-		}
-		objs = append(objs, model.Obj{Name: name, IsDir: true})
-	}
-	sort.Slice(objs, func(i, j int) bool { return objs[i].Name < objs[j].Name })
 	return objs, nil
 }
 
@@ -255,10 +284,10 @@ func (v *Vault) Link(ctx context.Context, reqPath string) (*model.Link, error) {
 		return nil, fmt.Errorf("vault: 上游未返回数据流: %s", objPath)
 	}
 
-	// 全局信号量（I6：超限不排队，直接拒绝）
-	if !v.sem.acquire(acquireTimeout) {
+	// 全局信号量（I2：最多等待 acquireTimeout 后拒绝 → 503）
+	if !v.sem.acquire(ctx, acquireTimeout) {
 		link.Reader.Close()
-		return nil, fmt.Errorf("vault: 并发解密流超上限（%d），请稍后重试", v.sem.max)
+		return nil, driver.ErrTooManyStreams
 	}
 
 	ra, ok := link.Reader.(io.ReaderAt)
@@ -287,9 +316,11 @@ func (v *Vault) Link(ctx context.Context, reqPath string) (*model.Link, error) {
 		return nil, err
 	}
 
+	hdr := httpHeader(e.MIME)
+	hdr.Set("ETag", etagFor(e)) // I3：与 PROPFIND 同源
 	return &model.Link{
 		Reader: &semDecryptReader{DecryptReader: dr, sem: v.sem},
-		Header: httpHeader(e.MIME),
+		Header: hdr,
 	}, nil
 }
 
@@ -325,15 +356,19 @@ type readAtCloser struct {
 func (a *readAtCloser) ReadAt(p []byte, off int64) (int, error) { return a.r.ReadAt(p, off) }
 func (a *readAtCloser) Close() error                            { return a.c.Close() }
 
-// semDecryptReader 关闭时释放全局信号量
+// semDecryptReader 关闭时释放全局信号量（P16：重复 Close 幂等，只释放一次）
 type semDecryptReader struct {
 	*DecryptReader
-	sem *streamSem
+	sem      *streamSem
+	closeOnce sync.Once
 }
 
 func (r *semDecryptReader) Close() error {
-	err := r.DecryptReader.Close()
-	r.sem.release()
+	var err error
+	r.closeOnce.Do(func() {
+		err = r.DecryptReader.Close()
+		r.sem.release()
+	})
 	return err
 }
 

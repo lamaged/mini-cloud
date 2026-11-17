@@ -37,8 +37,6 @@ type mountedDriver struct {
 	Prefix string        // URL 前缀，如 "/mobile"
 	Drv    driver.Driver // 驱动实例（原始驱动）
 
-	// VaultWarning vault 层健康提示（manifest 缺失/损坏等；装配后回填，可为 nil）
-	VaultWarning func() string
 }
 
 func main() {
@@ -179,7 +177,7 @@ func main() {
 	// Vault 全局配置（PM 拍板：全局一套，按挂载生效；docs/design.md §4.1/§4.3）
 	var vaultKey []byte
 	var vaultCfg *vault.Config
-	if cfg.Vault.Enabled {
+	if cfg.Vault != nil && cfg.Vault.Enabled {
 		vaultKey, err = os.ReadFile(cfg.Vault.KeyFile)
 		if err != nil {
 			slog.Error("读取 vault 密钥失败", "key_file", cfg.Vault.KeyFile, "err", err)
@@ -225,13 +223,6 @@ func main() {
 			davHandler.ServeHTTP(w, r)
 		})
 		slog.Info("挂载云盘", "name", m.Name, "prefix", m.Prefix)
-	}
-
-	// vault 健康提示回填到挂载信息（显示在根页面/根 PROPFIND 的显示名）
-	for i := range mounts {
-		if v, ok := davHandlers[i].Driver.(interface{ Warning() string }); ok {
-			mounts[i].VaultWarning = v.Warning
-		}
 	}
 
 	// 凭证生效后：清空该挂载的目录/链接缓存，避免旧账号数据残留（30s 目录 / 10min 链接）
@@ -359,11 +350,6 @@ func displayName(m mountedDriver) string {
 	}
 	if hr, ok := m.Drv.(driver.HealthReporter); ok {
 		if w := hr.HealthWarning(); w != "" {
-			return w
-		}
-	}
-	if m.VaultWarning != nil {
-		if w := m.VaultWarning(); w != "" {
 			return w
 		}
 	}

@@ -474,7 +474,7 @@ Go 的 `http.Redirect` 写 302 时没有设置 `Cache-Control` / `Expires`。客
 - 加密软件离线运行，生成 `_mc` 目录；官方工具上传。
 - 服务端只读，不需要云盘写权限。
 - 新增一个 `vault` 配置段和一个 key 文件；不影响现有云盘配置。
-- manifest 更新后，服务端定时重载；新增文件最多延迟几分钟可见。
+- manifest 仅在服务启动时加载，更新后需重启服务生效（Phase 0 现状）；定时重载列入 Phase 2。
 - 日志不打印 key、nonce、明文内容。
 
 ### 6.5 总体结论
@@ -609,7 +609,6 @@ GET /天翼个人/backup/电影/a.mkv
 ```
 
 > 注：`h` 字段已废弃（v1.3，I1）——单遍流式加密下无法自包含明文哈希，恒为空；权威 SHA-256 只存 manifest 条目。示例保留字段仅为格式兼容。
-```
 
 保存原始路径、原始文件名、大小、mtime、MIME。
 
@@ -725,10 +724,10 @@ master key (32B)
     "enabled": true,
     "key_file": "/data/mini-cloud/vault.key",
     "paths": ["backup", "Archive"],
-    "manifest": "_mc/manifest.mcf",
-    "chunk_size": 1048576,
-    "max_streams": 4,
-    "cache_mb": 16
+    "manifest": "_mc/manifest.mcf",   // Phase 2 预留（当前未实现；实际固定为 _mc/manifest.mcf）
+    "chunk_size": 1048576,           // Phase 2 预留（当前未实现；实际固定 1 MiB）
+    "max_streams": 4,                // 已实现（0 = 默认 4）
+    "cache_mb": 16                   // Phase 2 预留（当前未实现）
   }
 }
 ```
@@ -778,7 +777,7 @@ auth.StartWatcher(ctx, raw, 5*time.Minute)   // 必须传 raw：TokenManager 断
 cached := fs.NewCachedReader(fs.NewRetryReader(raw))
 var drv driver.Driver = cached
 if vaultCfg != nil {
-    v := vault.New(cached, raw, vaultCfg)    // /M/<vault> 前缀：List 读内存虚拟树、Link 走 raw（自管 URL 表）；其余路径：List/Link 全部委托 cached
+    v := vault.New(cached, raw, vaultKey, vaultCfg) // 实际签名以代码为准（P13）；/M/<vault> 前缀：List 读内存虚拟树、Link 走 raw（自管 URL 表）；其余路径：List/Link 全部委托 cached
     if err := v.Init(ctx); err != nil { ... }
     v.Start(ctx)
     drv = v
@@ -809,7 +808,7 @@ if vaultCfg != nil {
   - `GET /<vault 根>/_mc/...` 返回 403（I4）；
   - 空文件可解密、头部被篡改时拒绝（I2）；
   - manifest 记录的 fileID 与对象头 fileID 一致性校验（I12，Phase 0 必做）。
-- 用 55 GB 文件走一遍代理，测 4K 播放、拖动、`top`、`free`。
+- 用 55 GB 文件走一遍代理，测 4K 播放、拖动、`top`、`free`（**执行环境：开发机**——AX6 可用存储仅数 MB，无法在真机本地构造 55 GB 文件；真实 55 GB 用例在 Phase 1 接天翼家庭后真机验证，P17）。
 
 ### Phase 1：云端 MVP（1–2 周）
 

@@ -13,7 +13,7 @@ type Config struct {
 	Server ServerConfig   `json:"server"`
 	Cloud  *CloudConfig   `json:"cloud,omitempty"` // 单云盘（向后兼容）；指针 + omitempty：指针保证空值被省略（struct 值的 omitempty 不生效），避免 Save 输出空 "cloud" 块
 	Clouds []CloudConfig  `json:"clouds"`          // 多云盘（优先）
-	Vault  VaultConfig    `json:"vault,omitempty"` // 加密文件播放（docs/design.md §4.3）
+	Vault  *VaultConfig   `json:"vault,omitempty"` // 加密文件播放（docs/design.md §4.3；指针 + omitempty：struct 值的 omitempty 不生效，P11）
 }
 
 // VaultConfig Vault 配置（全局一套，按挂载生效）

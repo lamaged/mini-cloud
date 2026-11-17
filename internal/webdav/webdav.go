@@ -99,6 +99,10 @@ func (h *Handler) handleGetHead(w http.ResponseWriter, r *http.Request) (int, er
 			// Vault _mc 密文对象：403 屏蔽（I4）
 			return http.StatusForbidden, nil
 		}
+		if errors.Is(err, driver.ErrTooManyStreams) {
+			// 并发解密流超上限（design §7.7：超出返回 503 防止 OOM）
+			return http.StatusServiceUnavailable, nil
+		}
 		return http.StatusInternalServerError, err
 	}
 

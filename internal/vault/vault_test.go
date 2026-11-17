@@ -18,7 +18,8 @@ import (
 
 // fakeRaw 内存假云盘：模拟 local 驱动（Link 返回 seekable 数据流）
 type fakeRaw struct {
-	files map[string][]byte // 挂载内路径 → 内容
+	files    map[string][]byte // 挂载内路径 → 内容
+	urlOnly  bool              // 模拟天翼/移动：Link 只返回 URL（302 模式）
 }
 
 func (f *fakeRaw) Name() string                          { return "local" }
@@ -64,6 +65,9 @@ func (f *fakeRaw) Link(ctx context.Context, p string) (*model.Link, error) {
 	data, ok := f.files[p]
 	if !ok {
 		return nil, os.ErrNotExist
+	}
+	if f.urlOnly {
+		return &model.Link{URL: "https://cdn.example.com/" + p}, nil // 302 模式：无数据流
 	}
 	return &model.Link{Reader: &memReader{Reader: bytes.NewReader(data)}}, nil
 }
@@ -219,6 +223,80 @@ func TestVaultMissingManifestEmptyDir(t *testing.T) {
 	if v.Warning() == "" {
 		t.Error("manifest 缺失应有健康提示")
 	}
+}
+
+// TestVaultURLOnlyDriverSkipped I1：Link 只返回 URL 的驱动（天翼/移动）不建 vault 根、
+// 不接管同名目录、不产生告警——挂载完全按普通模式工作
+func TestVaultURLOnlyDriverSkipped(t *testing.T) {
+	f, master, _ := buildTestVault(t, true)
+	f.urlOnly = true
+	v := newTestVault(t, f, master, 4)
+	defer v.Stop()
+
+	// 同名 backup 目录不被虚拟树接管：List 委托 cached，返回物理目录内容
+	objs, err := v.List(context.Background(), "/backup")
+	if err != nil {
+		t.Fatalf("List /backup: %v", err)
+	}
+	// fakeRaw 物理视图：backup 下有 _mc 子目录
+	found := false
+	for _, o := range objs {
+		if o.Name == "_mc" && o.IsDir {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("URL 型驱动应保持物理视图（含 _mc 目录），实际: %+v", objs)
+	}
+	if v.Warning() != "" {
+		t.Errorf("URL 型驱动不应产生告警，got %q", v.Warning())
+	}
+}
+
+// TestVaultETagSameSource I3：GET 响应 ETag 与 PROPFIND 列表同源
+func TestVaultETagSameSource(t *testing.T) {
+	f, master, _ := buildTestVault(t, true)
+	v := newTestVault(t, f, master, 4)
+	defer v.Stop()
+
+	objs, err := v.List(context.Background(), "/backup/电影")
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	link, err := v.Link(context.Background(), "/backup/电影/a.mkv")
+	if err != nil {
+		t.Fatalf("Link: %v", err)
+	}
+	link.Reader.Close()
+	if objs[0].ETag == "" || link.Header.Get("ETag") != objs[0].ETag {
+		t.Errorf("ETag 不同源: PROPFIND=%q GET=%q", objs[0].ETag, link.Header.Get("ETag"))
+	}
+}
+
+// TestVaultStreamLimitDoubleClose P16：重复 Close 幂等（信号量只释放一次）
+func TestVaultStreamLimitDoubleClose(t *testing.T) {
+	f, master, _ := buildTestVault(t, true)
+	v := New(f, f, master, Config{Paths: []string{"backup"}, MaxStreams: 1})
+	if err := v.Init(context.Background()); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	defer v.Stop()
+
+	old := acquireTimeout
+	acquireTimeout = 100 * time.Millisecond
+	defer func() { acquireTimeout = old }()
+
+	link1, err := v.Link(context.Background(), "/backup/电影/a.mkv")
+	if err != nil {
+		t.Fatalf("Link 1: %v", err)
+	}
+	link1.Reader.Close()
+	link1.Reader.Close() // 重复关闭：不得重复释放导致信号量超发
+	v.sem.mu.Lock()
+	if v.sem.avail > v.sem.max {
+		t.Errorf("双 Close 重复释放：avail=%d > max=%d", v.sem.avail, v.sem.max)
+	}
+	v.sem.mu.Unlock()
 }
 
 func TestVaultStreamLimit(t *testing.T) {

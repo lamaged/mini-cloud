@@ -193,7 +193,7 @@ auth.StartWatcher(ctx, raw, 5*time.Minute)   // 必须传 raw：TokenManager 断
 cached := fs.NewCachedReader(fs.NewRetryReader(raw))
 var drv driver.Driver = cached
 if vaultCfg != nil {
-    v := vault.New(cached, raw, vaultCfg)    // /M/<vault> 前缀：List 读内存虚拟树、Link 走 raw（自管 URL 表）；其余路径：List/Link 全部委托 cached
+    v := vault.New(cached, raw, vaultKey, vaultCfg) // 实际签名以代码为准（P13）；/M/<vault> 前缀：List 读内存虚拟树、Link 走 raw（自管 URL 表）；其余路径：List/Link 全部委托 cached
     if err := v.Init(ctx); err != nil { ... }
     v.Start(ctx)
     drv = v
@@ -222,7 +222,8 @@ if vaultCfg != nil {
 - 对每个挂载 M：请求路径 `/M/<p>/...` 的第一段 `p` 与 `vault.paths` 匹配即进入 Vault（Handler 已 strip 掉 `/<mount>` 前缀，Vault 收到的是挂载内相对路径，只比较首段字符串，**大小写敏感**）；**子目录继承**——Vault 根下任意深度的目录与文件全部按加密文件处理，虚拟视图完全由 manifest 决定。
 - 物理对象名与扩展名均非原名（如 `_mc/o/7f/3a/….bin`）；每个 Vault 根独立持有自己的 `_mc/manifest.mcf` 与对象，共用全局 master key。
 - `PROPFIND`/List 虚拟树只含 manifest 记录；`_mc` 与 manifest 未记录的其他物理对象一律不出现；`GET /M/<p>/_mc/...` 及任何未记录路径 → **403**，绝不回落 302 交出密文。
-- 未找到 manifest（或损坏）→ 该 Vault 根虚拟视图为空目录 + 健康提示，服务不崩溃。
+- 未找到 manifest（或损坏）→ 该 Vault 根虚拟视图为空目录 + 日志告警，服务不崩溃。
+- **manifest 仅启动加载，更新后重启生效**；定时重载列入 Phase 2（P12）。
 - **边界语义（PM 拍板，2026-11-16）**：名字匹配即视为 Vault——若某云盘根下存在恰好同名的**普通**文件夹且无 manifest，将显示为空目录（内容不可见）。此属用户误用 vault 路径名，不受保护，按此语义实现。
 
 **格式不变量（v1.1 定稿，详见报告 §7.3）**：fileID 每次加密新生成、禁止复用；manifest 条目含 header_sha256（空文件防头部篡改）；头部字段校验（chunk_size ∈ [64 KiB, 1 MiB]、data_offset == 64+meta_len、meta_len ≤ 4 KiB、plain_size ≥ 0）；对象绑定字段（fileID 一致 + metadata.p 路径比对）自 Phase 0 起就位、强校验 Phase 1。

@@ -10,7 +10,7 @@
 
 ## 进行中
 
-- **Vault v1.0.0 Phase 0**：**验收通过（2026-11-17）**——AX6 实测 Seal 384.6 MB/s / Open 383.8 MB/s（验收线 40 MB/s 的 9.6 倍）；全部验收项闭环；下一目标 Phase 1 云端 MVP（首接天翼家庭，PM 指令后过闸门①）
+- **Vault v1.0.0 Phase 0**：**验收通过（2026-11-17）**——AX6 实测 Seal 384.6 MB/s / Open 383.8 MB/s（验收线 40 MB/s 的 9.6 倍；口径：单线程、1 MiB 分块、纯内存无 I/O）；全部验收项闭环；下一目标 Phase 1 云端 MVP（首接天翼家庭，PM 指令后过闸门①）
 
 ## 已完成
 
@@ -23,6 +23,7 @@
 | 2026-11-16 | **闸门① 通过（PM 批准），v0.10.0 实现完成**：两阶段 CredentialUpdater + internal/admin 管理页（CSRF、html/template 转义）+ mobile 实现（临时客户端验证、按 __req 隔离、凭证/缓存代次防护）+ conf 原子写/0600/备份 + 3 处转义修复（buildHref 百分号编码、目录页/根页转义）。自查（/code-review high）15 条全部修复；`go vet` + `go test -race` 全绿；ARM64 交叉编译通过；实现期修订记录于 design.md §3.8 |
 | 2026-11-16 | **闸门③ 外部代码审核 RV-2026-11-16-03（结论：有条件通过）**：I1–I6 全部修复（更新串行化、LoadStrict 严格读取、目录 fsync、WriteCredential 测试、401×提交竞态测试、提交失败 .bak 回滚），P1–P9 全部落实（状态码、安全响应头、version v0.10.0、Stop 幂等、字段同步、编码去重、24h 门槛、文档修正、自查留痕表）；`go vet` + `go test -race` 全绿；ARM64 交叉编译通过 |
 | 2026-11-16 | **部署脚本完成（PM 拍板：审核后立即写、单独提交）**：scripts/deploy-prepare.sh（开发机编译+UPX+暂存，端到端跑通）+ scripts/deploy-router.sh（路由器拉取+备份+重启+健康检查+失败回滚，busybox ash 兼容，语法与健康检查解析本地验证通过）；体积观察项（铁律 10）：ARM64 原始 8,716,472 B → UPX 后 2,974,696 B（v0.9.2 基线 UPX 约 2.3 MB，增量主要来自 html/template 与凭证相关代码）；真机验证属闸门⑤ |
+| 2026-11-17 | **Vault Phase 0 接线复核 RV-2026-11-17-04（通过，有条件）**：P7–P10 闭环确认；I1（URL 型驱动跳过 vault 装配，天翼/移动同名目录不受影响 + 告警不再覆盖显示名）、I2（ErrTooManyStreams → 503 + 注释修正）、I3（GET ETag 与 PROPFIND 同源）、I4（孤立围栏修复）全部处置；P11–P18 落实（VaultConfig 指针、重载口径、签名统一、示例标注、children 索引、信号量幂等+ctx、验收口径记录、Obj 前缀校验） |
 | 2026-11-17 | **Vault Phase 0 验收通过**：AX6 实测 AES-256-GCM Seal 384.6 MB/s / Open 383.8 MB/s（远超 40 MB/s 验收线；4K 播放约占单核 3%）；验收清单全部闭环——SHA-256 一致、Range 206 字节级精确、随机 Seek 只读 1-2 块、_mc 403、空文件/头篡改拒绝、fileID 一致性、go test -race 全绿 |
 | 2026-11-17 | **Vault Phase 0 接线完成**：Vault 包装层（虚拟树/_mc 403/信号量/降级告警）+ model.Obj ETag 唯一来源 + webdav ErrForbidden→403 + conf VaultConfig + main 装配；本地端到端全通（加密→PROPFIND 原始名→GET 明文→Range 206 字节级精确→_mc 403→普通文件不受影响）；mcrypt-arm64 bench 已入暂存目录待 AX6 执行 |
 | 2026-11-17 | **Vault Phase 0 复核 RV-2026-11-17-03（通过）**：I1/I2/I3、P1–P6 全部闭环（磁盘格式零变更，旧对象无需重加密）；P7 报告版本统一 v1.3；P8 PROGRESS 状态区清理；P9 顺序流式契约细节落 design §4.1；P10 meta.S 强制一致 + 加密失败删除半成品 |
@@ -183,3 +184,21 @@
 | P8 | 建议 | PROGRESS 进行中与当前版本区滞后 | 已改 | 当前版本单一化（代码/文档各一行）；进行中据实改写（库层完成、待接线） | 文档修订完成 | 待复核 | 2026-11-17 |
 | P9 | 建议 | Phase 1 顺序流式契约缺实现细节 | 已改 | design §4.1 补 4 条验收口径：缓冲 4–8 MiB / 相邻偏移差判定 / 失效时机（反向 Seek、跳跃、403 重签）/ 与 max_streams 信号量同一账 | 文档修订完成 | 待复核 | 2026-11-17 |
 | P10 | 建议 | meta.S 失去约束；失败残留孤儿对象 | 已改 | EncryptObject 在 SealMeta 前强制 meta.S=size；cmdEncrypt 加密失败删除半成品对象并注明 | 文档修订完成 | 待复核 | 2026-11-17 |
+
+
+### RV-2026-11-17-04（接线首轮审核 + P7–P10 复核，12 条）
+
+| 编号 | 级别 | 意见摘要 | 处置类别 | 处置说明 | 状态 | 复核 | 日期 |
+|---|---|---|---|---|---|---|---|
+| I1 | 重要 | Vault 无条件装配误伤天翼/移动 | 已改 | loadRoot 对 URL 型 Link（Reader==nil）跳过该根并 INFO 日志（不接管同名目录）；撤销 VaultWarning 覆盖显示名（仅日志）；补 urlOnly 驱动测试 | 文档修订完成 | 待复核 | 2026-11-17 |
+| I2 | 重要 | max_streams 超限 500 应为 503 | 已改 | 新增 driver.ErrTooManyStreams → webdav 映射 503；注释改为「最多等待 acquireTimeout 后拒绝」；acquire 增 ctx 取消响应 | 文档修订完成 | 待复核 | 2026-11-17 |
+| I3 | 重要 | GET 无 ETag 与 PROPFIND 不同源 | 已改 | etagFor 统一生成，Link Header 增同源 ETag；补同源测试 | 文档修订完成 | 待复核 | 2026-11-17 |
+| I4 | 重要 | 报告 §7.3 孤立围栏渲染错位 | 已改 | 删除多余围栏；全文档围栏计数核对为偶数 | 文档修订完成 | 待复核 | 2026-11-17 |
+| P11 | 建议 | VaultConfig struct 值 omitempty 无效 | 已改 | 改指针 *VaultConfig + omitempty；main 判空 | 文档修订完成 | 待复核 | 2026-11-17 |
+| P12 | 建议 | manifest 无重载与文档不符 | 已改 | 报告 §6.4 与 design §4.3 改为「启动加载、重启生效；定时重载 Phase 2」 | 文档修订完成 | 待复核 | 2026-11-17 |
+| P13 | 建议 | vault.New 签名三处不一致 | 已改 | design §4.1 与报告 §8.2 统一为 New(cached, raw, vaultKey, vaultCfg)，以代码为准 | 文档修订完成 | 待复核 | 2026-11-17 |
+| P14 | 建议 | 配置示例含未实现字段 | 已改 | 报告 §7.8 示例逐字段标注（已实现 / Phase 2 预留） | 文档修订完成 | 待复核 | 2026-11-17 |
+| P15 | 建议 | List 全表扫描 | 已改 | loadRoot 一次性构建 children 索引（目录→子项，排序），List O(子项)；manifest 缺失分支同样初始化 | 文档修订完成 | 待复核 | 2026-11-17 |
+| P16 | 建议 | 信号量三处细节 | 已改 | ① semDecryptReader.Close sync.Once 幂等 + 双关闭测试 ② acquire 响应 ctx 取消 ③ 获取时机前置列入 Phase 1 设计（P9 契约） | 文档修订完成 | 待复核 | 2026-11-17 |
+| P17 | 建议 | 验收口径需写清 | 已改 | 报告 §9 注明 55GB 用例执行环境为开发机（AX6 存储限制），真机验证在 Phase 1；PROGRESS 验收行补 bench 口径（单线程/1 MiB 分块/纯内存无 I/O） | 文档修订完成 | 待复核 | 2026-11-17 |
+| P18 | 建议 | Obj 前缀校验、manifest 路径硬编码 | 已改 | loadRoot 校验 e.Obj 前缀 _mc/o/（非法条目跳过+告警）；manifest 固定 _mc/manifest.mcf 随 P14 示例标注写清 | 文档修订完成 | 待复核 | 2026-11-17 |
