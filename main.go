@@ -29,7 +29,7 @@ import (
 	"mini-cloud/internal/webdav"
 )
 
-const version = "v0.10.0"
+const version = "v1.1.0-dev" // Phase 1 开发版（真机验收中；正式版认定按发布策略）
 
 // mountedDriver 已挂载的云盘驱动信息
 type mountedDriver struct {
