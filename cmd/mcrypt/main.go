@@ -91,6 +91,10 @@ func cmdKeygen(args []string) error {
 	if err := os.WriteFile(*keyPath, key, 0600); err != nil {
 		return fmt.Errorf("写密钥失败: %w", err)
 	}
+	// P2：WriteFile 的 perm 只对新建文件生效，存量文件显式收紧
+	if err := os.Chmod(*keyPath, 0600); err != nil {
+		return fmt.Errorf("设置密钥权限失败: %w", err)
+	}
 	fmt.Printf("已生成 master key：%s（32 字节，0600）\n", *keyPath)
 	fmt.Println("警告：master key 永不传上网盘、必须离线备份；丢失 = 数据不可恢复。")
 	return nil
@@ -108,6 +112,18 @@ func cmdEncrypt(args []string) error {
 	key, err := loadKey(*keyPath)
 	if err != nil {
 		return err
+	}
+	// P3：输出目录不得位于输入目录内部（否则把生成的对象再当明文加密）
+	inAbs, err := filepath.Abs(*inDir)
+	if err != nil {
+		return err
+	}
+	outAbs, err := filepath.Abs(*outDir)
+	if err != nil {
+		return err
+	}
+	if outAbs == inAbs || strings.HasPrefix(outAbs, inAbs+string(filepath.Separator)) {
+		return errors.New("输出目录不能位于输入目录内部（会把生成的对象再加密一遍）")
 	}
 
 	m := &vault.Manifest{V: 1}
@@ -134,7 +150,8 @@ func cmdEncrypt(args []string) error {
 			return err
 		}
 		if !info.Mode().IsRegular() {
-			return nil // 跳过符号链接等
+			fmt.Printf("  跳过 %s（非普通文件）\n", virtual)
+			return nil
 		}
 
 		fileID, err := vault.NewFileID()
@@ -161,7 +178,7 @@ func cmdEncrypt(args []string) error {
 			f.Close()
 			return err
 		}
-		h, err := vault.EncryptObject(f, key, in, info.Size(), fileID, meta)
+		h, shaHex, err := vault.EncryptObject(f, key, in, info.Size(), fileID, meta)
 		in.Close()
 		if err != nil {
 			f.Close()
@@ -174,7 +191,7 @@ func cmdEncrypt(args []string) error {
 			Path: virtual, Name: meta.N, Size: meta.S, MTime: meta.M, MIME: meta.T,
 			FileID: idStr, Obj: objPath,
 			HeaderSHA256: hex.EncodeToString(h.HeaderHash()),
-			SHA256:       meta.H,
+			SHA256:       shaHex,
 		})
 		fileCount++
 		totalSize += info.Size()

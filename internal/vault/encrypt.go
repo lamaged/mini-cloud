@@ -8,12 +8,13 @@ import (
 )
 
 // EncryptObject 流式加密单个文件到 dst（内存占用 = 一个分块 + 元数据，支持 55GB 级大文件）。
-// 返回最终文件头（供 manifest 条目记录 header_sha256 与 fileID）。
+// 返回最终文件头（供 manifest 条目记录 header_sha256）与明文 SHA-256（hex，权威哈希，
+// 写入 manifest.Entry.SHA256；对象内嵌元数据的 H 字段已废弃，见 meta.go I1 说明）。
 // 不变量（I1）：fileID 必须每次新生成；调用方负责随机生成并保证不复用。
-func EncryptObject(dst io.Writer, master []byte, plain io.Reader, size int64, fileID [16]byte, meta *Metadata) (*Header, error) {
+func EncryptObject(dst io.Writer, master []byte, plain io.Reader, size int64, fileID [16]byte, meta *Metadata) (*Header, string, error) {
 	prefix, err := randomBytes(4)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	h := &Header{
 		Magic:     [4]byte{'M', 'C', 'F', '1'},
@@ -25,23 +26,25 @@ func EncryptObject(dst io.Writer, master []byte, plain io.Reader, size int64, fi
 	}
 	copy(h.NoncePrefix[:], prefix)
 
-	// 元数据先加密（AAD 绑定占位头，见 meta.go），再定 MetaLen/DataOffset
+	// 元数据先加密（AAD 绑定占位头，见 meta.go），再定 MetaLen/DataOffset。
+	// I1 说明：单遍流式下元数据先于数据落盘，无法自包含明文哈希——meta.H 保持空，
+	// 权威哈希由本函数计算后返回，调用方写入 manifest.Entry.SHA256。
 	metaBlob, err := SealMeta(FileMetaKey(master, fileID), h, meta)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if len(metaBlob) > MaxMetaLen {
-		return nil, fmt.Errorf("vault: 元数据超上限 %d", MaxMetaLen)
+		return nil, "", fmt.Errorf("vault: 元数据超上限 %d", MaxMetaLen)
 	}
 	h.MetaLen = uint32(len(metaBlob))
 	h.DataOffset = HeaderSize + uint64(len(metaBlob))
 
 	// 写头 + 元数据
 	if _, err := dst.Write(h.Marshal()); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if _, err := dst.Write(metaBlob); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	// 流式分块加密
@@ -55,10 +58,10 @@ func EncryptObject(dst io.Writer, master []byte, plain io.Reader, size int64, fi
 			hasher.Write(buf[:n])
 			ct, err := seal(key, h.ChunkNonce(idx), buf[:n], h.ChunkAAD(idx))
 			if err != nil {
-				return nil, err
+				return nil, "", err
 			}
 			if _, err := dst.Write(ct); err != nil {
-				return nil, err
+				return nil, "", err
 			}
 			idx++
 		}
@@ -66,17 +69,13 @@ func EncryptObject(dst io.Writer, master []byte, plain io.Reader, size int64, fi
 			break
 		}
 		if rerr != nil {
-			return nil, rerr
+			return nil, "", rerr
 		}
 	}
 	if idx != h.ChunkCount() {
-		return nil, fmt.Errorf("vault: 明文大小不符：期望 %d 块，实际 %d 块", h.ChunkCount(), idx)
+		return nil, "", fmt.Errorf("vault: 明文大小不符：期望 %d 块，实际 %d 块", h.ChunkCount(), idx)
 	}
-	if meta != nil {
-		meta.H = hex.EncodeToString(hasher.Sum(nil))
-		meta.S = size
-	}
-	return h, nil
+	return h, hex.EncodeToString(hasher.Sum(nil)), nil
 }
 
 // NewFileID 生成全新 fileID（I1：每次加密必须新生成，禁止复用）

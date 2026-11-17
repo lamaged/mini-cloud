@@ -48,8 +48,8 @@ func TestChunkMath(t *testing.T) {
 	if h.ChunkCipherLen(2) != 1+TagSize {
 		t.Errorf("last chunk cipher len = %d", h.ChunkCipherLen(2))
 	}
-	// 密文总大小 = 头+元数据 + 每块 1MiB+16B
-	want := uint64(HeaderSize+100) + 3*(1<<20+TagSize)
+	// 密文总大小 = 头+元数据 + 明文大小 + 每块 16B tag（I2 修正后公式）
+	want := h.DataOffset + uint64(h.PlainSize) + 3*TagSize
 	if h.CipherSize() != want {
 		t.Errorf("CipherSize = %d, want %d", h.CipherSize(), want)
 	}
@@ -57,6 +57,12 @@ func TestChunkMath(t *testing.T) {
 	h0 := newTestHeader(0)
 	if h0.ChunkCount() != 0 || h0.CipherSize() != h0.DataOffset {
 		t.Errorf("empty file math wrong: chunks=%d size=%d", h0.ChunkCount(), h0.CipherSize())
+	}
+	// I2 非对齐明文：1.5 MiB = 2 块，密文 = 头+元数据 + 1.5MiB + 2*16B
+	hNonAlign := newTestHeader((1<<20)*3/2)
+	wantNonAlign := hNonAlign.DataOffset + uint64(hNonAlign.PlainSize) + 2*TagSize
+	if hNonAlign.CipherSize() != wantNonAlign {
+		t.Errorf("非对齐 CipherSize = %d, want %d", hNonAlign.CipherSize(), wantNonAlign)
 	}
 }
 

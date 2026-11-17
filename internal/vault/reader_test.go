@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -27,18 +28,17 @@ func (c *countingSource) ReadAt(p []byte, off int64) (int, error) {
 }
 func (c *countingSource) Close() error { return c.closer.Close() }
 
-// encryptTestObject 构造一个加密对象（含头/元数据/分块），返回密文与 manifest 用信息
+// encryptTestObject 构造一个加密对象（含头/元数据/分块），返回密文、头与权威哈希
 func encryptTestObject(t *testing.T, master []byte, fileID [16]byte, plain []byte, path string) ([]byte, *Header, string) {
 	t.Helper()
-	sum := sha256.Sum256(plain)
 	meta := &Metadata{V: 1, P: path, N: filepath.Base(path), S: int64(len(plain)),
-		M: time.Now().Unix(), T: "application/octet-stream", H: hex.EncodeToString(sum[:])}
+		M: time.Now().Unix(), T: "application/octet-stream"}
 	var buf bytes.Buffer
-	h, err := EncryptObject(&buf, master, bytes.NewReader(plain), int64(len(plain)), fileID, meta)
+	h, shaHex, err := EncryptObject(&buf, master, bytes.NewReader(plain), int64(len(plain)), fileID, meta)
 	if err != nil {
 		t.Fatalf("EncryptObject: %v", err)
 	}
-	return buf.Bytes(), h, hex.EncodeToString(sum[:])
+	return buf.Bytes(), h, shaHex
 }
 
 func TestDecryptReaderFullRead(t *testing.T) {
@@ -204,6 +204,35 @@ func TestDecryptReaderStat(t *testing.T) {
 	}
 	if fi.IsDir() {
 		t.Error("文件不应是目录")
+	}
+}
+
+// shortMetaSource 模拟 Phase 1 网络源短读：头部给足 64B，元数据只给 5 字节且不报错
+type shortMetaSource struct {
+	data []byte
+}
+
+func (s *shortMetaSource) ReadAt(p []byte, off int64) (int, error) {
+	if off == 0 {
+		return copy(p, s.data[:HeaderSize]), nil
+	}
+	if off == HeaderSize {
+		return copy(p, s.data[off:off+5]), nil
+	}
+	return copy(p, s.data[off:]), nil
+}
+func (s *shortMetaSource) Close() error { return nil }
+
+// TestOpenDecryptReaderMetaTruncated P1：短读且无错误不得被当成完整元数据
+func TestOpenDecryptReaderMetaTruncated(t *testing.T) {
+	master := bytes.Repeat([]byte{0xAA}, 32)
+	fileID, _ := NewFileID()
+	cipher, h, _ := encryptTestObject(t, master, fileID, []byte("hello world"), "/a.bin")
+
+	cs := &shortMetaSource{data: cipher}
+	if _, err := OpenDecryptReader(cs, master, fileID, h.HeaderHash()); err == nil ||
+		!strings.Contains(err.Error(), "截断") {
+		t.Errorf("元数据短读应报「截断」，got %v", err)
 	}
 }
 

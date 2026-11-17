@@ -104,9 +104,10 @@ func (h *Header) ChunkCount() uint64 {
 	return uint64((h.PlainSize + int64(h.ChunkSize) - 1) / int64(h.ChunkSize))
 }
 
-// CipherSize 密文总大小（头 + 元数据 + 分块）
+// CipherSize 密文总大小 = 头+元数据 + 明文大小 + 每块 16B tag。
+// （I2 修正：最后一块明文可能更短，不能按满块计）
 func (h *Header) CipherSize() uint64 {
-	return h.DataOffset + h.ChunkCount()*(uint64(h.ChunkSize)+TagSize)
+	return h.DataOffset + uint64(h.PlainSize) + h.ChunkCount()*TagSize
 }
 
 // ChunkCipherOffset 第 idx 块的密文起始偏移

@@ -18,7 +18,8 @@ type Metadata struct {
 	S int64  `json:"s"` // 明文大小
 	M int64  `json:"m"` // 原始修改时间（unix 秒）
 	T string `json:"t"` // MIME
-	H string `json:"h"` // 明文 SHA-256（hex）
+	H string `json:"h"` // 明文 SHA-256（hex）——已废弃（I1）：单遍流式下元数据先于数据落盘，
+	// 无法自包含哈希；权威哈希只存 manifest.Entry.SHA256。字段保留仅为格式兼容，读取方不得依赖。
 }
 
 // metaAADHeader 元数据 AAD 用的头：MetaLen/DataOffset 置零的占位版

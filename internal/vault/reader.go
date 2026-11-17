@@ -55,8 +55,13 @@ func OpenDecryptReader(src RangeSource, master []byte, wantFileID [16]byte, want
 	var meta *Metadata
 	if h.MetaLen > 0 {
 		blob := make([]byte, h.MetaLen)
-		if _, err := src.ReadAt(blob, HeaderSize); err != nil {
+		n, err := src.ReadAt(blob, HeaderSize)
+		if err != nil && err != io.EOF {
 			return nil, fmt.Errorf("vault: 读元数据失败: %w", err)
+		}
+		if n != int(h.MetaLen) {
+			// P1：短读且无错误（Phase 1 网络源常见）不得被当成完整元数据
+			return nil, fmt.Errorf("vault: 元数据被截断: %d/%d", n, h.MetaLen)
 		}
 		meta, err = OpenMeta(FileMetaKey(master, h.FileID), h, blob)
 		if err != nil {
@@ -93,6 +98,10 @@ func (r *DecryptReader) Read(p []byte) (int, error) {
 		}
 		chunkOff := r.offset - int64(r.chunkIdx)*int64(r.header.ChunkSize)
 		c := copy(p[n:], r.chunk[chunkOff:])
+		if c == 0 {
+			// P5 防御：块内容与偏移矛盾（未来逻辑变化时避免死循环）
+			return n, io.ErrUnexpectedEOF
+		}
 		n += c
 		r.offset += int64(c)
 		if r.offset >= r.header.PlainSize {
