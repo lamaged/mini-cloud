@@ -273,6 +273,53 @@ func TestVaultETagSameSource(t *testing.T) {
 	}
 }
 
+// TestVaultLinkEmptyMIME I5：manifest 条目 MIME 为空（无扩展名/未知类型文件）时
+// Link 不得 panic、响应不设 Content-Type、ETag 照常
+func TestVaultLinkEmptyMIME(t *testing.T) {
+	master := bytes.Repeat([]byte{0x5A}, 32)
+	plain := []byte("no-extension file")
+	fileID := [16]byte{9, 9, 9, 9}
+	objID := EncodeFileID(fileID)
+
+	meta := &Metadata{V: 1, P: "/资料/无扩展名", N: "无扩展名", S: int64(len(plain))}
+	var objBuf bytes.Buffer
+	h, shaHex, err := EncryptObject(&objBuf, master, bytes.NewReader(plain), int64(len(plain)), fileID, meta)
+	if err != nil {
+		t.Fatalf("EncryptObject: %v", err)
+	}
+	m := &Manifest{V: 1, Files: []Entry{{
+		Path: "/资料/无扩展名", Name: "无扩展名", Size: int64(len(plain)), MTime: 1,
+		MIME: "", FileID: objID, Obj: ObjectPath(objID),
+		HeaderSHA256: hex.EncodeToString(h.HeaderHash()), SHA256: shaHex,
+	}}}
+	var mf bytes.Buffer
+	if err := SaveManifest(&mf, ManifestKey(master), m); err != nil {
+		t.Fatal(err)
+	}
+	f := &fakeRaw{files: map[string][]byte{
+		"backup/" + ObjectPath(objID): objBuf.Bytes(),
+		"backup/_mc/manifest.mcf":     mf.Bytes(),
+	}}
+	v := newTestVault(t, f, master, 4)
+	defer v.Stop()
+
+	link, err := v.Link(context.Background(), "/backup/资料/无扩展名")
+	if err != nil {
+		t.Fatalf("Link（空 MIME）: %v", err)
+	}
+	got, err := io.ReadAll(link.Reader)
+	link.Reader.Close()
+	if err != nil || !bytes.Equal(got, plain) {
+		t.Errorf("明文不符: %v", err)
+	}
+	if ct := link.Header.Get("Content-Type"); ct != "" {
+		t.Errorf("空 MIME 不应设置 Content-Type，got %q", ct)
+	}
+	if et := link.Header.Get("ETag"); et == "" {
+		t.Error("ETag 必须照常设置")
+	}
+}
+
 // TestVaultStreamLimitDoubleClose P16：重复 Close 幂等（信号量只释放一次）
 func TestVaultStreamLimitDoubleClose(t *testing.T) {
 	f, master, _ := buildTestVault(t, true)

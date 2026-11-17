@@ -716,6 +716,8 @@ master key (32B)
 
 ### 7.8 配置示例
 
+已实现字段：`enabled`、`key_file`、`paths`、`max_streams`（0 = 默认 4）。Phase 2 预留（当前未实现、会被忽略）：`manifest`（实际固定 `_mc/manifest.mcf`）、`chunk_size`（实际固定 1 MiB）、`cache_mb`（P20：JSON 示例保持合法，标注移出代码块）。
+
 **`vault.paths` 格式与匹配规则（v1.2 定稿）**：无前导斜杠的目录名列表（挂载内相对路径的首段）。Handler 已 strip 掉 `/<mount>` 前缀，Vault 收到的是挂载内相对路径，仅比较首段字符串，**大小写敏感**（与原盘目录名一致）。
 
 ```json
@@ -724,10 +726,10 @@ master key (32B)
     "enabled": true,
     "key_file": "/data/mini-cloud/vault.key",
     "paths": ["backup", "Archive"],
-    "manifest": "_mc/manifest.mcf",   // Phase 2 预留（当前未实现；实际固定为 _mc/manifest.mcf）
-    "chunk_size": 1048576,           // Phase 2 预留（当前未实现；实际固定 1 MiB）
-    "max_streams": 4,                // 已实现（0 = 默认 4）
-    "cache_mb": 16                   // Phase 2 预留（当前未实现）
+    "manifest": "_mc/manifest.mcf",
+    "chunk_size": 1048576,
+    "max_streams": 4,
+    "cache_mb": 16
   }
 }
 ```

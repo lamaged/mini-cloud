@@ -258,7 +258,7 @@ func (v *Vault) List(ctx context.Context, reqPath string) ([]model.Obj, error) {
 	if !ok {
 		return nil, fmt.Errorf("not found: %s", reqPath)
 	}
-	return objs, nil
+	return append([]model.Obj(nil), objs...), nil // P22：返回副本，防调用方污染索引
 }
 
 // Link：vault 文件 → 解密数据流（随机访问 + Range 支持）；_mc → 403；其余委托 cached
@@ -316,8 +316,11 @@ func (v *Vault) Link(ctx context.Context, reqPath string) (*model.Link, error) {
 		return nil, err
 	}
 
-	hdr := httpHeader(e.MIME)
-	hdr.Set("ETag", etagFor(e)) // I3：与 PROPFIND 同源
+	hdr := http.Header{}
+	if e.MIME != "" {
+		hdr.Set("Content-Type", e.MIME)
+	}
+	hdr.Set("ETag", etagFor(e)) // I3：与 PROPFIND 同源（I5：空 MIME 时不得对 nil map 赋值）
 	return &model.Link{
 		Reader: &semDecryptReader{DecryptReader: dr, sem: v.sem},
 		Header: hdr,
@@ -333,7 +336,8 @@ func (v *Vault) Stop() {
 	})
 }
 
-// Warning 该挂载所有 vault 根的健康提示（manifest 缺失/损坏等；供 main 展示，不影响 302 路径）
+// Warning 该挂载所有 vault 根的健康提示（manifest 缺失/损坏等）。
+// 当前仅日志与测试使用；Phase 1 接入 /admin 展示（TODO 技术债）。
 func (v *Vault) Warning() string {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
@@ -370,13 +374,6 @@ func (r *semDecryptReader) Close() error {
 		r.sem.release()
 	})
 	return err
-}
-
-func httpHeader(mime string) http.Header {
-	if mime == "" {
-		return nil
-	}
-	return http.Header{"Content-Type": {mime}}
 }
 
 var _ driver.Driver = (*Vault)(nil)

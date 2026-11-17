@@ -27,6 +27,8 @@
 
 ## 技术债
 
+- [ ] Vault 健康提示（Warning()）接入 /admin 管理页展示——当前仅日志与测试使用（RV-17-05 P22），Phase 1 落地
+
 - [ ] 云盘驱动（tianyi / mobile / baidu）无单元测试——用 httptest 假服务器补齐（策略见 docs/design.md §2）
 - [ ] 路由器整机重启后开机自启（procd init 脚本 + 崩溃自动拉起）——不在 v0.10.0 范围（P14 口径），列入后续版本或单独技术债
 - [ ] 移动驱动启动健壮性（RV-17 I12 分析）：config 为过期 token 且无缓存时，Init 的 discoverCloudHost 可能因路由发现接口拒绝而启动失败——与「过期 → 空目录 + 提示」承诺不符；建议 Vault Phase 0 或小补丁处理（过期时跳过主机发现、驱动就绪并显示过期提示）

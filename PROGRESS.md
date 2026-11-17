@@ -23,6 +23,7 @@
 | 2026-11-16 | **闸门① 通过（PM 批准），v0.10.0 实现完成**：两阶段 CredentialUpdater + internal/admin 管理页（CSRF、html/template 转义）+ mobile 实现（临时客户端验证、按 __req 隔离、凭证/缓存代次防护）+ conf 原子写/0600/备份 + 3 处转义修复（buildHref 百分号编码、目录页/根页转义）。自查（/code-review high）15 条全部修复；`go vet` + `go test -race` 全绿；ARM64 交叉编译通过；实现期修订记录于 design.md §3.8 |
 | 2026-11-16 | **闸门③ 外部代码审核 RV-2026-11-16-03（结论：有条件通过）**：I1–I6 全部修复（更新串行化、LoadStrict 严格读取、目录 fsync、WriteCredential 测试、401×提交竞态测试、提交失败 .bak 回滚），P1–P9 全部落实（状态码、安全响应头、version v0.10.0、Stop 幂等、字段同步、编码去重、24h 门槛、文档修正、自查留痕表）；`go vet` + `go test -race` 全绿；ARM64 交叉编译通过 |
 | 2026-11-16 | **部署脚本完成（PM 拍板：审核后立即写、单独提交）**：scripts/deploy-prepare.sh（开发机编译+UPX+暂存，端到端跑通）+ scripts/deploy-router.sh（路由器拉取+备份+重启+健康检查+失败回滚，busybox ash 兼容，语法与健康检查解析本地验证通过）；体积观察项（铁律 10）：ARM64 原始 8,716,472 B → UPX 后 2,974,696 B（v0.9.2 基线 UPX 约 2.3 MB，增量主要来自 html/template 与凭证相关代码）；真机验证属闸门⑤ |
+| 2026-11-17 | **Vault Phase 0 复核 RV-2026-11-17-05（通过，有条件）**：RV-04 全部闭环；I5（空 MIME → nil map panic，I3 修复引入的回归）一行修复 + 空 MIME 测试；P19 示例删 v.Start；P20 JSON 注释移出代码块；P21 信号量前置入 design §4.1 契约；P22 List 返回副本 + Warning 去向记技术债（Phase 1 接 /admin） |
 | 2026-11-17 | **Vault Phase 0 接线复核 RV-2026-11-17-04（通过，有条件）**：P7–P10 闭环确认；I1（URL 型驱动跳过 vault 装配，天翼/移动同名目录不受影响 + 告警不再覆盖显示名）、I2（ErrTooManyStreams → 503 + 注释修正）、I3（GET ETag 与 PROPFIND 同源）、I4（孤立围栏修复）全部处置；P11–P18 落实（VaultConfig 指针、重载口径、签名统一、示例标注、children 索引、信号量幂等+ctx、验收口径记录、Obj 前缀校验） |
 | 2026-11-17 | **Vault Phase 0 验收通过**：AX6 实测 AES-256-GCM Seal 384.6 MB/s / Open 383.8 MB/s（远超 40 MB/s 验收线；4K 播放约占单核 3%）；验收清单全部闭环——SHA-256 一致、Range 206 字节级精确、随机 Seek 只读 1-2 块、_mc 403、空文件/头篡改拒绝、fileID 一致性、go test -race 全绿 |
 | 2026-11-17 | **Vault Phase 0 接线完成**：Vault 包装层（虚拟树/_mc 403/信号量/降级告警）+ model.Obj ETag 唯一来源 + webdav ErrForbidden→403 + conf VaultConfig + main 装配；本地端到端全通（加密→PROPFIND 原始名→GET 明文→Range 206 字节级精确→_mc 403→普通文件不受影响）；mcrypt-arm64 bench 已入暂存目录待 AX6 执行 |
@@ -202,3 +203,14 @@
 | P16 | 建议 | 信号量三处细节 | 已改 | ① semDecryptReader.Close sync.Once 幂等 + 双关闭测试 ② acquire 响应 ctx 取消 ③ 获取时机前置列入 Phase 1 设计（P9 契约） | 文档修订完成 | 待复核 | 2026-11-17 |
 | P17 | 建议 | 验收口径需写清 | 已改 | 报告 §9 注明 55GB 用例执行环境为开发机（AX6 存储限制），真机验证在 Phase 1；PROGRESS 验收行补 bench 口径（单线程/1 MiB 分块/纯内存无 I/O） | 文档修订完成 | 待复核 | 2026-11-17 |
 | P18 | 建议 | Obj 前缀校验、manifest 路径硬编码 | 已改 | loadRoot 校验 e.Obj 前缀 _mc/o/（非法条目跳过+告警）；manifest 固定 _mc/manifest.mcf 随 P14 示例标注写清 | 文档修订完成 | 待复核 | 2026-11-17 |
+
+
+### RV-2026-11-17-05（第七轮复核，5 条）
+
+| 编号 | 级别 | 意见摘要 | 处置类别 | 处置说明 | 状态 | 复核 | 日期 |
+|---|---|---|---|---|---|---|---|
+| I5 | 重要 | 空 MIME → httpHeader 返回 nil → hdr.Set panic（I3 回归） | 已改 | Link 改用 http.Header{} 显式构造（空 MIME 不设 Content-Type，ETag 照常）；删除 httpHeader；补 TestVaultLinkEmptyMIME | 文档修订完成 | 待复核 | 2026-11-17 |
+| P19 | 建议 | design §4.1 示例含不存在的 v.Start | 已改 | 删除该行并注明「示例仅示意装配顺序，实际接口以代码为准」 | 文档修订完成 | 待复核 | 2026-11-17 |
+| P20 | 建议 | §7.8 JSON 示例含 // 注释（非法 JSON） | 已改 | 注释移出代码块（字段实现状态列表置于块后），JSON 保持合法 | 文档修订完成 | 待复核 | 2026-11-17 |
+| P21 | 建议 | 信号量前置未写入 design §4.1 | 已改 | §4.1 增「信号量必须在 raw.Link 之前获取」（Phase 1 验收口径） | 文档修订完成 | 待复核 | 2026-11-17 |
+| P22 | 建议 | List 共享切片；Warning 无调用方 | 已改 | List 返回副本（防污染索引）；Warning 注明现状并记 TODO 技术债（Phase 1 接 /admin） | 文档修订完成 | 待复核 | 2026-11-17 |
