@@ -83,6 +83,12 @@ func Load(path string) (*Config, error) {
 		// ② 损坏原文件另存副本 config.json.broken-<时间戳>（0600），不静默丢失；
 		// ③ 恢复成功日志为 ERROR 并明示旧凭证风险。
 		if bakCfg, bakErr := LoadStrict(path + ".bak"); bakErr == nil {
+			// I8 防线：备份若是默认配置（admin/admin + 单个 local），拒绝恢复——
+			// 自愈不得把服务"恢复"成弱口令空挂载
+			if isDefaultBackup(bakCfg) {
+				slog.Error("config.json 语法损坏，且备份为默认配置——拒绝自愈（防 admin/admin 回退），请手工修复 config.json", "orig_err", err)
+				return nil, err
+			}
 			// ① 非空损坏文件另存副本（I7：空文件无需副本、恢复照常执行）
 			broken := ""
 			if data, rdErr := os.ReadFile(path); rdErr == nil && len(data) > 0 {
@@ -111,30 +117,46 @@ func Load(path string) (*Config, error) {
 		}
 		return nil, err
 	}
-	// 文件不存在，创建默认配置
+	// 文件不存在，创建默认配置。
+	// I8：此处不写 .bak——默认配置（admin/admin）不得成为自愈回退目标（安全降级）。
 	cfg = DefaultConfig()
 	if err := cfg.Save(path); err != nil {
 		return nil, err
 	}
-	ensureBackup(path)
 	return cfg, nil
 }
 
-// pruneBroken 保留最近 3 份损坏副本，删除更旧的（P10：路由器 flash 有限）
+// pruneBroken 保留最近 3 份损坏副本，删除更旧的（P10：路由器 flash 有限）。
+// 排序前提（P17）：副本名时间戳为 10 位秒级 unix 时间，字典序 = 时间序（2286 年前成立）；
+// 若将来改成毫秒/纳秒或非定长，需改用 mtime 排序。
 func pruneBroken(path string) {
 	matches, _ := filepath.Glob(path + ".broken-*")
 	if len(matches) <= 3 {
 		return
 	}
-	sort.Strings(matches) // 时间戳后缀：字典序 = 时间序
+	sort.Strings(matches)
 	for _, m := range matches[:len(matches)-3] {
 		os.Remove(m)
 	}
 }
 
-// ensureBackup 无 .bak 时写一份（I6：自愈的前提；启动路径调用，写回路径不受影响）
+// isDefaultBackup 是否为默认配置（admin/admin + 单个 local）——不得作为自愈回退目标（I8）
+func isDefaultBackup(cfg *Config) bool {
+	return cfg.Server.Username == "admin" && cfg.Server.Password == "admin" &&
+		len(cfg.Clouds) == 1 && cfg.Clouds[0].Type == "local"
+}
+
+// ensureBackup 确保 .bak 存在且可解析（I6：自愈的前提；启动路径调用，写回路径不受影响）。
+// 缺失或损坏时用当前成功加载的配置覆盖（P15：.bak 损坏不自愈失效）；
+// 仅在缺失/损坏时刷新（P16：不每次覆盖，保护管理页写前备份的回滚语义）。
 func ensureBackup(path string) {
+	refresh := false
 	if _, err := os.Stat(path + ".bak"); os.IsNotExist(err) {
+		refresh = true
+	} else if _, err := LoadStrict(path + ".bak"); err != nil {
+		refresh = true
+	}
+	if refresh {
 		if err := Backup(path); err != nil {
 			slog.Warn("生成配置备份失败", "err", err)
 		}

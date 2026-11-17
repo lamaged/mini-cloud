@@ -559,3 +559,53 @@ func TestLoadSelfHealPrunesBroken(t *testing.T) {
 		}
 	}
 }
+
+// TestLoadDefaultConfigNoBackup I8：全新安装生成默认配置时不写 .bak（不得成为自愈回退目标）
+func TestLoadDefaultConfigNoBackup(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "nested", "config.json")
+	if _, err := Load(path); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if _, err := os.Stat(path + ".bak"); !os.IsNotExist(err) {
+		t.Error("默认配置创建时不应生成 .bak")
+	}
+}
+
+// TestLoadSelfHealRefusesDefaultBackup I8：备份为默认配置时拒绝自愈（防 admin/admin 回退）
+func TestLoadSelfHealRefusesDefaultBackup(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	// .bak 是默认配置
+	if err := DefaultConfig().Save(path + ".bak"); err != nil {
+		t.Fatal(err)
+	}
+	broken := `{"server": {"listen": ":8088",} "clouds": []}`
+	if err := os.WriteFile(path, []byte(broken), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("默认备份应拒绝自愈并报错")
+	}
+	// 原文件不得被覆盖
+	data, _ := os.ReadFile(path)
+	if string(data) != broken {
+		t.Error("拒绝自愈时原文件不得被覆盖")
+	}
+}
+
+// TestEnsureBackupRefreshesCorrupt P15：.bak 损坏时用当前好配置刷新
+func TestEnsureBackupRefreshesCorrupt(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	writeCloudsConfig(t, path)
+	if err := os.WriteFile(path+".bak", []byte(`{corrupt`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadStrict(path + ".bak"); err != nil {
+		t.Errorf(".bak 损坏后应被刷新为好配置: %v", err)
+	}
+}

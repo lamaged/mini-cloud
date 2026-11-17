@@ -23,7 +23,16 @@ type fakeRaw struct {
 	files      map[string][]byte // 挂载内路径 → 内容
 	urlOnly    bool              // 模拟天翼/移动：Link 只返回 URL（302 模式）
 	urlOnlyURL string            // urlOnly 时返回的 URL（默认不可达域名；测试可指向拒绝端口加速）
+	streamOnly bool              // 模拟百度：Reader 不可 seek（P14）
 }
+
+// onlyReader 只有 Read 没有 ReadAt（模拟百度代理流）
+type onlyReader struct{ r io.Reader }
+
+func (o *onlyReader) Read(p []byte) (int, error) { return o.r.Read(p) }
+
+// fakeRaw 字段补充（P14）
+
 
 func (f *fakeRaw) Name() string                          { return "local" }
 func (f *fakeRaw) Init(ctx context.Context) error        { return nil }
@@ -75,6 +84,10 @@ func (f *fakeRaw) Link(ctx context.Context, p string) (*model.Link, error) {
 			base = "https://cdn.example.com"
 		}
 		return &model.Link{URL: base + "/" + p}, nil // 302 模式：无数据流
+	}
+	if f.streamOnly {
+		// 百度代理流：只有 Read 无 ReadAt（P14）
+		return &model.Link{Reader: io.NopCloser(&onlyReader{r: bytes.NewReader(data)})}, nil
 	}
 	return &model.Link{Reader: &memReader{Reader: bytes.NewReader(data)}}, nil
 }
@@ -510,4 +523,31 @@ func TestVaultStreamLimit(t *testing.T) {
 		t.Fatalf("关闭后 Link 2: %v", err2)
 	}
 	link2.Reader.Close()
+}
+
+// TestVaultStreamOnlyDriverSkipped P14：不可 seek 的流式驱动（百度）完全不建 vault 根——
+// 物理视图原样委托、无告警
+func TestVaultStreamOnlyDriverSkipped(t *testing.T) {
+	f, master, _ := buildTestVault(t, true)
+	f.streamOnly = true
+	v := newTestVault(t, f, master, 4)
+	defer v.Stop()
+
+	// backup 不被虚拟树接管：List 委托 cached（物理视图，含 _mc 目录）
+	objs, err := v.List(context.Background(), "/backup")
+	if err != nil {
+		t.Fatalf("List /backup: %v", err)
+	}
+	found := false
+	for _, o := range objs {
+		if o.Name == "_mc" && o.IsDir {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("流式驱动应保持物理视图（含 _mc），实际: %+v", objs)
+	}
+	if v.Warning() != "" {
+		t.Errorf("跳过的驱动不应产生告警，got %q", v.Warning())
+	}
 }
