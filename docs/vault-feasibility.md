@@ -605,7 +605,14 @@ GET /天翼个人/backup/电影/a.mkv
 }
 ```
 
-保存原始路径、原始文件名、大小、mtime、MIME、SHA-256。
+保存原始路径、原始文件名、大小、mtime、MIME。
+
+> v1.3 修订（RV-2026-11-17-02）：
+> - `h`（明文 SHA-256）字段**废弃**：单遍流式加密下元数据先于数据落盘，无法自包含哈希；
+>   权威哈希只存 manifest 条目的 `sha256`。字段保留仅为格式兼容，读取方不得依赖（I1）。
+> - 元数据加密的 AAD = SHA256(「MetaLen/DataOffset 置零的占位头」)：因为 MetaLen 依赖元数据密文
+>   长度，无法在加密元数据前得到完整头；分块 AAD 绑定最终完整头（含 MetaLen/DataOffset），
+>   空文件由 header_sha256 兜底——三者合起来覆盖整个头，勿改成「绑定完整头」破坏加密顺序（P6）。
 
 #### 格式不变量（v1.1 评审后定稿）
 
@@ -648,7 +655,7 @@ cipherOff = dataOffset + chunkIdx * (chunkSize + 16)
 
 - `Seek(0, End)` 直接返回 `plain_size`，不访问云盘；
 - `Seek(start)` 关闭旧流，从块边界开新 Range；
-- 顺序读时保持一个上游连接，不按块发请求；
+- 顺序读时保持一个上游连接，不按块发请求——**Phase 1 由 upstream.go 的顺序流式 RangeSource 实现**（下发大段 Range、内部缓冲、按块切出；随机读走单块）。Phase 0 的 DecryptReader 对本地文件按块 ReadAt（无网络开销）。PM 拍板 2026-11-17 方案 (b)（RV-2026-11-17-02 I3）。
 - 最多浪费一个块的前缀（1 MiB）。
 
 #### 上游异常分支（→ 动作 → 对外状态码）
