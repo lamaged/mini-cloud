@@ -12,8 +12,7 @@
 
 ## 1. 部署与启动
 
-- [ ] 路由器执行 `sh deploy-router.sh`，输出「部署成功」
-- [ ] 健康检查返回 401 或 200
+- [ ] 路由器执行 `sh deploy-router.sh`，输出「部署成功」（健康检查 = 进程存活 + 日志出现「Gateway 启动」行，不依赖 wget——AX6 BusyBox wget 无 -S 参数，实测确认）
 - [ ] 服务日志落文件：`grep v0.10.0 $INSTALL_DIR/mini-cloud.log` 能看到启动版本号
 - [ ] **断开 SSH 会话后服务仍在运行**（脱离会话启动验证，I9）
 

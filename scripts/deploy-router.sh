@@ -29,9 +29,16 @@ PORT="8088"
 # 函数定义（必须整体先于使用：POSIX sh 执行到定义行才生效，I11）
 # ============================================================
 
-# start_daemon 脱离会话启动（P15：setsid + 显式重定向，行为可预期；回退普通后台）
+# LOG_START：start_daemon 启动前的日志行数；health_check 只检查其后新增的行
+LOG_START=0
+
+# start_daemon 脱离会话启动（P15：setsid + 显式重定向，行为可预期；回退普通后台。
+# 注：AX6 实测无 setsid，回退 & 启动并已证明可跨会话存活）
 start_daemon() {
     cd "$INSTALL_DIR" || return 1
+    touch "$LOG" 2>/dev/null || true
+    LOG_START=$(wc -l < "$LOG" 2>/dev/null)
+    LOG_START="${LOG_START:-0}"
     if command -v setsid >/dev/null 2>&1; then
         setsid sh -c "exec \"$INSTALL_DIR/$BINARY\" -config \"$CONFIG\" >> \"$LOG\" 2>&1" &
     else
@@ -39,19 +46,18 @@ start_daemon() {
     fi
 }
 
-# health_check 轮询健康检查（15×1s）；进程死亡提前判失败。返回 0=通过，1=失败
+# health_check 轮询（15×1s）：进程存活 + 启动后日志新增「Gateway 启动」行。
+# 不依赖 wget（AX6 BusyBox wget 无 -S 选项，实测确认），进程死亡提前判失败。
+# 返回 0=通过，1=失败
 health_check() {
     _pid="$1"
     i=0
     while [ "$i" -lt 15 ]; do
-        _code=$(wget -q -S -O /dev/null "http://127.0.0.1:$PORT/" 2>&1 | \
-            grep -o 'HTTP/1\.[01] [0-9][0-9][0-9]' | tail -1 | awk '{print $2}') || true
-        _code="${_code:-000}"
-        if [ "$_code" = "401" ] || [ "$_code" = "200" ]; then
-            return 0
-        fi
         if ! kill -0 "$_pid" 2>/dev/null; then
             return 1
+        fi
+        if tail -n "+$((LOG_START + 1))" "$LOG" 2>/dev/null | grep -q 'Gateway 启动'; then
+            return 0
         fi
         sleep 1
         i=$((i+1))
@@ -62,7 +68,7 @@ health_check() {
 # rollback_old 回滚旧版本并验证恢复（P16：回滚后同样健康检查，确认「已恢复」）
 rollback_old() {
     echo "==> 回滚旧版本"
-    pkill -f "$BINARY" 2>/dev/null || killall "$BINARY" 2>/dev/null || true
+    killall "$BINARY" 2>/dev/null || true
     sleep 1
     if [ ! -f "$INSTALL_DIR/$BINARY.prev" ]; then
         echo "错误：无旧版本可回滚（.prev 不存在）"
@@ -77,7 +83,7 @@ rollback_old() {
         echo "错误：回滚后服务仍未恢复，请人工介入"
         return 1
     fi
-    echo "已恢复旧版本（HTTP 401/200）"
+    echo "已恢复旧版本（日志确认 Gateway 启动）"
     return 0
 }
 
@@ -137,9 +143,10 @@ if [ "$NEW_PID" = "0" ] || [ "$NEW_PID" = "$OLD_PID" ]; then
     exit 1
 fi
 
-echo "==> 健康检查 http://127.0.0.1:$PORT/（轮询，期望 401 或 200）"
+echo "==> 健康检查（进程存活 + 日志出现 Gateway 启动，轮询 15×1s）"
 if health_check "$NEW_PID"; then
-    echo "==> 部署成功（PID $NEW_PID）"
+    echo "==> 部署成功（PID $NEW_PID，日志确认启动）"
+    grep 'version=' "$LOG" | tail -1
     echo "==> UPX 后体积（铁律 10 观察项，记入 PROGRESS.md）: $(wc -c < "$INSTALL_DIR/$BINARY") 字节"
     exit 0
 fi
