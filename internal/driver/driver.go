@@ -52,6 +52,9 @@ type CredentialField struct {
 // CommitCredential 用 %w 包裹该哨兵返回，调用方据此区分「生效但有告警」与「提交失败」。
 var ErrStateWriteFailed = errors.New("credential applied but state write failed")
 
+// ErrForbidden 禁止访问（Vault 的 _mc 密文对象目录：PROPFIND 隐藏、GET 403，绝不回落 302）
+var ErrForbidden = errors.New("forbidden")
+
 // CredentialUpdater 凭证更新（可选接口）：两阶段——先验证后提交（docs/design.md §3.2）
 //
 // values 中的保留键：调用方在 ValidateCredential 前写入 "__req"（本次更新请求的唯一标识，

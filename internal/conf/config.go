@@ -13,6 +13,15 @@ type Config struct {
 	Server ServerConfig   `json:"server"`
 	Cloud  *CloudConfig   `json:"cloud,omitempty"` // 单云盘（向后兼容）；指针 + omitempty：指针保证空值被省略（struct 值的 omitempty 不生效），避免 Save 输出空 "cloud" 块
 	Clouds []CloudConfig  `json:"clouds"`          // 多云盘（优先）
+	Vault  VaultConfig    `json:"vault,omitempty"` // 加密文件播放（docs/design.md §4.3）
+}
+
+// VaultConfig Vault 配置（全局一套，按挂载生效）
+type VaultConfig struct {
+	Enabled    bool     `json:"enabled"`     // 总开关
+	KeyFile    string   `json:"key_file"`    // master key 文件路径（32 字节，永不传网盘）
+	Paths      []string `json:"paths"`       // vault 根目录名列表（无前导斜杠，如 ["backup"]）
+	MaxStreams int      `json:"max_streams"` // 全局并发解密流上限（0 = 默认 4）
 }
 
 // ServerConfig WebDAV 服务配置

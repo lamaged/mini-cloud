@@ -25,6 +25,7 @@ import (
 	"mini-cloud/internal/conf"
 	"mini-cloud/internal/driver"
 	"mini-cloud/internal/fs"
+	"mini-cloud/internal/vault"
 	"mini-cloud/internal/webdav"
 )
 
@@ -34,7 +35,10 @@ const version = "v0.10.0"
 type mountedDriver struct {
 	Name   string        // 驱动名称（类型名，如 "mobile"）
 	Prefix string        // URL 前缀，如 "/mobile"
-	Drv    driver.Driver // 驱动实例
+	Drv    driver.Driver // 驱动实例（原始驱动）
+
+	// VaultWarning vault 层健康提示（manifest 缺失/损坏等；装配后回填，可为 nil）
+	VaultWarning func() string
 }
 
 func main() {
@@ -172,12 +176,42 @@ func main() {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 	})
 
+	// Vault 全局配置（PM 拍板：全局一套，按挂载生效；docs/design.md §4.1/§4.3）
+	var vaultKey []byte
+	var vaultCfg *vault.Config
+	if cfg.Vault.Enabled {
+		vaultKey, err = os.ReadFile(cfg.Vault.KeyFile)
+		if err != nil {
+			slog.Error("读取 vault 密钥失败", "key_file", cfg.Vault.KeyFile, "err", err)
+			os.Exit(1)
+		}
+		if len(vaultKey) != 32 {
+			slog.Error("vault 密钥长度必须为 32 字节", "len", len(vaultKey))
+			os.Exit(1)
+		}
+		if len(cfg.Vault.Paths) == 0 {
+			slog.Error("vault.paths 不能为空")
+			os.Exit(1)
+		}
+		vaultCfg = &vault.Config{Paths: cfg.Vault.Paths, MaxStreams: cfg.Vault.MaxStreams}
+	}
+
 	// 每个云盘注册到 /<prefix>/
 	var davHandlers []*webdav.Handler
 	for i := range mounts {
 		m := &mounts[i]
+		cached := fs.NewCachedReader(fs.NewRetryReader(m.Drv))
+		var drv webdav.Reader = cached
+		if vaultCfg != nil {
+			v := vault.New(cached, m.Drv, vaultKey, *vaultCfg)
+			if err := v.Init(ctx); err != nil {
+				slog.Warn("vault 初始化失败，该挂载按普通模式工作", "mount", m.Name, "err", err)
+			} else {
+				drv = v
+			}
+		}
 		davHandler := &webdav.Handler{
-			Driver: fs.NewCachedReader(fs.NewRetryReader(m.Drv)),
+			Driver: drv,
 			Prefix: m.Prefix,
 		}
 		davHandlers = append(davHandlers, davHandler)
@@ -191,6 +225,13 @@ func main() {
 			davHandler.ServeHTTP(w, r)
 		})
 		slog.Info("挂载云盘", "name", m.Name, "prefix", m.Prefix)
+	}
+
+	// vault 健康提示回填到挂载信息（显示在根页面/根 PROPFIND 的显示名）
+	for i := range mounts {
+		if v, ok := davHandlers[i].Driver.(interface{ Warning() string }); ok {
+			mounts[i].VaultWarning = v.Warning
+		}
 	}
 
 	// 凭证生效后：清空该挂载的目录/链接缓存，避免旧账号数据残留（30s 目录 / 10min 链接）
@@ -309,7 +350,8 @@ var cloudDisplayNames = map[string]string{
 }
 
 // displayName 返回云盘在导航/索引页的显示名。
-// 若驱动报告健康警告（如移动云盘 authorization 过期），则用警告文本覆盖显示名。
+// 若驱动报告健康警告（如移动云盘 authorization 过期）或 vault 层告警
+// （manifest 缺失/损坏），则用警告文本覆盖显示名。
 func displayName(m mountedDriver) string {
 	label := cloudDisplayNames[m.Name]
 	if label == "" {
@@ -317,6 +359,11 @@ func displayName(m mountedDriver) string {
 	}
 	if hr, ok := m.Drv.(driver.HealthReporter); ok {
 		if w := hr.HealthWarning(); w != "" {
+			return w
+		}
+	}
+	if m.VaultWarning != nil {
+		if w := m.VaultWarning(); w != "" {
 			return w
 		}
 	}

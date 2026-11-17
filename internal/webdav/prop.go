@@ -3,6 +3,7 @@ package webdav
 import (
 	"context"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"mime"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"mini-cloud/internal/driver"
 	"mini-cloud/internal/model"
 )
 
@@ -23,6 +25,10 @@ func (h *Handler) handlePropfind(w http.ResponseWriter, r *http.Request) (int, e
 	if err != nil {
 		if isNotFound(err) {
 			return http.StatusNotFound, nil
+		}
+		if errors.Is(err, driver.ErrForbidden) {
+			// Vault _mc 密文对象：PROPFIND 隐藏（I4）
+			return http.StatusForbidden, nil
 		}
 		return http.StatusInternalServerError, err
 	}
@@ -106,9 +112,11 @@ func (h *Handler) buildPropsXML(obj *model.Obj) string {
 		textProps["getlastmodified"] = t.UTC().Format(http.TimeFormat)
 	}
 
-	// getcontenttype
+	// getcontenttype（D3：ContentType 非空时为唯一来源，Vault 虚拟树填充）
 	if obj.IsDir {
 		textProps["getcontenttype"] = "httpd/unix-directory"
+	} else if obj.ContentType != "" {
+		textProps["getcontenttype"] = obj.ContentType
 	} else {
 		ext := filepath.Ext(obj.Name)
 		ct := mime.TypeByExtension(ext)
@@ -118,8 +126,12 @@ func (h *Handler) buildPropsXML(obj *model.Obj) string {
 		textProps["getcontenttype"] = ct
 	}
 
-	// getetag
-	textProps["getetag"] = fmt.Sprintf(`"%x-%x"`, obj.ModTime.UnixNano(), obj.Size)
+	// getetag（D3：ETag 非空时为唯一来源）
+	if obj.ETag != "" {
+		textProps["getetag"] = obj.ETag
+	} else {
+		textProps["getetag"] = fmt.Sprintf(`"%x-%x"`, obj.ModTime.UnixNano(), obj.Size)
+	}
 
 	return buildPropXML(textProps, dirProps)
 }

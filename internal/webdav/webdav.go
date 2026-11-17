@@ -2,6 +2,7 @@ package webdav
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"html/template"
 	"io"
@@ -13,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"mini-cloud/internal/driver"
 	"mini-cloud/internal/model"
 )
 
@@ -92,6 +94,10 @@ func (h *Handler) handleGetHead(w http.ResponseWriter, r *http.Request) (int, er
 	if err != nil {
 		if os.IsNotExist(err) {
 			return http.StatusNotFound, nil
+		}
+		if errors.Is(err, driver.ErrForbidden) {
+			// Vault _mc 密文对象：403 屏蔽（I4）
+			return http.StatusForbidden, nil
 		}
 		return http.StatusInternalServerError, err
 	}

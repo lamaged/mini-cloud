@@ -27,6 +27,11 @@ type Obj struct {
 	Size    int64
 	ModTime time.Time
 	IsDir   bool
+
+	// 可选字段（D3：ETag 与 MIME 的唯一来源）：零值表示按现有规则生成
+	// （ETag = ModTime+Size；ContentType = 扩展名推断）。Vault 虚拟树必须填充。
+	ETag        string
+	ContentType string
 }
 
 // Link 文件下载链接或数据流
