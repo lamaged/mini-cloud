@@ -85,11 +85,18 @@ func SaveManifest(dst io.Writer, key []byte, m *Manifest) error {
 	return nil
 }
 
-// LoadManifest 解密并解析 manifest（认证失败返回 ErrAuth 包装错误）
+// MaxManifestSize manifest 密文大小上限（资源约束：伪造超大清单不得撑爆路由器内存）
+const MaxManifestSize = 32 << 20 // 32 MiB
+
+// LoadManifest 解密并解析 manifest（认证失败返回 ErrAuth 包装错误）。
+// 读取总量受 MaxManifestSize 限制，解压后 JSON 再受同样限制（防 gzip 炸弹）。
 func LoadManifest(src io.Reader, key []byte) (*Manifest, error) {
-	data, err := io.ReadAll(src)
+	data, err := io.ReadAll(io.LimitReader(src, MaxManifestSize+1))
 	if err != nil {
 		return nil, fmt.Errorf("vault: manifest 读取失败: %w", err)
+	}
+	if len(data) > MaxManifestSize {
+		return nil, fmt.Errorf("vault: manifest 超过大小上限 %d MiB", MaxManifestSize>>20)
 	}
 	if len(data) < 12+TagSize {
 		return nil, fmt.Errorf("vault: manifest 文件过短: %d", len(data))
@@ -103,8 +110,17 @@ func LoadManifest(src io.Reader, key []byte) (*Manifest, error) {
 		return nil, fmt.Errorf("vault: manifest gzip 解析失败: %w", err)
 	}
 	defer zr.Close()
+	// 解压总量同样受限（gzip 炸弹防护）
+	limited := io.LimitReader(zr, MaxManifestSize+1)
+	raw, err := io.ReadAll(limited)
+	if err != nil {
+		return nil, fmt.Errorf("vault: manifest 解压失败: %w", err)
+	}
+	if len(raw) > MaxManifestSize {
+		return nil, fmt.Errorf("vault: manifest 解压后超过大小上限 %d MiB", MaxManifestSize>>20)
+	}
 	var m Manifest
-	if err := json.NewDecoder(zr).Decode(&m); err != nil {
+	if err := json.Unmarshal(raw, &m); err != nil {
 		return nil, fmt.Errorf("vault: manifest JSON 解析失败: %w", err)
 	}
 	if m.V != 1 {
