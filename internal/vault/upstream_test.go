@@ -76,6 +76,7 @@ type rangeCDN struct {
 	recoverAfter1 atomic.Bool // 仅第一次 403，之后恢复正常（换签名恢复测试）
 	failNext      atomic.Bool // 下一次请求失败一次后恢复（缓冲中途 403 测试）
 	mismatchNext  atomic.Bool // 下一次请求 Content-Range 错位一次后恢复
+	truncateNext  atomic.Bool // 下一次 206 响应短 body（Content-Range 声称未到文件尾）一次
 	lastUA        atomic.Value // 最近一次请求的 User-Agent
 }
 
@@ -119,6 +120,11 @@ func (c *rangeCDN) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(c.data)))
 	}
 	w.WriteHeader(http.StatusPartialContent)
+	if c.truncateNext.CompareAndSwap(true, false) {
+		// 传输截断：只写一半，但 Content-Range 声称完整
+		w.Write(c.data[start : start+(end-start)/2])
+		return
+	}
 	w.Write(c.data[start : end+1])
 }
 
@@ -272,14 +278,16 @@ func TestUpstream200IgnoreRange(t *testing.T) {
 	}
 }
 
-// TestUpstream416 区间无效
+// TestUpstream416 I2：off 超过文件长度时服务端返回 416（bytes */N）——
+// 按 io.ReaderAt 语义应返回 (0, io.EOF)，而非报错
 func TestUpstream416(t *testing.T) {
 	data := make([]byte, 1000)
 	u, _, _ := newTestUpstream(t, data, "")
 	defer u.Close()
 	p := make([]byte, 100)
-	if _, err := u.ReadAt(p, 5000); err == nil || !strings.Contains(err.Error(), "416") {
-		t.Errorf("越界应报 416，got %v", err)
+	n, err := u.ReadAt(p, 5000)
+	if err != io.EOF || n != 0 {
+		t.Errorf("越界读应返回 (0, io.EOF)，got n=%d err=%v", n, err)
 	}
 }
 
@@ -426,5 +434,29 @@ func TestUpstreamContentRangeMismatch(t *testing.T) {
 	}
 	if delta := cdn.requests.Load() - before; delta != 2 {
 		t.Errorf("应恰好 2 次请求（错位 + 换签名重试），实际 %d", delta)
+	}
+}
+
+// TestUpstreamTruncatedBodyRetries I1：206 短 body 且未到文件尾 = 传输截断 → 换签名重试成功
+func TestUpstreamTruncatedBodyRetries(t *testing.T) {
+	data := make([]byte, 1<<20)
+	for i := range data {
+		data[i] = byte(i % 61)
+	}
+	u, cdn, _ := newTestUpstream(t, data, "")
+	defer u.Close()
+
+	cdn.truncateNext.Store(true) // 第一次响应截断
+	p := make([]byte, 1000)
+	before := cdn.requests.Load()
+	n, err := u.ReadAt(p, 5000)
+	if err != nil {
+		t.Fatalf("截断应换签名重试成功: %v", err)
+	}
+	if n != 1000 || p[0] != byte(5000%61) {
+		t.Errorf("重试后内容不符: n=%d", n)
+	}
+	if delta := cdn.requests.Load() - before; delta != 2 {
+		t.Errorf("应恰好 2 次请求（截断 + 换签名重试），实际 %d", delta)
 	}
 }

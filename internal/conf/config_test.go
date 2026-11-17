@@ -411,7 +411,8 @@ func TestLoadSelfHealFromBackup(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 写坏 config.json（模拟手工编辑漏逗号）
-	if err := os.WriteFile(path, []byte(`{"server": {"listen": ":8088",} "clouds": []}`), 0644); err != nil {
+	brokenContent := `{"server": {"listen": ":8088",} "clouds": []}`
+	if err := os.WriteFile(path, []byte(brokenContent), 0644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -421,6 +422,45 @@ func TestLoadSelfHealFromBackup(t *testing.T) {
 	}
 	if len(cfg.Clouds) != 2 || cfg.Clouds[0].Name != "移动云盘" {
 		t.Errorf("自愈后配置不符: %+v", cfg.Clouds)
+	}
+	// I4：损坏原文件必须保留副本（不静默丢失用户编辑内容）
+	brokenFiles, _ := filepath.Glob(path + ".broken-*")
+	if len(brokenFiles) != 1 {
+		t.Errorf("应保留 1 个损坏副本，实际 %v", brokenFiles)
+	}
+	data, _ := os.ReadFile(brokenFiles[0])
+	if string(data) != brokenContent {
+		t.Error("损坏副本内容与原损坏文件不一致")
+	}
+	checkPerm(t, brokenFiles[0], 0600)
+}
+
+// TestLoadSelfHealBrokenBackup I4：备份也损坏时不覆盖原文件、如实报错
+func TestLoadSelfHealBrokenBackup(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	writeCloudsConfig(t, path)
+
+	// 备份是坏的
+	if err := os.WriteFile(path+".bak", []byte(`{bad bak`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	brokenContent := `{"server": {"listen": ":8088",} "clouds": []}`
+	if err := os.WriteFile(path, []byte(brokenContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Load(path); err == nil {
+		t.Fatal("备份也坏时应报错")
+	}
+	// 原文件不得被覆盖（I4：先验证备份再替换）
+	data, _ := os.ReadFile(path)
+	if string(data) != brokenContent {
+		t.Errorf("备份坏时原文件不得被覆盖: %s", data)
+	}
+	// 不得留下 broken 副本误导排查？——本实现此时未进入恢复流程，不应产生副本
+	if matches, _ := filepath.Glob(path + ".broken-*"); len(matches) != 0 {
+		t.Errorf("备份坏时不应产生损坏副本: %v", matches)
 	}
 }
 

@@ -9,11 +9,11 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
 	"mini-cloud/internal/driver"
+	"mini-cloud/internal/model"
 )
 
 // ============================================================
@@ -39,13 +39,8 @@ const (
 	MaxURLTTL = 10 * time.Minute
 )
 
-// ErrUpstream 上游异常（webdav 映射 502）
-type ErrUpstream struct{ msg string }
-
-func (e *ErrUpstream) Error() string { return "vault upstream: " + e.msg }
-
-// ErrRangeNotSupported 上游不支持 Range（I10：两次 200 后且偏移超限）
-var ErrRangeNotSupported = &ErrUpstream{msg: "上游不支持 Range"}
+// ErrRangeNotSupported 上游不支持 Range（I10：两次 200 后且偏移超限；webdav 经 driver.ErrUpstream 映射 502）
+var ErrRangeNotSupported = fmt.Errorf("%w: 上游不支持 Range", driver.ErrUpstream)
 
 // errRangeInvalid 416：区间无效（P2：不触发换签名）
 var errRangeInvalid = errors.New("vault upstream: 416 区间无效")
@@ -102,17 +97,29 @@ type Upstream struct {
 // 信号量必须由调用方在 raw.Link 之前获取（P21）。
 func NewUpstream(ctx context.Context, drv driver.Driver, objPath string, httpc *http.Client) (*Upstream, error) {
 	u := &Upstream{drv: drv, objPath: objPath, httpc: httpc, baseCtx: ctx}
-	if err := u.refreshURL(ctx); err != nil {
+	if err := u.refreshURL(ctx, nil); err != nil {
+		return nil, err
+	}
+	return u, nil
+}
+
+// NewUpstreamWithLink 用已获取的 Link 构造上游（P1：loadRoot 已调用过一次 Link，避免重复）
+func NewUpstreamWithLink(ctx context.Context, drv driver.Driver, objPath string, link *model.Link, httpc *http.Client) (*Upstream, error) {
+	u := &Upstream{drv: drv, objPath: objPath, httpc: httpc, baseCtx: ctx}
+	if err := u.refreshURL(ctx, link); err != nil {
 		return nil, err
 	}
 	return u, nil
 }
 
 // refreshURL 重新 Link 获取签名 URL（调用方需持锁）
-func (u *Upstream) refreshURL(ctx context.Context) error {
-	link, err := u.drv.Link(ctx, u.objPath)
-	if err != nil {
-		return fmt.Errorf("vault upstream: 获取签名失败: %w", err)
+func (u *Upstream) refreshURL(ctx context.Context, link *model.Link) error {
+	if link == nil {
+		var err error
+		link, err = u.drv.Link(ctx, u.objPath)
+		if err != nil {
+			return fmt.Errorf("vault upstream: 获取签名失败: %w", err)
+		}
 	}
 	if link.URL == "" {
 		return fmt.Errorf("vault upstream: 驱动未返回签名 URL（%s）", u.objPath)
@@ -152,7 +159,7 @@ func (u *Upstream) ensureFreshURL(ctx context.Context) error {
 	if time.Now().Before(u.expiresAt.Add(-60 * time.Second)) {
 		return nil
 	}
-	if err := u.refreshURL(ctx); err != nil {
+	if err := u.refreshURL(ctx, nil); err != nil {
 		return fmt.Errorf("vault upstream: 刷新签名失败: %w", err)
 	}
 	slog.Info("vault upstream: 签名已刷新", "obj", u.objPath, "ttl", u.urlTTL())
@@ -232,7 +239,7 @@ func (u *Upstream) fetchRange(p []byte, off int64, length int) (int, error) {
 		u.mu.Lock()
 		u.buf = nil
 		u.bufStart, u.bufEnd = 0, 0
-		refErr := u.refreshURL(ctx)
+		refErr := u.refreshURL(ctx, nil)
 		u.mu.Unlock()
 		if refErr != nil {
 			return 0, lastErr
@@ -265,7 +272,7 @@ func (u *Upstream) doRange(ctx context.Context, p []byte, off int64, length int)
 
 	resp, err := u.httpc.Do(req)
 	if err != nil {
-		return 0, fmt.Errorf("vault upstream: 请求失败: %w", err)
+		return 0, fmt.Errorf("vault upstream: 请求失败: %v: %w", err, driver.ErrUpstream)
 	}
 	defer resp.Body.Close()
 
@@ -273,13 +280,21 @@ func (u *Upstream) doRange(ctx context.Context, p []byte, off int64, length int)
 	case resp.StatusCode == http.StatusPartialContent:
 		// 校验 Content-Range 与请求区间一致（I10：不符 → 失效重试）
 		cr := resp.Header.Get("Content-Range")
-		wantStart := fmt.Sprintf("%d-", off)
-		if !strings.HasPrefix(cr, "bytes "+wantStart) {
-			return 0, fmt.Errorf("vault upstream: Content-Range 与请求区间不符: %q", cr)
+		var crStart, crEnd, crTotal int64
+		if _, err := fmt.Sscanf(cr, "bytes %d-%d/%d", &crStart, &crEnd, &crTotal); err != nil {
+			return 0, fmt.Errorf("vault upstream: Content-Range 解析失败 %q: %w", cr, driver.ErrUpstream)
+		}
+		if crStart != off {
+			return 0, fmt.Errorf("vault upstream: Content-Range 与请求区间不符: %q: %w", cr, driver.ErrUpstream)
 		}
 		data, err := io.ReadAll(io.LimitReader(resp.Body, int64(length)+1))
 		if err != nil {
 			return 0, fmt.Errorf("vault upstream: 读取失败: %w", err)
+		}
+		// I1：实际收到的字节数少于 Content-Range 声称的区间长度 = 传输截断——
+		// 必须换签名重试，不得误报文件损坏（与「正常到文件尾」的短窗口区分）
+		if int64(len(data)) < crEnd-crStart+1 {
+			return 0, fmt.Errorf("vault upstream: 传输截断（%d/%d）: %w", len(data), crEnd-crStart+1, driver.ErrUpstream)
 		}
 		// U2：无论顺序/随机都写入缓冲（随机读替换旧缓冲，后续顺序读自然延续）
 		u.mu.Lock()
@@ -294,16 +309,22 @@ func (u *Upstream) doRange(ctx context.Context, p []byte, off int64, length int)
 		return n, nil
 
 	case resp.StatusCode == http.StatusRequestedRangeNotSatisfiable:
+		// I2：off 恰等于（或超过）文件长度时按 io.ReaderAt 语义返回 EOF
+		// （服务端对 bytes=N- 且 N==size 返回 416，Content-Range: bytes */size）
+		var total int64
+		if _, err := fmt.Sscanf(resp.Header.Get("Content-Range"), "bytes */%d", &total); err == nil && off >= total {
+			return 0, io.EOF
+		}
 		return 0, errRangeInvalid
 
 	case resp.StatusCode == http.StatusForbidden:
-		return 0, fmt.Errorf("vault upstream: 签名过期（403）")
+		return 0, fmt.Errorf("vault upstream: 签名过期（403）: %w", driver.ErrUpstream)
 
 	case resp.StatusCode == http.StatusOK:
 		return 0, errIgnoredRange
 
 	default:
-		return 0, fmt.Errorf("vault upstream: HTTP %d", resp.StatusCode)
+		return 0, fmt.Errorf("vault upstream: HTTP %d: %w", resp.StatusCode, driver.ErrUpstream)
 	}
 }
 
@@ -328,14 +349,14 @@ func (u *Upstream) discardServe(ctx context.Context, p []byte, off int64) (int, 
 	}
 	resp, err := u.httpc.Do(req)
 	if err != nil {
-		return 0, fmt.Errorf("vault upstream: 丢弃请求失败: %w", err)
+		return 0, fmt.Errorf("vault upstream: 丢弃请求失败: %v: %w", err, driver.ErrUpstream)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("vault upstream: 丢弃请求状态 %d", resp.StatusCode)
+		return 0, fmt.Errorf("vault upstream: 丢弃请求状态 %d: %w", resp.StatusCode, driver.ErrUpstream)
 	}
 	if _, err := io.CopyN(io.Discard, resp.Body, off); err != nil {
-		return 0, fmt.Errorf("vault upstream: 丢弃失败: %w", err)
+		return 0, fmt.Errorf("vault upstream: 丢弃失败: %v: %w", err, driver.ErrUpstream)
 	}
 	n, err := io.ReadFull(resp.Body, p)
 	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {

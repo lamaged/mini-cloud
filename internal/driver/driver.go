@@ -58,6 +58,9 @@ var ErrForbidden = errors.New("forbidden")
 // ErrTooManyStreams 并发解密流超上限（max_streams 信号量：等待超时后拒绝，webdav 映射 503）
 var ErrTooManyStreams = errors.New("too many concurrent streams")
 
+// ErrUpstream 上游（云盘 CDN）失败（网络/签名/截断等；webdav 映射 502，契约 design §7.7）
+var ErrUpstream = errors.New("upstream failure")
+
 // CredentialUpdater 凭证更新（可选接口）：两阶段——先验证后提交（docs/design.md §3.2）
 //
 // values 中的保留键：调用方在 ValidateCredential 前写入 "__req"（本次更新请求的唯一标识，

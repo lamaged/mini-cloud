@@ -103,6 +103,10 @@ func (h *Handler) handleGetHead(w http.ResponseWriter, r *http.Request) (int, er
 			// 并发解密流超上限（design §7.7：超出返回 503 防止 OOM）
 			return http.StatusServiceUnavailable, nil
 		}
+		if errors.Is(err, driver.ErrUpstream) {
+			// 上游（云盘 CDN）失败：网络/签名/截断等（契约 design §7.7 → 502）
+			return http.StatusBadGateway, nil
+		}
 		return http.StatusInternalServerError, err
 	}
 

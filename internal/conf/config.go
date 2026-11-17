@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 // Config 应用配置
@@ -75,12 +76,28 @@ func Load(path string) (*Config, error) {
 		return cfg, nil
 	}
 	if !os.IsNotExist(err) {
-		// JSON 损坏：尝试用备份自愈
-		if _, statErr := os.Stat(path + ".bak"); statErr == nil {
-			if rbErr := RestoreBackup(path); rbErr == nil {
-				if cfg2, loadErr := LoadStrict(path); loadErr == nil {
-					slog.Warn("config.json 语法损坏，已用 .bak 备份自动恢复（请核对配置）", "orig_err", err)
-					return cfg2, nil
+		// JSON 损坏：自愈（I4/I5，真机经验 2026-11-17）——
+		// ① 备份先在内存中验证可解析，通过才替换（避免「覆盖后才发现备份也坏」）；
+		// ② 损坏原文件另存副本 config.json.broken-<时间戳>（0600），不静默丢失；
+		// ③ 恢复成功日志为 ERROR 并明示旧凭证风险。
+		if bakCfg, bakErr := LoadStrict(path + ".bak"); bakErr == nil {
+			broken := fmt.Sprintf("%s.broken-%d", path, time.Now().Unix())
+			if data, rdErr := os.ReadFile(path); rdErr == nil && len(data) > 0 {
+				if wErr := os.WriteFile(broken, data, 0600); wErr == nil {
+					if rbErr := RestoreBackup(path); rbErr == nil {
+						if cfg2, loadErr := LoadStrict(path); loadErr == nil {
+							bakInfo := ""
+							if fi, statErr := os.Stat(path + ".bak"); statErr == nil {
+								bakInfo = fi.ModTime().Format("2006-01-02 15:04:05")
+							}
+							slog.Error("config.json 语法损坏，已自动回退到备份并恢复——其中凭证可能已过期，请在 /admin 核对或更新",
+								"broken_saved", broken,
+								"bak_mtime", bakInfo,
+								"bak_clouds", len(bakCfg.Clouds),
+								"orig_err", err)
+							return cfg2, nil
+						}
+					}
 				}
 			}
 		}

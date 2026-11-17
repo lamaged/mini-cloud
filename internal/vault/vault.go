@@ -85,7 +85,9 @@ func (s *streamSem) release() {
 var acquireTimeout = 5 * time.Second
 
 // httpClient 云盘取数层 HTTP 客户端（测试可替换）
-var httpClient = &http.Client{Timeout: 30 * time.Second}
+// httpClient 云盘取数层 HTTP 客户端（测试可替换）。
+// 超时 90s（P4）：4 MiB 窗口在 1 Mbps 弱网约需 32s，30s 总超时必然误杀；90s 给足余量。
+var httpClient = &http.Client{Timeout: 90 * time.Second}
 
 // New 创建 Vault 包装层（签名以本实现为准：vault.New(cached, raw, master, cfg)）
 func New(cached driver.Reader, raw driver.Driver, master []byte, cfg Config) *Vault {
@@ -157,7 +159,7 @@ func (v *Vault) loadRoot(ctx context.Context, name string) {
 		src = link.Reader
 	case link.URL != "":
 		// Phase 1 接线：URL 型驱动经取数层读 manifest（Range 请求）
-		up, err := NewUpstream(ctx, v.raw, manifestPath, httpClient)
+		up, err := NewUpstreamWithLink(ctx, v.raw, manifestPath, link, httpClient)
 		if err != nil {
 			r.warning = fmt.Sprintf("vault 根 %s：manifest 读取失败，虚拟视图为空目录", name)
 			slog.Warn("vault: "+r.warning, "err", err)
@@ -330,8 +332,9 @@ func (v *Vault) Link(ctx context.Context, reqPath string) (*model.Link, error) {
 		// 流式驱动（local / 百度代理）：Reader 需支持 io.ReaderAt
 		ra, ok := link.Reader.(io.ReaderAt)
 		if !ok {
+			// I3：百度代理流不支持随机读取且已退出支持目标（PM 拍板 2026-11-17）→ 502
 			link.Reader.Close()
-			return nil, fmt.Errorf("vault: 上游数据流不支持随机读取")
+			return nil, fmt.Errorf("vault: 该驱动不在支持范围（Vault 仅支持天翼/移动）: %w", driver.ErrUpstream)
 		}
 		src = &readAtCloser{r: ra, c: link.Reader}
 	} else if link.URL != "" {
@@ -351,8 +354,9 @@ func (v *Vault) Link(ctx context.Context, reqPath string) (*model.Link, error) {
 		return nil, err
 	}
 
-	// I3 对象绑定强校验（Phase 1）：文件内嵌 metadata.p 必须与请求虚拟路径一致（防跨对象替换）
-	if p := dr.OriginalPath(); p != "" && p != inner {
+	// I3 对象绑定强校验（Phase 1）：文件内嵌 metadata.p 必须与请求虚拟路径一致（防跨对象替换）；
+	// P3：空路径一律拒绝（fail-closed，不因老对象/异常对象绕过）
+	if p := dr.OriginalPath(); p != inner {
 		dr.Close()
 		return nil, fmt.Errorf("vault: 对象绑定校验失败：内嵌路径 %q 与请求路径 %q 不一致", p, inner)
 	}
@@ -394,7 +398,8 @@ func (v *Vault) Warning() string {
 	return strings.Join(parts, "；")
 }
 
-// rangeReadCloser 适配 RangeSource → io.ReadCloser（manifest 顺序读取用）
+// rangeReadCloser 适配 RangeSource → io.ReadCloser（manifest 顺序读取用）。
+// 依赖外层限长（LoadManifest 的 LimitReader 32 MiB+1）：本适配器自身不做尺寸保护（P6）。
 type rangeReadCloser struct {
 	src RangeSource
 	off int64
