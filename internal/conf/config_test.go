@@ -399,3 +399,39 @@ func TestRestoreBackup(t *testing.T) {
 	}
 	checkPerm(t, path, 0600)
 }
+
+// TestLoadSelfHealFromBackup 手工编辑写坏 config.json 时自动用 .bak 恢复（真机经验）
+func TestLoadSelfHealFromBackup(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	writeCloudsConfig(t, path)
+
+	// 备份「好」配置
+	if err := Backup(path); err != nil {
+		t.Fatal(err)
+	}
+	// 写坏 config.json（模拟手工编辑漏逗号）
+	if err := os.WriteFile(path, []byte(`{"server": {"listen": ":8088",} "clouds": []}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("损坏配置应自愈加载: %v", err)
+	}
+	if len(cfg.Clouds) != 2 || cfg.Clouds[0].Name != "移动云盘" {
+		t.Errorf("自愈后配置不符: %+v", cfg.Clouds)
+	}
+}
+
+// TestLoadBrokenJSONNoBackup 无备份时仍如实报错
+func TestLoadBrokenJSONNoBackup(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(path, []byte(`{broken`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Error("无备份的损坏配置应报错")
+	}
+}

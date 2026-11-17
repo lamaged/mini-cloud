@@ -66,13 +66,24 @@ func DefaultConfig() *Config {
 	}
 }
 
-// Load 从文件加载配置，如果文件不存在则创建默认配置（仅限启动路径使用）
+// Load 从文件加载配置，如果文件不存在则创建默认配置（仅限启动路径使用）。
+// 自愈（真机经验 2026-11-17）：手工编辑导致 JSON 语法错误时，自动用 .bak 备份恢复
+// 并继续启动（日志明确警告）——服务不因配置笔误停摆。.bak 不存在则按原样报错。
 func Load(path string) (*Config, error) {
 	cfg, err := LoadStrict(path)
 	if err == nil {
 		return cfg, nil
 	}
 	if !os.IsNotExist(err) {
+		// JSON 损坏：尝试用备份自愈
+		if _, statErr := os.Stat(path + ".bak"); statErr == nil {
+			if rbErr := RestoreBackup(path); rbErr == nil {
+				if cfg2, loadErr := LoadStrict(path); loadErr == nil {
+					slog.Warn("config.json 语法损坏，已用 .bak 备份自动恢复（请核对配置）", "orig_err", err)
+					return cfg2, nil
+				}
+			}
+		}
 		return nil, err
 	}
 	// 文件不存在，创建默认配置
