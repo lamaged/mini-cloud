@@ -10,7 +10,7 @@
 
 ## 进行中
 
-- **Vault v1.0.0 Phase 0**：**代码全部完成**（库层 + Vault 包装层 + local 驱动接入 + webdav 接线，本地端到端验证通过）；剩 AX6 加密性能基准（mcrypt-arm64 bench 已放入暂存目录，待 PM 在路由器执行，验收线 ≥40 MB/s）
+- **Vault v1.0.0 Phase 0**：**验收通过（2026-11-17）**——AX6 实测 Seal 384.6 MB/s / Open 383.8 MB/s（验收线 40 MB/s 的 9.6 倍）；全部验收项闭环；下一目标 Phase 1 云端 MVP（首接天翼家庭，PM 指令后过闸门①）
 
 ## 已完成
 
@@ -23,6 +23,7 @@
 | 2026-11-16 | **闸门① 通过（PM 批准），v0.10.0 实现完成**：两阶段 CredentialUpdater + internal/admin 管理页（CSRF、html/template 转义）+ mobile 实现（临时客户端验证、按 __req 隔离、凭证/缓存代次防护）+ conf 原子写/0600/备份 + 3 处转义修复（buildHref 百分号编码、目录页/根页转义）。自查（/code-review high）15 条全部修复；`go vet` + `go test -race` 全绿；ARM64 交叉编译通过；实现期修订记录于 design.md §3.8 |
 | 2026-11-16 | **闸门③ 外部代码审核 RV-2026-11-16-03（结论：有条件通过）**：I1–I6 全部修复（更新串行化、LoadStrict 严格读取、目录 fsync、WriteCredential 测试、401×提交竞态测试、提交失败 .bak 回滚），P1–P9 全部落实（状态码、安全响应头、version v0.10.0、Stop 幂等、字段同步、编码去重、24h 门槛、文档修正、自查留痕表）；`go vet` + `go test -race` 全绿；ARM64 交叉编译通过 |
 | 2026-11-16 | **部署脚本完成（PM 拍板：审核后立即写、单独提交）**：scripts/deploy-prepare.sh（开发机编译+UPX+暂存，端到端跑通）+ scripts/deploy-router.sh（路由器拉取+备份+重启+健康检查+失败回滚，busybox ash 兼容，语法与健康检查解析本地验证通过）；体积观察项（铁律 10）：ARM64 原始 8,716,472 B → UPX 后 2,974,696 B（v0.9.2 基线 UPX 约 2.3 MB，增量主要来自 html/template 与凭证相关代码）；真机验证属闸门⑤ |
+| 2026-11-17 | **Vault Phase 0 验收通过**：AX6 实测 AES-256-GCM Seal 384.6 MB/s / Open 383.8 MB/s（远超 40 MB/s 验收线；4K 播放约占单核 3%）；验收清单全部闭环——SHA-256 一致、Range 206 字节级精确、随机 Seek 只读 1-2 块、_mc 403、空文件/头篡改拒绝、fileID 一致性、go test -race 全绿 |
 | 2026-11-17 | **Vault Phase 0 接线完成**：Vault 包装层（虚拟树/_mc 403/信号量/降级告警）+ model.Obj ETag 唯一来源 + webdav ErrForbidden→403 + conf VaultConfig + main 装配；本地端到端全通（加密→PROPFIND 原始名→GET 明文→Range 206 字节级精确→_mc 403→普通文件不受影响）；mcrypt-arm64 bench 已入暂存目录待 AX6 执行 |
 | 2026-11-17 | **Vault Phase 0 复核 RV-2026-11-17-03（通过）**：I1/I2/I3、P1–P6 全部闭环（磁盘格式零变更，旧对象无需重加密）；P7 报告版本统一 v1.3；P8 PROGRESS 状态区清理；P9 顺序流式契约细节落 design §4.1；P10 meta.S 强制一致 + 加密失败删除半成品 |
 | 2026-11-17 | **Vault Phase 0 核心审核 RV-2026-11-17-02**：读取器设计获确认（随机 Seek O(1) 内存/打开即校验/ServeContent 契约对齐）；I1（Metadata.H 废弃，哈希唯一真值源=manifest）、I2（CipherSize 非对齐公式修正）修复；P1–P6 全部落实（短读防御/keygen 权限/out-in 拒绝/符号链接提示/死循环防御/文档注记）；I3 PM 拍板方案 (b)（Phase 1 顺序流式 RangeSource）；本地端到端（100MB+空目录+嵌套）diff -r 完全一致；x86 参考 Seal 1928 MB/s / Open 2492 MB/s |
