@@ -86,8 +86,9 @@ func Load(path string) (*Config, error) {
 			// I8 防线：备份若是默认配置（admin/admin + 单个 local），拒绝恢复——
 			// 自愈不得把服务"恢复"成弱口令空挂载
 			if isDefaultBackup(bakCfg) {
-				slog.Error("config.json 语法损坏，且备份为默认配置——拒绝自愈（防 admin/admin 回退），请手工修复 config.json", "orig_err", err)
-				return nil, err
+				refuseErr := fmt.Errorf("备份为默认配置，拒绝自愈（防 admin/admin 回退），请手工修复 config.json：%w", err)
+				slog.Error("config.json 语法损坏，且备份为默认配置——拒绝自愈", "orig_err", err)
+				return nil, refuseErr
 			}
 			// ① 非空损坏文件另存副本（I7：空文件无需副本、恢复照常执行）
 			broken := ""
@@ -140,10 +141,11 @@ func pruneBroken(path string) {
 	}
 }
 
-// isDefaultBackup 是否为默认配置（admin/admin + 单个 local）——不得作为自愈回退目标（I8）
+// isDefaultBackup 是否为默认配置——与 DefaultConfig() 字段级精确比较（P20：
+// 仅「admin/admin + 单个 local + 无 vault」命中；local-only 的自定义配置不受影响）
 func isDefaultBackup(cfg *Config) bool {
-	return cfg.Server.Username == "admin" && cfg.Server.Password == "admin" &&
-		len(cfg.Clouds) == 1 && cfg.Clouds[0].Type == "local"
+	d := DefaultConfig()
+	return cfg.Server == d.Server && len(cfg.Clouds) == 1 && cfg.Clouds[0] == *d.Cloud && cfg.Vault == nil
 }
 
 // ensureBackup 确保 .bak 存在且可解析（I6：自愈的前提；启动路径调用，写回路径不受影响）。
@@ -153,8 +155,13 @@ func ensureBackup(path string) {
 	refresh := false
 	if _, err := os.Stat(path + ".bak"); os.IsNotExist(err) {
 		refresh = true
-	} else if _, err := LoadStrict(path + ".bak"); err != nil {
+	} else if bakCfg, err := LoadStrict(path + ".bak"); err != nil {
 		refresh = true
+	} else if isDefaultBackup(bakCfg) {
+		// P19：旧版本首启曾写入默认 .bak 的升级机器——当前配置非默认时刷新，恢复自愈能力
+		if cur, curErr := LoadStrict(path); curErr == nil && !isDefaultBackup(cur) {
+			refresh = true
+		}
 	}
 	if refresh {
 		if err := Backup(path); err != nil {

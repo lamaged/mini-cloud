@@ -584,8 +584,8 @@ func TestLoadSelfHealRefusesDefaultBackup(t *testing.T) {
 	if err := os.WriteFile(path, []byte(broken), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Load(path); err == nil {
-		t.Fatal("默认备份应拒绝自愈并报错")
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "拒绝自愈") {
+		t.Fatalf("默认备份应拒绝自愈且错误带原因，got %v", err)
 	}
 	// 原文件不得被覆盖
 	data, _ := os.ReadFile(path)
@@ -607,5 +607,52 @@ func TestEnsureBackupRefreshesCorrupt(t *testing.T) {
 	}
 	if _, err := LoadStrict(path + ".bak"); err != nil {
 		t.Errorf(".bak 损坏后应被刷新为好配置: %v", err)
+	}
+}
+
+// TestEnsureBackupRefreshesLegacyDefault P19：升级机器遗留的默认 .bak 被当前好配置刷新
+func TestEnsureBackupRefreshesLegacyDefault(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	writeCloudsConfig(t, path)
+	// 遗留的默认 .bak
+	if err := DefaultConfig().Save(path + ".bak"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err != nil {
+		t.Fatal(err)
+	}
+	bak, err := LoadStrict(path + ".bak")
+	if err != nil {
+		t.Fatalf(".bak 应被刷新: %v", err)
+	}
+	if len(bak.Clouds) != 2 {
+		t.Errorf("刷新后 .bak 应为当前配置（2 个云盘），实际 %d", len(bak.Clouds))
+	}
+}
+
+// TestSelfHealLocalOnlyCustom P20：local-only 自定义配置（非默认）不受默认判定影响，可自愈
+func TestSelfHealLocalOnlyCustom(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	content := `{
+    "server": {"listen": ":8088", "username": "myuser", "password": "mypass"},
+    "clouds": [{"name": "本地", "type": "local"}]
+}`
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := Backup(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(`{broken`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("local-only 自定义配置应可自愈: %v", err)
+	}
+	if cfg.Server.Username != "myuser" {
+		t.Errorf("自愈后配置不符: %+v", cfg.Server)
 	}
 }
