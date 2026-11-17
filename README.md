@@ -53,6 +53,14 @@ TV / Nova Player / 网易爆米花 / Infuse
 
 ### 变更记录
 
+#### v0.10.0 (2026-11-17)
+
+- **新增** 凭证网页管理：浏览器访问 `/admin` 直接更新移动云盘 authorization，免 SSH。两阶段更新（联网验证 10s 超时 → 原子写配置 → 生效），任何一步失败零变化；配置文件原子写入（临时文件+落盘+改名）、写前自动备份（.bak）、写后权限 0600；剩余有效期不足 24 小时的凭证拒绝接收
+- **修复** 3 处现存转义缺陷：PROPFIND href 逐段百分号编码（中文/空格/`#`/`?` 文件名在严格客户端 404）、目录页文件名 HTML 转义（XSS）、根 PROPFIND 挂载名 XML 转义
+- **增强** 更新成功后立即清空该挂载的目录/链接缓存；401 自动刷新与网页更新互不覆盖（代次防护）；配置文件缺失时写回路径严格报错（不重建默认配置，防认证降级）；HTTP 服务增加读请求头超时
+- **新增** 部署脚本 `scripts/`：开发机一键编译+UPX+暂存（deploy-prepare.sh），路由器一键拉取+备份+重启+健康检查+失败自动回滚（deploy-router.sh，busybox ash 兼容）
+- **测试** 新增 40+ 用例（凭证两阶段更新、并发串行化、401×提交竞态、配置原子写/权限/备份/还原、转义），全部通过竞态检测；外部代码审核五轮通过
+
 #### v0.9.2 (2026-10-05)
 
 - **变更** 移动云盘 authorization 过期后不再返回 500，改为显示空目录 + 提示名：
@@ -239,6 +247,8 @@ mini-cloud/
 ├── config.json             # 配置文件
 ├── go.mod                  # Go module (go 1.22)
 ├── state/                  # Token 缓存目录（自动生成）
+├── scripts/                # 部署脚本（开发机编译 + 路由器拉取/回滚）
+├── docs/                   # 设计文档、流程文档、验收清单、评审归档
 ├── drivers/
 │   ├── tianyi/             # 天翼云盘驱动
 │   │   ├── driver.go       # List / Link / 路径解析
@@ -258,9 +268,10 @@ mini-cloud/
 │   └── local/              # 本地文件驱动（开发用）
 │       └── driver.go
 └── internal/
+    ├── admin/              # 凭证管理页（/admin，v0.10.0）
     ├── auth/watcher.go     # Token 后台维护器（仅 OAuth2 驱动）
-    ├── conf/config.go      # 配置加载与验证
-    ├── driver/driver.go    # Driver 接口定义
+    ├── conf/config.go      # 配置加载与验证（原子写/备份/0600）
+    ├── driver/driver.go    # Driver 接口定义（含 CredentialUpdater）
     ├── fs/
     │   ├── cache.go        # 目录/链接缓存层
     │   └── retry.go        # 失败重试层
@@ -298,7 +309,7 @@ mini-cloud/
 - 百度网盘非会员用户高码率视频可能卡顿（百度 CDN 策略限制）
 - 不支持文件上传/修改（只读）
 - 天翼云盘频繁密码登录可能触发验证码（建议首次登录后保持 session）
-- 移动云盘 `authorization` 有效期约 30 天，过期后无法自动续期：挂载会显示为空目录、名称变为「移动云盘authorization已经过期，请更新」。届时需重新生成 authorization 并更新 `config.json`（并删除 `state/移动云盘_token.json` 后重启）
+- 移动云盘 `authorization` 有效期约 30 天，过期后无法自动续期：挂载会显示为空目录、名称变为「移动云盘authorization已经过期，请更新」。**v0.10.0 起**：浏览器打开 `http://<路由器IP>:8088/admin` 直接粘贴新 authorization 即可更新（免 SSH、立即生效、重启仍有效），无需手工修改 config.json
 
 ## License
 
