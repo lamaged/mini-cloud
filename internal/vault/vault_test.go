@@ -6,9 +6,11 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
+	"net/http/httptest"
 	"os"
 	"path"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -18,8 +20,9 @@ import (
 
 // fakeRaw 内存假云盘：模拟 local 驱动（Link 返回 seekable 数据流）
 type fakeRaw struct {
-	files    map[string][]byte // 挂载内路径 → 内容
-	urlOnly  bool              // 模拟天翼/移动：Link 只返回 URL（302 模式）
+	files      map[string][]byte // 挂载内路径 → 内容
+	urlOnly    bool              // 模拟天翼/移动：Link 只返回 URL（302 模式）
+	urlOnlyURL string            // urlOnly 时返回的 URL（默认不可达域名；测试可指向拒绝端口加速）
 }
 
 func (f *fakeRaw) Name() string                          { return "local" }
@@ -67,7 +70,11 @@ func (f *fakeRaw) Link(ctx context.Context, p string) (*model.Link, error) {
 		return nil, os.ErrNotExist
 	}
 	if f.urlOnly {
-		return &model.Link{URL: "https://cdn.example.com/" + p}, nil // 302 模式：无数据流
+		base := f.urlOnlyURL
+		if base == "" {
+			base = "https://cdn.example.com"
+		}
+		return &model.Link{URL: base + "/" + p}, nil // 302 模式：无数据流
 	}
 	return &model.Link{Reader: &memReader{Reader: bytes.NewReader(data)}}, nil
 }
@@ -225,31 +232,160 @@ func TestVaultMissingManifestEmptyDir(t *testing.T) {
 	}
 }
 
-// TestVaultURLOnlyDriverSkipped I1：Link 只返回 URL 的驱动（天翼/移动）不建 vault 根、
-// 不接管同名目录、不产生告警——挂载完全按普通模式工作
-func TestVaultURLOnlyDriverSkipped(t *testing.T) {
+// TestVaultURLOnlyDriverUnreadableManifest I1 演进（Phase 1 语义）：URL 型驱动已支持
+// （manifest 经取数层读取）；但取数失败（如假域名不可达）时——空目录 + 告警，不崩溃
+func TestVaultURLOnlyDriverUnreadableManifest(t *testing.T) {
 	f, master, _ := buildTestVault(t, true)
 	f.urlOnly = true
+	f.urlOnlyURL = "http://127.0.0.1:1" // 本地拒绝端口：连接立即失败，加速测试
 	v := newTestVault(t, f, master, 4)
 	defer v.Stop()
 
-	// 同名 backup 目录不被虚拟树接管：List 委托 cached，返回物理目录内容
 	objs, err := v.List(context.Background(), "/backup")
 	if err != nil {
-		t.Fatalf("List /backup: %v", err)
+		t.Fatalf("List: %v", err)
 	}
-	// fakeRaw 物理视图：backup 下有 _mc 子目录
-	found := false
-	for _, o := range objs {
-		if o.Name == "_mc" && o.IsDir {
-			found = true
-		}
+	if len(objs) != 0 {
+		t.Errorf("manifest 不可读应显示空目录: %+v", objs)
 	}
-	if !found {
-		t.Errorf("URL 型驱动应保持物理视图（含 _mc 目录），实际: %+v", objs)
+	if v.Warning() == "" {
+		t.Error("manifest 不可读应有告警")
 	}
-	if v.Warning() != "" {
-		t.Errorf("URL 型驱动不应产生告警，got %q", v.Warning())
+}
+
+// buildURLVault 构造 URL 型驱动的完整 vault（httptest CDN 同时服务 manifest 与对象）
+func buildURLVault(t *testing.T, maxStreams int) (*Vault, *fakeURLDriver, *rangeCDN, []byte, string) {
+	t.Helper()
+	master := bytes.Repeat([]byte{0x6B}, 32)
+	plain := []byte("Phase1 云盘播放端到端内容 hello tianyi!")
+	fileID := [16]byte{3, 3, 3, 3}
+	objID := EncodeFileID(fileID)
+
+	meta := &Metadata{V: 1, P: "/电影/a.mkv", N: "a.mkv", S: int64(len(plain)), M: 1712345678, T: "video/x-matroska"}
+	var objBuf bytes.Buffer
+	h, shaHex, err := EncryptObject(&objBuf, master, bytes.NewReader(plain), int64(len(plain)), fileID, meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := &Manifest{V: 1, Files: []Entry{{
+		Path: "/电影/a.mkv", Name: "a.mkv", Size: int64(len(plain)), MTime: 1712345678,
+		MIME: "video/x-matroska", FileID: objID, Obj: ObjectPath(objID),
+		HeaderSHA256: hex.EncodeToString(h.HeaderHash()), SHA256: shaHex,
+	}}, Dirs: []string{"/电影"}}
+	var mf bytes.Buffer
+	if err := SaveManifest(&mf, ManifestKey(master), m); err != nil {
+		t.Fatal(err)
+	}
+
+	objKey := "backup/" + ObjectPath(objID)
+	cdn := &rangeCDN{byPath: map[string][]byte{
+		"/backup/_mc/manifest.mcf": mf.Bytes(),
+		"/" + objKey:              objBuf.Bytes(),
+	}}
+	ts := httptest.NewServer(cdn)
+	t.Cleanup(ts.Close)
+	drv := &fakeURLDriver{baseURL: ts.URL}
+	drv.files = map[string][]byte{"backup/_mc/manifest.mcf": mf.Bytes(), objKey: objBuf.Bytes()}
+	v := New(drv, drv, master, Config{Paths: []string{"backup"}, MaxStreams: maxStreams})
+	if err := v.Init(context.Background()); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	return v, drv, cdn, plain, objID
+}
+
+// TestVaultLinkViaUpstream Phase 1 核心集成：URL 型驱动全链路
+// （manifest 经取数层 → 虚拟列表 → 解密数据流经云盘 Range）
+func TestVaultLinkViaUpstream(t *testing.T) {
+	v, _, _, plain, _ := buildURLVault(t, 4)
+	defer v.Stop()
+
+	objs, err := v.List(context.Background(), "/backup/电影")
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(objs) != 1 || objs[0].Name != "a.mkv" {
+		t.Fatalf("虚拟列表不符: %+v", objs)
+	}
+	link, err := v.Link(context.Background(), "/backup/电影/a.mkv")
+	if err != nil {
+		t.Fatalf("Link: %v", err)
+	}
+	got, err := io.ReadAll(link.Reader)
+	link.Reader.Close()
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if !bytes.Equal(got, plain) {
+		t.Fatal("云盘取数解密内容与明文不符")
+	}
+}
+
+// TestVaultSemaphoreBeforeLink U3：信号量在 raw.Link（云盘 API）之前获取——
+// 超限拒绝时不得多调用一次 Link
+func TestVaultSemaphoreBeforeLink(t *testing.T) {
+	v, drv, _, _, _ := buildURLVault(t, 1)
+	defer v.Stop()
+
+	old := acquireTimeout
+	acquireTimeout = 100 * time.Millisecond
+	defer func() { acquireTimeout = old }()
+
+	link1, err := v.Link(context.Background(), "/backup/电影/a.mkv")
+	if err != nil {
+		t.Fatalf("Link 1: %v", err)
+	}
+	baseline := drv.linkCalls.Load()
+	if _, err := v.Link(context.Background(), "/backup/电影/a.mkv"); !errors.Is(err, driver.ErrTooManyStreams) {
+		link1.Reader.Close()
+		t.Fatalf("第二路应被信号量拒绝，got %v", err)
+	}
+	if drv.linkCalls.Load() != baseline {
+		t.Errorf("信号量拒绝后不应再调用云盘 Link：before=%d after=%d", baseline, drv.linkCalls.Load())
+	}
+	link1.Reader.Close()
+}
+
+// TestVaultBindingMismatch I3：对象内嵌 metadata.p 与请求路径不一致 → 拒绝（防跨对象替换）
+func TestVaultBindingMismatch(t *testing.T) {
+	master := bytes.Repeat([]byte{0x6B}, 32)
+	plain := []byte("stolen content")
+	fileID := [16]byte{4, 4, 4, 4}
+	objID := EncodeFileID(fileID)
+
+	// 对象内嵌路径是 /别的目录/b.mkv，但 manifest 把它挂到 /电影/a.mkv
+	meta := &Metadata{V: 1, P: "/别的目录/b.mkv", N: "b.mkv", S: int64(len(plain)), M: 1}
+	var objBuf bytes.Buffer
+	h, shaHex, err := EncryptObject(&objBuf, master, bytes.NewReader(plain), int64(len(plain)), fileID, meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := &Manifest{V: 1, Files: []Entry{{
+		Path: "/电影/a.mkv", Name: "a.mkv", Size: int64(len(plain)), MTime: 1,
+		MIME: "video/x-matroska", FileID: objID, Obj: ObjectPath(objID),
+		HeaderSHA256: hex.EncodeToString(h.HeaderHash()), SHA256: shaHex,
+	}}}
+	var mf bytes.Buffer
+	if err := SaveManifest(&mf, ManifestKey(master), m); err != nil {
+		t.Fatal(err)
+	}
+	objKey := "backup/" + ObjectPath(objID)
+	cdn := &rangeCDN{byPath: map[string][]byte{
+		"/backup/_mc/manifest.mcf": mf.Bytes(),
+		"/" + objKey:              objBuf.Bytes(),
+	}}
+	ts := httptest.NewServer(cdn)
+	t.Cleanup(ts.Close)
+	drv := &fakeURLDriver{baseURL: ts.URL}
+	drv.files = map[string][]byte{"backup/_mc/manifest.mcf": mf.Bytes(), objKey: objBuf.Bytes()}
+	v := New(drv, drv, master, Config{Paths: []string{"backup"}})
+	if err := v.Init(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer v.Stop()
+
+	if _, err := v.Link(context.Background(), "/backup/电影/a.mkv"); err == nil ||
+		!strings.Contains(err.Error(), "绑定校验失败") {
+		t.Errorf("路径绑定不一致必须被拒绝，got %v", err)
 	}
 }
 

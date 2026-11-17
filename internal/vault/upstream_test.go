@@ -69,6 +69,7 @@ func TestParseURLExpiry(t *testing.T) {
 // rangeCDN 模拟支持 Range 的 CDN
 type rangeCDN struct {
 	data          []byte
+	byPath        map[string][]byte // 按路径提供内容（manifest 与对象同服）
 	requests      atomic.Int32
 	serve200      bool // 模拟忽略 Range
 	fail403       atomic.Bool
@@ -81,6 +82,11 @@ type rangeCDN struct {
 func (c *rangeCDN) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	reqNo := c.requests.Add(1)
 	c.lastUA.Store(r.Header.Get("User-Agent"))
+	if c.byPath != nil {
+		if d, ok := c.byPath[r.URL.Path]; ok {
+			c.data = d
+		}
+	}
 	if c.failNext.CompareAndSwap(true, false) {
 		http.Error(w, "Forbidden", http.StatusForbidden)
 		return

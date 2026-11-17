@@ -171,6 +171,14 @@ func (r *DecryptReader) Stat() (os.FileInfo, error) {
 	}, nil
 }
 
+// OriginalPath 元数据中的原始虚拟路径（I3：与请求路径比对，防跨对象替换；Phase 1 强校验）
+func (r *DecryptReader) OriginalPath() string {
+	if r.meta != nil {
+		return r.meta.P
+	}
+	return ""
+}
+
 func (r *DecryptReader) headerName() string {
 	if r.meta != nil && r.meta.N != "" {
 		return r.meta.N

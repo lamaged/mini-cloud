@@ -211,8 +211,9 @@ func (u *Upstream) fetchRange(p []byte, off int64, length int) (int, error) {
 			return 0, err
 		}
 		n, err := u.doRange(ctx, p, off, length)
-		if err == nil {
-			return n, nil
+		if err == nil || err == io.EOF {
+			// io.EOF = 对象末尾的正常短读（如 manifest 小于窗口），不是失败
+			return n, err
 		}
 		lastErr = err
 		if errors.Is(err, errRangeInvalid) {

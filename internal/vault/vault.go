@@ -84,6 +84,9 @@ func (s *streamSem) release() {
 // acquireTimeout 信号量获取超时（测试可缩短）
 var acquireTimeout = 5 * time.Second
 
+// httpClient 云盘取数层 HTTP 客户端（测试可替换）
+var httpClient = &http.Client{Timeout: 30 * time.Second}
+
 // New 创建 Vault 包装层（签名以本实现为准：vault.New(cached, raw, master, cfg)）
 func New(cached driver.Reader, raw driver.Driver, master []byte, cfg Config) *Vault {
 	if cfg.MaxStreams <= 0 {
@@ -131,11 +134,13 @@ func (v *Vault) isVaultRoot(name string) bool {
 	return false
 }
 
-// loadRoot 加载单个 vault 根（manifest 唯一真值源）
+// loadRoot 加载单个 vault 根（manifest 唯一真值源）。
+// Phase 1：URL 型驱动（天翼/移动）的 manifest 也经云盘取数层读取。
 func (v *Vault) loadRoot(ctx context.Context, name string) {
 	r := &root{name: name, entries: make(map[string]Entry), dirs: map[string]bool{"/": true}, children: make(map[string][]model.Obj)}
+	manifestPath := path.Join(name, "_mc", "manifest.mcf")
 
-	link, err := v.raw.Link(ctx, path.Join(name, "_mc", "manifest.mcf"))
+	link, err := v.raw.Link(ctx, manifestPath)
 	if err != nil {
 		r.warning = fmt.Sprintf("vault 根 %s：manifest 缺失或不可读，虚拟视图为空目录", name)
 		slog.Warn("vault: "+r.warning, "err", err)
@@ -145,18 +150,36 @@ func (v *Vault) loadRoot(ctx context.Context, name string) {
 		v.mu.Unlock()
 		return
 	}
-	if link.Reader == nil {
-		// I1：Link 返回 URL 的驱动（天翼/移动 302 模式）不支持流式读取——
-		// 不建 vault 根、不接管同名目录，挂载完全按普通模式工作（Phase 1 接 OpenRange 后启用）
-		slog.Info("vault: 驱动不支持流式读取，跳过该挂载的 vault 根", "root", name)
+
+	var src io.ReadCloser
+	switch {
+	case link.Reader != nil:
+		src = link.Reader
+	case link.URL != "":
+		// Phase 1 接线：URL 型驱动经取数层读 manifest（Range 请求）
+		up, err := NewUpstream(ctx, v.raw, manifestPath, httpClient)
+		if err != nil {
+			r.warning = fmt.Sprintf("vault 根 %s：manifest 读取失败，虚拟视图为空目录", name)
+			slog.Warn("vault: "+r.warning, "err", err)
+			r.buildChildren()
+			v.mu.Lock()
+			v.roots[name] = r
+			v.mu.Unlock()
+			return
+		}
+		src = &rangeReadCloser{src: up}
+	default:
+		// 既无数据流也无 URL：无法读取，不建根（挂载按普通模式工作）
+		slog.Info("vault: 驱动无法提供对象内容，跳过该挂载的 vault 根", "root", name)
 		return
 	}
-	defer link.Reader.Close()
+	defer src.Close()
 
-	m, err := LoadManifest(link.Reader, ManifestKey(v.master))
+	m, err := LoadManifest(src, ManifestKey(v.master))
 	if err != nil {
 		r.warning = fmt.Sprintf("vault 根 %s：manifest 解密失败，虚拟视图为空目录", name)
 		slog.Warn("vault: "+r.warning, "err", err)
+		r.buildChildren() // 空虚拟树：List 返回空列表而非 not found
 		v.mu.Lock()
 		v.roots[name] = r
 		v.mu.Unlock()
@@ -276,45 +299,65 @@ func (v *Vault) Link(ctx context.Context, reqPath string) (*model.Link, error) {
 	}
 
 	objPath := path.Join(r.name, e.Obj) // 挂载内对象路径（"backup/_mc/o/..."）
-	link, err := v.raw.Link(ctx, objPath)
-	if err != nil {
-		return nil, fmt.Errorf("vault: 获取对象失败: %w", err)
-	}
-	if link.Reader == nil {
-		return nil, fmt.Errorf("vault: 上游未返回数据流: %s", objPath)
-	}
 
-	// 全局信号量（I2：最多等待 acquireTimeout 后拒绝 → 503）
+	// U3/P21：全局信号量在 raw.Link（云盘 API 调用）之前获取——超限拒绝时不白开上游连接
 	if !v.sem.acquire(ctx, acquireTimeout) {
-		link.Reader.Close()
 		return nil, driver.ErrTooManyStreams
 	}
+	release := true
+	defer func() {
+		if release {
+			v.sem.release()
+		}
+	}()
 
-	ra, ok := link.Reader.(io.ReaderAt)
-	if !ok {
-		link.Reader.Close()
-		v.sem.release()
-		return nil, fmt.Errorf("vault: 上游不支持随机读取（Phase 1 需 OpenRange 实现）")
-	}
 	fileID, err := DecodeFileID(e.FileID)
 	if err != nil {
-		link.Reader.Close()
-		v.sem.release()
 		return nil, err
 	}
 	headerSHA, err := hex.DecodeString(e.HeaderSHA256)
 	if err != nil {
-		link.Reader.Close()
-		v.sem.release()
 		return nil, fmt.Errorf("vault: header_sha256 解析失败: %w", err)
 	}
 
-	dr, err := OpenDecryptReader(&readAtCloser{r: ra, c: link.Reader}, v.master, fileID, headerSHA)
+	link, err := v.raw.Link(ctx, objPath)
 	if err != nil {
-		link.Reader.Close()
-		v.sem.release()
+		return nil, fmt.Errorf("vault: 获取对象失败: %w", err)
+	}
+
+	var src RangeSource
+	if link.Reader != nil {
+		// 流式驱动（local / 百度代理）：Reader 需支持 io.ReaderAt
+		ra, ok := link.Reader.(io.ReaderAt)
+		if !ok {
+			link.Reader.Close()
+			return nil, fmt.Errorf("vault: 上游数据流不支持随机读取")
+		}
+		src = &readAtCloser{r: ra, c: link.Reader}
+	} else if link.URL != "" {
+		// URL 型驱动（天翼/移动 302 模式）：走云盘取数层（Phase 1 接线）
+		up, err := NewUpstream(ctx, v.raw, objPath, httpClient)
+		if err != nil {
+			return nil, err
+		}
+		src = up
+	} else {
+		return nil, fmt.Errorf("vault: 上游既无数据流也无 URL: %s", objPath)
+	}
+
+	dr, err := OpenDecryptReader(src, v.master, fileID, headerSHA)
+	if err != nil {
+		src.Close()
 		return nil, err
 	}
+
+	// I3 对象绑定强校验（Phase 1）：文件内嵌 metadata.p 必须与请求虚拟路径一致（防跨对象替换）
+	if p := dr.OriginalPath(); p != "" && p != inner {
+		dr.Close()
+		return nil, fmt.Errorf("vault: 对象绑定校验失败：内嵌路径 %q 与请求路径 %q 不一致", p, inner)
+	}
+
+	release = false // 信号量交由 semDecryptReader.Close 释放
 
 	hdr := http.Header{}
 	if e.MIME != "" {
@@ -350,6 +393,19 @@ func (v *Vault) Warning() string {
 	sort.Strings(parts)
 	return strings.Join(parts, "；")
 }
+
+// rangeReadCloser 适配 RangeSource → io.ReadCloser（manifest 顺序读取用）
+type rangeReadCloser struct {
+	src RangeSource
+	off int64
+}
+
+func (r *rangeReadCloser) Read(p []byte) (int, error) {
+	n, err := r.src.ReadAt(p, r.off)
+	r.off += int64(n)
+	return n, err
+}
+func (r *rangeReadCloser) Close() error { return r.src.Close() }
 
 // readAtCloser 适配 io.ReaderAt + io.Closer
 type readAtCloser struct {
