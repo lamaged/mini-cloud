@@ -2,6 +2,7 @@ package vault
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -18,19 +19,23 @@ import (
 // ============================================================
 // 云盘上游取数层（Phase 1）
 // 契约（P9/design §4.1）：
-//   ① 预读/缓冲窗口 8 MiB；② 相邻 ReadAt 偏移差 ≤ 窗口视为顺序（命中缓冲不请求）；
-//   ③ 反向 Seek/跨块跳跃/403 重签后缓冲立即失效；④ 缓冲内存计入 max_streams 账（每流 ≤ 窗口）。
+//   ① 预读/缓冲窗口 4 MiB；② 相邻 ReadAt 偏移差 ≤ 窗口视为顺序（命中缓冲不请求）；
+//   ③ 反向 Seek/跨块跳跃/换签名后缓冲立即失效（单块读取也写入缓冲，保证后续顺序读延续）；
+//   ④ 缓冲内存计入 max_streams 账（每流 = 窗口 4 MiB + 解密块 2 MiB = 6 MiB）。
 // 403 刷新（feasibility §5.4）：失效旧 URL → 重新 Link → 重试一次 → 仍失败报错（webdav 映射 502）。
 // ctx 传导（I6）：使用 Link 时的请求 ctx（baseCtx），客户端断开即取消上游请求。
+//
+// 串行契约（U4 方案 a）：Upstream 非并发安全——DecryptReader 由单 goroutine 使用
+// （http.ServeContent 契约），并发只发生在不同实例之间；因此无需单飞锁，
+// 所有共享状态写入均在 mu 内完成。
 // ============================================================
 
 const (
-	// StreamWindow 顺序读缓冲窗口（P9：4–8 MiB，取 4 MiB 下限——
-	// 每流内存 = 窗口 4 MiB + 分块缓存 2 MiB = 6 MiB，4 路并发封顶 24 MiB）
+	// StreamWindow 顺序读缓冲窗口（P9：4–8 MiB，取 4 MiB）
 	StreamWindow = 4 << 20
 	// MaxDiscard 上游忽略 Range 时允许的流式丢弃上限（I10：≤ 2 MiB）
 	MaxDiscard = 2 << 20
-	// URL 缓存 TTL 上限（feasibility §5.4：min(10min, expires-now-60s)）
+	// MaxURLTTL URL 缓存 TTL 上限（feasibility §5.4：min(10min, expires-now-60s)）
 	MaxURLTTL = 10 * time.Minute
 )
 
@@ -39,8 +44,14 @@ type ErrUpstream struct{ msg string }
 
 func (e *ErrUpstream) Error() string { return "vault upstream: " + e.msg }
 
-// ErrRangeNotSupported 上游不支持 Range（I10：200 分级策略耗尽）
+// ErrRangeNotSupported 上游不支持 Range（I10：两次 200 后且偏移超限）
 var ErrRangeNotSupported = &ErrUpstream{msg: "上游不支持 Range"}
+
+// errRangeInvalid 416：区间无效（P2：不触发换签名）
+var errRangeInvalid = errors.New("vault upstream: 416 区间无效")
+
+// errIgnoredRange 上游忽略 Range（200；触发换签名重试，两次后按 I10 分级）
+var errIgnoredRange = errors.New("vault upstream: 上游忽略 Range（200）")
 
 // parseURLExpiry 从签名 URL 解析绝对过期时间（feasibility §5.1；不写死 TTL，以查询参数为准）：
 //   - 天翼：Expires=<unix 秒>（13 位毫秒除以 1000）
@@ -74,13 +85,12 @@ type Upstream struct {
 	httpc   *http.Client
 	baseCtx context.Context // Link 时的请求 ctx：客户端断开即取消上游请求
 
-	mu         sync.Mutex // 保护 URL 状态/刷新单飞/缓冲
-	linkURL    string
-	linkHdr    http.Header
-	expiresAt  time.Time
-	refreshing bool
+	mu        sync.Mutex // 保护全部共享状态（U4：写入均在锁内）
+	linkURL   string
+	linkHdr   http.Header
+	expiresAt time.Time
 
-	// 顺序读缓冲（P9 契约①②③）
+	// 顺序读缓冲（P9 契约①②③；U2：单块读取也写入缓冲）
 	buf      []byte
 	bufStart int64
 	bufEnd   int64
@@ -98,7 +108,7 @@ func NewUpstream(ctx context.Context, drv driver.Driver, objPath string, httpc *
 	return u, nil
 }
 
-// refreshURL 重新 Link 获取签名 URL（单飞保护由调用方保证）
+// refreshURL 重新 Link 获取签名 URL（调用方需持锁）
 func (u *Upstream) refreshURL(ctx context.Context) error {
 	link, err := u.drv.Link(ctx, u.objPath)
 	if err != nil {
@@ -113,8 +123,7 @@ func (u *Upstream) refreshURL(ctx context.Context) error {
 	}
 	exp, ok := parseURLExpiry(parsed)
 	if !ok {
-		// 无法解析：按保守 TTL（10 分钟上限，与 CachedReader 链接缓存一致）
-		exp = time.Now().Add(MaxURLTTL)
+		exp = time.Now().Add(MaxURLTTL) // 无法解析：保守 TTL
 	}
 	u.linkURL = link.URL
 	u.linkHdr = link.Header
@@ -136,84 +145,88 @@ func (u *Upstream) urlTTL() time.Duration {
 	return remain
 }
 
-// ensureFreshURL 签名临近过期时刷新（单飞：并发共用同一次刷新，I6）
+// ensureFreshURL 签名临近过期时刷新（调用方串行，U4a）
 func (u *Upstream) ensureFreshURL(ctx context.Context) error {
 	u.mu.Lock()
+	defer u.mu.Unlock()
 	if time.Now().Before(u.expiresAt.Add(-60 * time.Second)) {
-		u.mu.Unlock()
 		return nil
 	}
-	if u.refreshing {
-		for u.refreshing {
-			u.mu.Unlock()
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(50 * time.Millisecond):
-			}
-			u.mu.Lock()
-		}
-		u.mu.Unlock()
-		return nil
-	}
-	u.refreshing = true
-	u.mu.Unlock()
-
-	err := u.refreshURL(ctx)
-
-	u.mu.Lock()
-	u.refreshing = false
-	u.mu.Unlock()
-	if err != nil {
+	if err := u.refreshURL(ctx); err != nil {
 		return fmt.Errorf("vault upstream: 刷新签名失败: %w", err)
 	}
 	slog.Info("vault upstream: 签名已刷新", "obj", u.objPath, "ttl", u.urlTTL())
 	return nil
 }
 
-// ReadAt 随机读取密文（契约②：偏移差 ≤ 窗口视为顺序走缓冲；否则单块请求）
+// ReadAt 随机读取密文。
+// U1 修复：跨窗口读取内部循环补齐——缓冲耗尽时按顺序续拉，直到填满 p 或到达 EOF；
+// 短读必须带 io.EOF（io.ReaderAt 契约）。
 func (u *Upstream) ReadAt(p []byte, off int64) (int, error) {
+	total := 0
+	for total < len(p) {
+		n, err := u.readOnce(p[total:], off+int64(total))
+		total += n
+		if err != nil {
+			return total, err
+		}
+		if n == 0 {
+			return total, io.EOF
+		}
+	}
+	return total, nil
+}
+
+// readOnce 单次读取：完整覆盖走缓冲；否则顺序大段或随机单块
+func (u *Upstream) readOnce(p []byte, off int64) (int, error) {
 	u.mu.Lock()
 	if u.closed {
 		u.mu.Unlock()
 		return 0, fmt.Errorf("vault upstream: 已关闭")
 	}
-	// 顺序命中缓冲
-	if len(u.buf) > 0 && off >= u.bufStart && off < u.bufEnd {
+	// U1：仅当缓冲完整覆盖 p 才直接返回（避免跨窗口短读）
+	if len(u.buf) > 0 && off >= u.bufStart && off+int64(len(p)) <= u.bufEnd {
 		rel := off - u.bufStart
 		n := copy(p, u.buf[rel:])
 		u.mu.Unlock()
-		if n == 0 {
-			return 0, io.EOF
-		}
 		return n, nil
 	}
-	// 顺序判定（P9 契约②）：无缓冲（首读）或请求起点紧接缓冲之后视为顺序 → 拉大段
-	sequential := len(u.buf) == 0 || (off >= u.bufEnd && off-u.bufEnd <= StreamWindow)
+	// 顺序判定（P9 契约②；U2：单块也写缓冲后，随机读会替换缓冲，后续读自然延续）
+	sequential := len(u.buf) == 0 || (off >= u.bufStart && off <= u.bufEnd+StreamWindow)
 	u.mu.Unlock()
 
 	if sequential {
-		return u.fetchRange(p, off, StreamWindow, true)
+		return u.fetchRange(p, off, StreamWindow)
 	}
-	return u.fetchRange(p, off, len(p), false)
+	return u.fetchRange(p, off, len(p))
 }
 
-// fetchRange 发 Range 请求；allowBuffer=true 时把拉到的数据写入顺序缓冲。
-// 失败（403/网络/Content-Range 不符）→ 强制刷新签名重试一次（feasibility §5.4）。
-func (u *Upstream) fetchRange(p []byte, off int64, length int, allowBuffer bool) (int, error) {
+// fetchRange 发 Range 请求；失败（403/网络/Content-Range 不符/200）→ 换签名重试一次（P1 对齐 I10）。
+// 416 直接返回不换签名（P2）。
+func (u *Upstream) fetchRange(p []byte, off int64, length int) (int, error) {
 	ctx := u.baseCtx
 	var lastErr error
 	for attempt := 0; attempt < 2; attempt++ {
 		if err := u.ensureFreshURL(ctx); err != nil {
 			return 0, err
 		}
-		n, err := u.doRange(ctx, p, off, length, allowBuffer)
+		n, err := u.doRange(ctx, p, off, length)
 		if err == nil {
 			return n, nil
 		}
 		lastErr = err
-		if errorsIsRangeNotSupported(err) {
-			return 0, err // I10：换签名仍 200 → 直接失败，不再无谓重试
+		if errors.Is(err, errRangeInvalid) {
+			return 0, err // 416：偏移越界，换签名无意义
+		}
+		if errors.Is(err, errIgnoredRange) && attempt == 1 {
+			// I10 分级：两次 200（换签名仍无效）——≤2 MiB 丢弃后继续，否则 502
+			if off > MaxDiscard {
+				return 0, ErrRangeNotSupported
+			}
+			return u.discardServe(ctx, p, off)
+		}
+		if attempt == 1 {
+			break
 		}
 		u.mu.Lock()
 		u.buf = nil
@@ -228,12 +241,8 @@ func (u *Upstream) fetchRange(p []byte, off int64, length int, allowBuffer bool)
 	return 0, lastErr
 }
 
-func errorsIsRangeNotSupported(err error) bool {
-	return err == ErrRangeNotSupported
-}
-
 // doRange 单次 Range 请求（I10 异常分支表）
-func (u *Upstream) doRange(ctx context.Context, p []byte, off int64, length int, allowBuffer bool) (int, error) {
+func (u *Upstream) doRange(ctx context.Context, p []byte, off int64, length int) (int, error) {
 	u.mu.Lock()
 	rawURL := u.linkURL
 	hdr := u.linkHdr
@@ -244,10 +253,11 @@ func (u *Upstream) doRange(ctx context.Context, p []byte, off int64, length int,
 		return 0, err
 	}
 	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", off, off+int64(length)-1))
+	// P3：仅透传白名单请求头（天翼需 UA；响应语义头如 Content-Type 不得带进请求）
 	if hdr != nil {
-		for k, vs := range hdr {
-			for _, v := range vs {
-				req.Header.Set(k, v) // 天翼需 UA=Mozilla/5.0（来自 Link 的 Header）
+		for _, k := range []string{"User-Agent", "Referer"} {
+			if v := hdr.Get(k); v != "" {
+				req.Header.Set(k, v)
 			}
 		}
 	}
@@ -270,13 +280,12 @@ func (u *Upstream) doRange(ctx context.Context, p []byte, off int64, length int,
 		if err != nil {
 			return 0, fmt.Errorf("vault upstream: 读取失败: %w", err)
 		}
-		if allowBuffer {
-			u.mu.Lock()
-			u.buf = append(u.buf[:0], data...)
-			u.bufStart = off
-			u.bufEnd = off + int64(len(data))
-			u.mu.Unlock()
-		}
+		// U2：无论顺序/随机都写入缓冲（随机读替换旧缓冲，后续顺序读自然延续）
+		u.mu.Lock()
+		u.buf = append(u.buf[:0], data...)
+		u.bufStart = off
+		u.bufEnd = off + int64(len(data))
+		u.mu.Unlock()
 		n := copy(p, data)
 		if n < len(p) {
 			return n, io.EOF
@@ -284,28 +293,54 @@ func (u *Upstream) doRange(ctx context.Context, p []byte, off int64, length int,
 		return n, nil
 
 	case resp.StatusCode == http.StatusRequestedRangeNotSatisfiable:
-		return 0, fmt.Errorf("vault upstream: 416 区间无效")
+		return 0, errRangeInvalid
 
 	case resp.StatusCode == http.StatusForbidden:
 		return 0, fmt.Errorf("vault upstream: 签名过期（403）")
 
 	case resp.StatusCode == http.StatusOK:
-		// I10 分级：换签名由 fetchRange 重试；本次请求先尝试「丢弃到偏移」（仅 ≤ MaxDiscard）
-		if off > MaxDiscard {
-			return 0, ErrRangeNotSupported
-		}
-		if _, err := io.CopyN(io.Discard, resp.Body, off); err != nil {
-			return 0, fmt.Errorf("vault upstream: 200 丢弃失败: %w", err)
-		}
-		n, err := io.ReadFull(resp.Body, p)
-		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
-			return 0, fmt.Errorf("vault upstream: 200 读取失败: %w", err)
-		}
-		return n, nil
+		return 0, errIgnoredRange
 
 	default:
 		return 0, fmt.Errorf("vault upstream: HTTP %d", resp.StatusCode)
 	}
+}
+
+// discardServe 200 分级中的「丢弃到偏移」路径（I10）。
+// 注（P5）：此路径读完即弃 body，放弃 keep-alive 连接复用（可接受取舍）。
+func (u *Upstream) discardServe(ctx context.Context, p []byte, off int64) (int, error) {
+	u.mu.Lock()
+	rawURL := u.linkURL
+	hdr := u.linkHdr
+	u.mu.Unlock()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", rawURL, nil)
+	if err != nil {
+		return 0, err
+	}
+	if hdr != nil {
+		for _, k := range []string{"User-Agent", "Referer"} {
+			if v := hdr.Get(k); v != "" {
+				req.Header.Set(k, v)
+			}
+		}
+	}
+	resp, err := u.httpc.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("vault upstream: 丢弃请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("vault upstream: 丢弃请求状态 %d", resp.StatusCode)
+	}
+	if _, err := io.CopyN(io.Discard, resp.Body, off); err != nil {
+		return 0, fmt.Errorf("vault upstream: 丢弃失败: %w", err)
+	}
+	n, err := io.ReadFull(resp.Body, p)
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+		return 0, fmt.Errorf("vault upstream: 读取失败: %w", err)
+	}
+	return n, nil
 }
 
 // Close 关闭上游（丢弃缓冲）

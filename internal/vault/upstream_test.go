@@ -2,6 +2,7 @@ package vault
 
 import (
 	"context"
+	"io"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -72,12 +73,18 @@ type rangeCDN struct {
 	serve200      bool // 模拟忽略 Range
 	fail403       atomic.Bool
 	recoverAfter1 atomic.Bool // 仅第一次 403，之后恢复正常（换签名恢复测试）
+	failNext      atomic.Bool // 下一次请求失败一次后恢复（缓冲中途 403 测试）
+	mismatchNext  atomic.Bool // 下一次请求 Content-Range 错位一次后恢复
 	lastUA        atomic.Value // 最近一次请求的 User-Agent
 }
 
 func (c *rangeCDN) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	reqNo := c.requests.Add(1)
 	c.lastUA.Store(r.Header.Get("User-Agent"))
+	if c.failNext.CompareAndSwap(true, false) {
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
 	if c.fail403.Load() && !(c.recoverAfter1.Load() && reqNo > 1) {
 		http.Error(w, "Forbidden", http.StatusForbidden)
 		return
@@ -100,7 +107,11 @@ func (c *rangeCDN) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if end >= int64(len(c.data)) {
 		end = int64(len(c.data)) - 1
 	}
-	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(c.data)))
+	if c.mismatchNext.CompareAndSwap(true, false) {
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start+1, end, len(c.data)))
+	} else {
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(c.data)))
+	}
 	w.WriteHeader(http.StatusPartialContent)
 	w.Write(c.data[start : end+1])
 }
@@ -279,5 +290,135 @@ func TestUpstreamExpiryRefresh(t *testing.T) {
 	}
 	if drv.linkCalls.Load() < 2 {
 		t.Errorf("临期签名应主动刷新（Link 至少 2 次），实际 %d", drv.linkCalls.Load())
+	}
+}
+
+// TestUpstreamChunkCrossingWindow U1：以真实块长（1 MiB+16）连续读 8 块，
+// 断言每块完整、内容正确——跨窗口（4 MiB）读取不得短读误报「截断」
+func TestUpstreamChunkCrossingWindow(t *testing.T) {
+	chunkLen := DefaultChunkSize + TagSize // 1,048,592
+	data := make([]byte, 10<<20)           // 10 MiB
+	for i := range data {
+		data[i] = byte(i % 251)
+	}
+	u, cdn, _ := newTestUpstream(t, data, "")
+	defer u.Close()
+
+	for i := 0; i < 8; i++ {
+		off := int64(i) * int64(chunkLen)
+		p := make([]byte, chunkLen)
+		n, err := u.ReadAt(p, off)
+		if err != nil && err != io.EOF {
+			t.Fatalf("块 %d 读取失败: %v", i, err)
+		}
+		if n != chunkLen {
+			t.Fatalf("块 %d 短读: %d/%d（U1 回归）", i, n, chunkLen)
+		}
+		for j := range p {
+			if p[j] != byte((off+int64(j))%251) {
+				t.Fatalf("块 %d 内容不符 at %d", i, j)
+			}
+		}
+	}
+	// 8 块 ≈ 2 个 4 MiB 窗口 + 64 字节错位（每 4 块边界跨一次）→ 3 次请求
+	if reqs := cdn.requests.Load(); reqs != 3 {
+		t.Errorf("请求次数 = %d, want 3（窗口 4 MiB，跨窗口续拉）", reqs)
+	}
+}
+
+// TestUpstreamJumpThenSequential U2：随机跳跃后预读不失效——后续顺序读仍走缓冲
+func TestUpstreamJumpThenSequential(t *testing.T) {
+	chunkLen := DefaultChunkSize + TagSize
+	data := make([]byte, 56<<20) // 56 MiB（覆盖 50 MiB 跳跃）
+	for i := range data {
+		data[i] = byte(i % 199)
+	}
+	u, cdn, _ := newTestUpstream(t, data, "")
+	defer u.Close()
+
+	// 建立第一个缓冲
+	p := make([]byte, 1000)
+	if _, err := u.ReadAt(p, 2<<20); err != nil {
+		t.Fatalf("ReadAt 2M: %v", err)
+	}
+	// 跳跃到 50 MiB（随机单块 → 替换缓冲，U2 修复）
+	if _, err := u.ReadAt(p, 50<<20); err != nil {
+		t.Fatalf("ReadAt 50M: %v", err)
+	}
+	before := cdn.requests.Load()
+
+	// 连续读 3 块：应从新缓冲顺序延续（每窗口一次请求）
+	off := int64(50<<20) + int64(chunkLen)
+	for i := 0; i < 3; i++ {
+		q := make([]byte, chunkLen)
+		n, err := u.ReadAt(q, off)
+		if err != nil && err != io.EOF {
+			t.Fatalf("块 %d: %v", i, err)
+		}
+		if n != chunkLen {
+			t.Fatalf("块 %d 短读: %d/%d", i, n, chunkLen)
+		}
+		if q[0] != byte(off%199) {
+			t.Fatalf("块 %d 内容不符", i)
+		}
+		off += int64(chunkLen)
+	}
+	// 跳跃后 3 个连续块只应触发 1 次窗口请求（缓冲已重建）
+	if reqs := cdn.requests.Load() - before; reqs != 1 {
+		t.Errorf("跳跃后连续读请求数 = %d, want 1（U2：预读应已恢复）", reqs)
+	}
+}
+
+// TestUpstream403MidBuffer P4①：403 发生在顺序缓冲连续读中途——换签名后恢复
+func TestUpstream403MidBuffer(t *testing.T) {
+	data := make([]byte, 10<<20)
+	for i := range data {
+		data[i] = byte(i % 131)
+	}
+	u, cdn, _ := newTestUpstream(t, data, "")
+	defer u.Close()
+
+	// 建立缓冲（首读）
+	p := make([]byte, 1000)
+	if _, err := u.ReadAt(p, 0); err != nil {
+		t.Fatalf("首读: %v", err)
+	}
+	// 下一次请求 403 一次
+	cdn.failNext.Store(true)
+	// 读缓冲之外的块：触发新请求 → 403 → 换签名重试 → 成功
+	q := make([]byte, 1000)
+	before := cdn.requests.Load()
+	if _, err := u.ReadAt(q, 6<<20); err != nil {
+		t.Fatalf("缓冲中途 403 应恢复: %v", err)
+	}
+	if q[0] != byte((int64(6<<20))%131) {
+		t.Error("恢复后内容不符")
+	}
+	if delta := cdn.requests.Load() - before; delta != 2 {
+		t.Errorf("403 后应恰好重试 1 次（2 个请求），实际 %d", delta)
+	}
+}
+
+// TestUpstreamContentRangeMismatch P4③：Content-Range 与请求区间不符 → 换签名重试
+func TestUpstreamContentRangeMismatch(t *testing.T) {
+	data := make([]byte, 1<<20)
+	for i := range data {
+		data[i] = byte(i % 97)
+	}
+	u, cdn, _ := newTestUpstream(t, data, "")
+	defer u.Close()
+
+	cdn.mismatchNext.Store(true) // 第一次响应 Content-Range 错位
+	p := make([]byte, 500)
+	before := cdn.requests.Load()
+	n, err := u.ReadAt(p, 1000)
+	if err != nil || n != 500 {
+		t.Fatalf("Content-Range 不符应换签名恢复: n=%d err=%v", n, err)
+	}
+	if p[0] != byte(1000%97) {
+		t.Error("恢复后内容不符")
+	}
+	if delta := cdn.requests.Load() - before; delta != 2 {
+		t.Errorf("应恰好 2 次请求（错位 + 换签名重试），实际 %d", delta)
 	}
 }
