@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -53,6 +54,11 @@ func main() {
 		logLevel = slog.LevelInfo
 	}
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel})))
+
+	// G（RV-2026-11-18-01）：-debug 下每 5 分钟打一次内存观测（压测定位内存问题用）
+	if *debug {
+		go memStatsLogger()
+	}
 
 	// 加载配置
 	cfg, err := conf.Load(*configPath)
@@ -462,3 +468,14 @@ func (r *responseLogger) Write(b []byte) (int, error) {
 	return n, err
 }
 
+// memStatsLogger -debug 模式下的内存观测（G：HeapInuse/HeapSys/NumGC/goroutine 数，5 分钟一次）
+func memStatsLogger() {
+	t := time.NewTicker(5 * time.Minute)
+	defer t.Stop()
+	var m runtime.MemStats
+	for range t.C {
+		runtime.ReadMemStats(&m)
+		slog.Debug("memstats", "heap_inuse_mib", m.HeapInuse>>20,
+			"heap_sys_mib", m.HeapSys>>20, "num_gc", m.NumGC, "goroutines", runtime.NumGoroutine())
+	}
+}

@@ -2,6 +2,7 @@ package vault
 
 import (
 	"context"
+	"errors"
 	"io"
 	"fmt"
 	"net/http"
@@ -312,6 +313,36 @@ func TestUpstreamExpiryRefresh(t *testing.T) {
 	}
 	if drv.linkCalls.Load() < 2 {
 		t.Errorf("临期签名应主动刷新（Link 至少 2 次），实际 %d", drv.linkCalls.Load())
+	}
+}
+
+// TestUpstreamCancelNoRefresh E（RV-2026-11-18-01）：客户端断开/取消
+// 不得触发换签名重试——linkCalls 不增加，错误直接返回 context.Canceled
+func TestUpstreamCancelNoRefresh(t *testing.T) {
+	data := make([]byte, 3<<20)
+	cdn := &rangeCDN{data: data}
+	ts := httptest.NewServer(cdn)
+	t.Cleanup(ts.Close)
+	drv := &fakeURLDriver{baseURL: ts.URL}
+	drv.files = map[string][]byte{"backup/_mc/o/xx.bin": data}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	u, err := NewUpstream(ctx, drv, "backup/_mc/o/xx.bin", &http.Client{Timeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("NewUpstream: %v", err)
+	}
+	defer u.Close()
+	if calls := drv.linkCalls.Load(); calls != 1 {
+		t.Fatalf("构造后 Link 应为 1 次，实际 %d", calls)
+	}
+
+	cancel()
+	p := make([]byte, 1000)
+	if _, err := u.ReadAt(p, 0); !errors.Is(err, context.Canceled) {
+		t.Fatalf("取消后应返回 context.Canceled，got %v", err)
+	}
+	if calls := drv.linkCalls.Load(); calls != 1 {
+		t.Errorf("取消后不得触发换签名 Link（E），实际 %d 次", calls)
 	}
 }
 

@@ -212,6 +212,10 @@ func (u *Upstream) readOnce(p []byte, off int64) (int, error) {
 // 416 直接返回不换签名（P2）。
 func (u *Upstream) fetchRange(p []byte, off int64, length int) (int, error) {
 	ctx := u.baseCtx
+	if ctx.Err() != nil {
+		// E（RV-2026-11-18-01）：入口即断——不换签、不重试
+		return 0, ctx.Err()
+	}
 	var lastErr error
 	for attempt := 0; attempt < 2; attempt++ {
 		if err := u.ensureFreshURL(ctx); err != nil {
@@ -221,6 +225,11 @@ func (u *Upstream) fetchRange(p []byte, off int64, length int) (int, error) {
 		if err == nil || err == io.EOF {
 			// io.EOF = 对象末尾的正常短读（如 manifest 小于窗口），不是失败
 			return n, err
+		}
+		if ctx.Err() != nil {
+			// E（RV-2026-11-18-01）：客户端断开/取消——不换签、不重试，直接返回。
+			// 播放器 seek/取消≠上游异常，重试只会白调云盘 API 并刷 WARN 日志。
+			return 0, ctx.Err()
 		}
 		lastErr = err
 		if errors.Is(err, errRangeInvalid) {
@@ -290,31 +299,53 @@ func (u *Upstream) doRange(ctx context.Context, p []byte, off int64, length int)
 		if crStart != off {
 			return 0, fmt.Errorf("vault upstream: Content-Range 与请求区间不符: %q: %w", cr, driver.ErrUpstream)
 		}
-		data, err := io.ReadAll(io.LimitReader(resp.Body, int64(length)+1))
-		if err != nil {
-			return 0, fmt.Errorf("vault upstream: 读取失败: %v: %w", err, driver.ErrUpstream) // P8
+		// A（RV-2026-11-18-01）：直接读入复用窗口缓冲，消除 io.ReadAll 中转的
+		// old+new 双份瞬时峰值（约 7 MiB/流，真机 4 并发流曾致内存耗尽崩溃）。
+		// 不变式：填充前先将 bufStart/bufEnd 置 0 使缓冲不可读；填充完成后持锁
+		// 一次性发布两个偏移。网络读取期间不持 mu（避免阻塞信号量/Close 路径）。
+		// U4a 串行契约下填充期间无其他 goroutine 访问本 Upstream，但不得依赖该
+		// 前提绕过「先置无效再填充」步骤。
+		u.mu.Lock()
+		if cap(u.buf) < length+1 {
+			u.buf = make([]byte, length+1) // 一次性预扩，避免 append 触发 growslice
 		}
+		u.bufStart, u.bufEnd = 0, 0
+		data := u.buf[:length+1]
+		u.mu.Unlock()
+
+		n := 0
+		for n < len(data) {
+			m, err := resp.Body.Read(data[n:])
+			n += m
+			if err != nil {
+				if err == io.EOF {
+					break // 读至 EOF 或 length+1 上限（与旧 LimitReader 语义等价）
+				}
+				return 0, fmt.Errorf("vault upstream: 读取失败: %v: %w", err, driver.ErrUpstream) // P8
+			}
+		}
+		data = data[:n]
 		// I1：实际收到的字节数少于 Content-Range 声称的区间长度 = 传输截断——
 		// 必须换签名重试，不得误报文件损坏（总额未知时跳过判定，P7）
-		if crTotal >= 0 && int64(len(data)) < crEnd-crStart+1 {
-			return 0, fmt.Errorf("vault upstream: 传输截断（%d/%d）: %w", len(data), crEnd-crStart+1, driver.ErrUpstream)
+		if crTotal >= 0 && int64(n) < crEnd-crStart+1 {
+			return 0, fmt.Errorf("vault upstream: 传输截断（%d/%d）: %w", n, crEnd-crStart+1, driver.ErrUpstream)
 		}
 		// U2：无论顺序/随机都写入缓冲（随机读替换旧缓冲，后续顺序读自然延续）
 		u.mu.Lock()
-		u.buf = append(u.buf[:0], data...)
+		u.buf = data
 		u.bufStart = off
-		u.bufEnd = off + int64(len(data))
+		u.bufEnd = off + int64(n)
 		u.mu.Unlock()
-		n := copy(p, data)
-		if n < len(p) {
+		c := copy(p, data)
+		if c < len(p) {
 			// P9：合法短窗口（CDN 返回比请求更短的区间且未到文件尾/总额未知）
-			// → 返回 (n, nil) 由 ReadAt 循环续拉，不得误报 EOF
+			// → 返回 (c, nil) 由 ReadAt 循环续拉，不得误报 EOF
 			if crTotal < 0 || crEnd+1 < crTotal {
-				return n, nil
+				return c, nil
 			}
-			return n, io.EOF
+			return c, io.EOF
 		}
-		return n, nil
+		return c, nil
 
 	case resp.StatusCode == http.StatusRequestedRangeNotSatisfiable:
 		// I2：off 恰等于（或超过）文件长度时按 io.ReaderAt 语义返回 EOF

@@ -10,7 +10,7 @@
 
 ## 进行中
 
-- **Vault v1.1.0 Phase 1**：天翼家庭站 + 移动站核心验收均通过（移动含 15 分钟签名自动刷新实测）；**移动站极限压测（2 播放器 + 下载）发现内存预算缺陷致崩溃**——根因已定位（每流实际 ~10 MiB vs 预算 6 MiB，4 并发流超路由器空闲内存），修复方案 A/B/C/D 已提交外部审核与 PM 确认（docs/review/2026-11-18-mobile-crash-report.md），**确认前不动代码**；55GB 压测（可选）、真机连续运行 ≥1 个月后升正式版；Phase 2 设计评审待启动
+- **Vault v1.1.0 Phase 1**：天翼家庭站 + 移动站核心验收均通过（移动含 15 分钟签名自动刷新实测）；**移动站极限压测崩溃缺陷已修复（RV-2026-11-18-01：A 直接读入窗口缓冲 + B 密文/明文复用 + E 取消不换签 + G 内存观测）**——待真机压测复验（gctrace + RSS 观察）；D（SetMemoryLimit 64 MiB）待实测后拍板；C（并发默认 4→3）暂缓；F（procd 守护脚本）已交付待 PM 安装；55GB 压测（可选）、真机连续运行 ≥1 个月后升正式版；Phase 2 设计评审待启动
 
 ## 已完成
 
@@ -23,6 +23,7 @@
 | 2026-11-16 | **闸门① 通过（PM 批准），v0.10.0 实现完成**：两阶段 CredentialUpdater + internal/admin 管理页（CSRF、html/template 转义）+ mobile 实现（临时客户端验证、按 __req 隔离、凭证/缓存代次防护）+ conf 原子写/0600/备份 + 3 处转义修复（buildHref 百分号编码、目录页/根页转义）。自查（/code-review high）15 条全部修复；`go vet` + `go test -race` 全绿；ARM64 交叉编译通过；实现期修订记录于 design.md §3.8 |
 | 2026-11-16 | **闸门③ 外部代码审核 RV-2026-11-16-03（结论：有条件通过）**：I1–I6 全部修复（更新串行化、LoadStrict 严格读取、目录 fsync、WriteCredential 测试、401×提交竞态测试、提交失败 .bak 回滚），P1–P9 全部落实（状态码、安全响应头、version v0.10.0、Stop 幂等、字段同步、编码去重、24h 门槛、文档修正、自查留痕表）；`go vet` + `go test -race` 全绿；ARM64 交叉编译通过 |
 | 2026-11-16 | **部署脚本完成（PM 拍板：审核后立即写、单独提交）**：scripts/deploy-prepare.sh（开发机编译+UPX+暂存，端到端跑通）+ scripts/deploy-router.sh（路由器拉取+备份+重启+健康检查+失败回滚，busybox ash 兼容，语法与健康检查解析本地验证通过）；体积观察项（铁律 10）：ARM64 原始 8,716,472 B → UPX 后 2,974,696 B（v0.9.2 基线 UPX 约 2.3 MB，增量主要来自 html/template 与凭证相关代码）；真机验证属闸门⑤ |
+| 2026-11-18 | **崩溃缺陷修复实施（RV-2026-11-18-01 处置 + PM 三原则落地）**：A `doRange` 直接读入复用窗口缓冲（消 ReadAll old+new 双份 ~7 MiB/流，4 条约束全落实）；B 解密块 cbuf+pbuf 复用（gcm.Open(dst)，每流 −2 MiB）；E `fetchRange` 入口/失败后判 ctx.Err() 不换签不重试 + webdav 取消类降 Debug + TestUpstreamCancelNoRefresh；G -debug 每 5 分钟 MemStats；F scripts/procd-mini-cloud.init（respawn 3600 5 5）+ deploy-router.sh procd 感知（stop/start/rollback 三处）；C 暂缓、D 待实测；`go vet` + `go test -race` 全绿（9 包）、ARM64 交叉编译通过；修复后每流 ~6 MiB（4 流 ≈ 24–28 MiB），对应 PM 三原则：①可崩但自愈且不拖垮路由（A+B+D+F）②内存最小化（A+B）③保留 4 并发支撑 2 路 4K 实测目标 |
 | 2026-11-18 | **移动站真机验收（闸门⑤）+ 崩溃缺陷定位**：部署 ✓、虚拟树 ✓、网页下载 ~10 MB/s（CPU 13.8%）✓、播放 + 拖动 ✓、**30+ 分钟连续播放 ✓（15 分钟签名自动刷新真机实测通过）**；极限压测（2 播放器 + 924 MB 下载 = 4 并发解密流）**应用崩溃**——SIGSEGV 位于 doRange 的 io.ReadAll 堆分配（日志 159–166 行），根因 = 每流内存预算漏账（ReadAll 中转 4 MiB + 密文块 1 MiB 未计入，实际 ~10 MiB/流 vs 预算 6 MiB），4 流峰值 50–60 MiB 超路由器 ~30 MB 空闲；修复方案 A（直接读入窗口缓冲）/B（密文缓冲复用）/C（默认并发 4→3）/D（可选 SetMemoryLimit）已写成报告 docs/review/2026-11-18-mobile-crash-report.md，**等审核 + PM 确认后动手**；PM 临时防线：config 加 `"max_streams": 2` |
 | 2026-11-17 | **Phase 1 代码评审闭环（RV-2026-11-17-11 通过）**：五轮共 36 条意见（RV-07 → RV-11）全部闭环；P19 升级机遗留默认 .bak 顺带刷新、P20 isDefaultBackup 字段级精确化（local-only 不再误伤）、P21 拒绝自愈错误带原因——三条「可选优化」已顺手全部落实（各约 5 行 + 测试）；`go vet` + `go test -race` 全绿、ARM64 交叉编译通过。**后续节奏：移动站真机验收 → 55GB 压测（可选）→ 真机运行 ≥1 个月 → Phase 2 设计评审** |
 | 2026-11-17 | **Phase 1 复核 RV-2026-11-17-10（通过 → 处置完成）**：RV-09 九题闭环确认；I8 默认配置不写 .bak + 默认备份拒绝自愈（防 admin/admin 回退）+ 两用例；I9 README 百度措辞与 P11 行为对齐（密文可下载副作用明示）；P14 不可 seek 流式驱动跳过测试；P15 .bak 损坏自动刷新；P16 备份刷新策略写明（只在缺失/损坏时）；P17 排序前提注释；P18 design §4.3 补第三态 |
@@ -295,3 +296,15 @@
 | P19 | 建议 | 升级机器遗留的「默认 .bak」不会被刷新，自愈被永久拒绝 | 已改 | ensureBackup：现有 .bak 是默认配置而当前配置非默认时，顺带刷新一次（恢复自愈能力）；补 TestEnsureBackupRefreshesLegacyDefault | 已闭环 | 通过 | 2026-11-17 |
 | P20 | 建议 | isDefaultBackup 语义偏宽（local-only 用户自愈不可用） | 已改 | 改为与 DefaultConfig() 字段级精确比较（admin/admin + 单个 local + 无 vault）；local-only 自定义配置可正常自愈；补 TestSelfHealLocalOnlyCustom | 已闭环 | 通过 | 2026-11-17 |
 | P21 | 建议 | 拒绝自愈返回的错误不带原因 | 已改 | fmt.Errorf("备份为默认配置，拒绝自愈…：%w", err)，stderr 与日志一致；测试断言错误文案 | 已闭环 | 通过 | 2026-11-17 |
+
+### RV-2026-11-18-01（崩溃缺陷评审，7 条）
+
+| 编号 | 级别 | 意见摘要 | 处置类别 | 处置说明 | 状态 | 复核 | 日期 |
+|---|---|---|---|---|---|---|---|
+| A | 重要 | doRange 读入中转产生瞬时双份（崩溃根因） | 已改 | 直接读入复用窗口缓冲；填充前置 bufStart/bufEnd=0、一次性预扩、截断判定用实际 n、网络读取不持 mu | 已实施 | 待真机压测复验 | 2026-11-18 |
+| B | 建议 | 解密块缓冲每块新建 | 已改（扩展） | cbuf+pbuf 复用（gcm.Open(dst[:0])），每流 −2 MiB + 降 GC 压力 | 已实施 | 待真机压测复验 | 2026-11-18 |
+| C | 建议 | max_streams 默认 4→3 | 暂缓 | 先 A+B 实测峰值再定；降默认属功能缩减 | 待实测 | | 2026-11-18 |
+| D | 可选 | SetMemoryLimit | 有条件采纳 | A+B 实测后加，建议 64 MiB + gctrace 验证 | 待实测后拍板 | | 2026-11-18 |
+| E | 重要 | ctx 取消被当上游异常触发换签重试 | 已改 | fetchRange 入口/失败后判 ctx.Err() 直接返回；webdav 取消类降 Debug；补 TestUpstreamCancelNoRefresh | 已实施 | 待复核 | 2026-11-18 |
+| F | 重要 | 崩溃即长期宕机（空窗 ~14 分钟） | 已交付 | scripts/procd-mini-cloud.init（respawn 3600 5 5，日志经 sh -c 重定向兼容健康检查）；deploy-router.sh 三处 procd 感知 | 待 PM 安装 | | 2026-11-18 |
+| G | 建议 | 缺运行时内存观测 | 已改 | -debug 下每 5 分钟 slog MemStats（HeapInuse/HeapSys/NumGC/goroutines） | 已实施 | 待复核 | 2026-11-18 |

@@ -27,6 +27,12 @@ type DecryptReader struct {
 	chunkIdx uint64 // 当前缓存块
 	chunk    []byte // 当前块明文（≤1 MiB）
 	hasChunk bool
+
+	// 复用缓冲（RV-2026-11-18-01 B：grow-only，消除每块 2 MiB 垃圾）：
+	// chunk 与 pbuf 别名——Read 在下次 loadChunk 前已把数据拷给调用方，串行契约下安全；
+	// 不得在 Read 之外持有 r.chunk 的引用。
+	cbuf []byte // 密文块读入缓冲
+	pbuf []byte // 明文块解密缓冲
 }
 
 // OpenDecryptReader 打开加密对象：
@@ -120,7 +126,10 @@ func (r *DecryptReader) loadChunk(idx uint64) error {
 	if cLen <= 0 {
 		return fmt.Errorf("vault: 块 %d 越界", idx)
 	}
-	buf := make([]byte, cLen)
+	if cap(r.cbuf) < int(cLen) {
+		r.cbuf = make([]byte, int(cLen))
+	}
+	buf := r.cbuf[:int(cLen)]
 	n, err := r.src.ReadAt(buf, int64(r.header.ChunkCipherOffset(idx)))
 	if err != nil && err != io.EOF {
 		return fmt.Errorf("vault: 读密文块 %d 失败: %w", idx, err)
@@ -128,10 +137,11 @@ func (r *DecryptReader) loadChunk(idx uint64) error {
 	if int64(n) != cLen {
 		return fmt.Errorf("vault: 密文块 %d 不完整: %d/%d（文件被截断）", idx, n, cLen)
 	}
-	plain, err := open(r.fileKey, r.header.ChunkNonce(idx), buf, r.header.ChunkAAD(idx))
+	plain, err := openInto(r.pbuf, r.fileKey, r.header.ChunkNonce(idx), buf, r.header.ChunkAAD(idx))
 	if err != nil {
 		return err
 	}
+	r.pbuf = plain // grow-only：容量不足时 openInto 返回新数组
 	r.chunkIdx = idx
 	r.chunk = plain
 	r.hasChunk = true

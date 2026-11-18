@@ -59,7 +59,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err != nil {
-		slog.Error("WebDAV error", "method", r.Method, "path", r.URL.Path, "err", err)
+		// E（RV-2026-11-18-01）：客户端断开/取消不是服务端故障，降为 Debug
+		//（播放器 seek/取消频繁发生，记 ERROR 会刷屏并掩盖真实异常）
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			slog.Debug("WebDAV 请求被取消", "method", r.Method, "path", r.URL.Path)
+		} else {
+			slog.Error("WebDAV error", "method", r.Method, "path", r.URL.Path, "err", err)
+		}
 	}
 	if status != 0 {
 		w.WriteHeader(status)

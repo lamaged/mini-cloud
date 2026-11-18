@@ -50,10 +50,9 @@ net/http.serveContent → CopyN(730 MB)    ← 播放/下载链路
 | 每流内存项 | 设计预算 | 实际 | 说明 |
 |---|---|---|---|
 | 顺序读窗口 `u.buf` | 4 MiB ✓ | 4 MiB | 持久 |
-| `doRange` 中 `io.ReadAll` 临时块 | ✗ **漏算** | ≤ 4 MiB+1 | 先整块读入 `data`，再 `append` 进窗口缓冲——两块**同时存在**，且 `data` 依赖 GC 回收（GC 滞后时跨周期叠加） |
-| 解密块明文 `r.chunk` | ✓ 含在 2 MiB | 1 MiB | 每块换新，旧块待 GC |
-| 密文块缓冲（reader.go:123） | ✗ **漏算** | 1 MiB+16 | `loadChunk` 每读一块 `make` 一个新缓冲，旧块待 GC |
-| **每流峰值** | **6 MiB** | **约 10–11 MiB** | |
+| `doRange` 中 `io.ReadAll` 中转 | ✗ **漏算** | **峰值约 7 MiB** | `ReadAll` 从 512 B 倍增，末次 `growslice` 时 old(≈3.2 MiB)+new(≈4.1 MiB) **同时存在**——崩溃点正是这次 `memmove` |
+| 解密块（明文+密文） | ✓ 含在 2 MiB | 2 MiB | design §4.1 的「解密块 2 MiB」本就含 cipher+plain（评审更正：密文块并非漏算） |
+| **每流峰值** | **6 MiB** | **~12–13 MiB** | 4 流 ≈ 48–52 MiB 瞬时，叠加基线后逼近路由器可用上限（评审复核值） |
 
 **4 流 × ~10 MiB ≈ 40–44 MiB，加上 Go 堆 GC 滞后余量（GOGC=100 堆翻倍）与基线占用，峰值 50–60 MiB**。路由器空闲仅 ~30 MB（93 MB cache 可回收但低内存内核下回收不及时，页错误先行触发 SIGSEGV）→ 内核无法为堆增长提供物理页 → 应用崩溃。
 
@@ -63,12 +62,15 @@ net/http.serveContent → CopyN(730 MB)    ← 播放/下载链路
 
 ## 3. 修复方案
 
-| 编号 | 方案 | 内容 | 收益 |
-|---|---|---|---|
-| **A** | 消除 4 MiB 瞬时双份（核心） | `doRange` 不再 `io.ReadAll` 中转：直接把网络数据读入 `u.buf` 的复用数组（预扩到 length+1，手工限长读循环，保持「读至 EOF/上限」语义），截断判定改用实际读入字节数 `n` | 每流 −4 MiB |
-| **B** | 密文块缓冲复用 | `DecryptReader` 增持 `cbuf []byte` 字段（增长即复用，单 goroutine 串行使用），替换 `loadChunk` 内每次 `make` | 每流 −1 MiB |
-| **C** | 默认并发上限 4 → 3 | `max_streams` 默认值改 3（config 仍可调高）。压测场景 = 2 播放器 + 1 下载恰为 3 流；4 流多为残留/异常连接 | 峰值 −6 MiB |
-| **D**（可选） | 运行时内存软上限 | `debug.SetMemoryLimit(48 MiB)`：Go 1.19+ 特性，堆接近上限时 GC 提前回收，防止内核 OOM 兜底（一行代码，无外部依赖） | 系统级保险 |
+| 编号 | 方案 | 评审结论（RV-2026-11-18-01） | 内容 | 收益 |
+|---|---|---|---|---|
+| **A** | 消除 ReadAll 中转双份（核心） | **采纳**（4 条实现约束：填充前置 bufStart/bufEnd=0、一次性预扩、截断判定用实际 n、读满 length+1 或 EOF；网络读取期间不持 mu） | `doRange` 直接读入 `u.buf` 复用数组 | 每流 −4~7 MiB |
+| **B** | 密文+明文缓冲复用 | **采纳并扩展**：明文缓冲一并复用（`gcm.Open(pbuf[:0],…)`） | `DecryptReader` 持 `cbuf`/`pbuf` grow-only 字段 | 每流 −2 MiB + 降 GC 压力 |
+| **C** | 默认并发上限 4 → 3 | **暂缓**：先 A+B 真机实测；降默认属功能缩减，保留配置可调 | — | — |
+| **D** | 运行时内存软上限 | **有条件采纳**：A+B 实测后再加；取值建议 **64 MiB**（48 在 4 流下余量偏薄），配 `GODEBUG=gctrace=1` 验证 | `debug.SetMemoryLimit` | 系统级保险 |
+| **E**（评审新增，重要） | ctx 取消被当上游异常 | **采纳**：`fetchRange` 入口/失败后判 `ctx.Err()` → 直接返回，不换签不重试；webdav 侧取消类错误降 Debug；补用例 | 见 §4 | 消除白刷签名与日志刷屏 |
+| **F**（评审新增，重要） | 崩溃即长期宕机 | **采纳**：procd respawn 提升为本批配套项（PM 原则①：可崩但必须自愈） | scripts/procd-mini-cloud.init | 崩溃秒级自动拉起 |
+| **G**（评审新增，建议） | 缺内存观测 | **采纳**：-debug 下每 5 分钟 slog MemStats（HeapInuse/HeapSys/NumGC） | main.go memStatsLogger | 下次问题分钟级定位 |
 
 **修复后预算**：每流持久 6 MiB（窗口 4 + 明文 1 + 密文复用 1）+ 瞬时 ~1 MiB（明文换块）≈ 7 MiB；**3 流 ≈ 21 MiB + 基线，相对 ~30 MB 空闲留有约 9 MB 余量**。
 
@@ -88,12 +90,15 @@ net/http.serveContent → CopyN(730 MB)    ← 播放/下载链路
 
 ## 5. 处置表
 
-| 编号 | 级别 | 摘要 | 处置类别 | 状态 |
-|---|---|---|---|---|
-| A | 重要 | doRange 读入中转产生 4 MiB/流瞬时双份 | 待审核 | 待处理 |
-| B | 建议 | loadChunk 密文缓冲每块新建 | 待审核 | 待处理 |
-| C | 建议 | max_streams 默认 4 → 3 | 待审核 | 待处理 |
-| D | 可选 | SetMemoryLimit 运行时内存软上限 | 待审核 | 待拍板 |
+| 编号 | 级别 | 摘要 | 处置类别 | 处置说明 | 状态 | 日期 |
+|---|---|---|---|---|---|---|
+| A | 重要 | doRange 读入中转产生瞬时双份 | 已改 | 直接读入复用窗口缓冲（4 条约束全落实） | 已实施，待真机压测复验 | 2026-11-18 |
+| B | 建议 | 解密块缓冲每块新建 | 已改 | cbuf+pbuf 复用（明文经 gcm.Open(dst) 一并复用） | 已实施，待真机压测复验 | 2026-11-18 |
+| C | 建议 | max_streams 默认 4 → 3 | 暂缓 | 先 A+B 实测峰值再定 | 待实测 | 2026-11-18 |
+| D | 可选 | SetMemoryLimit 内存软上限 | 有条件采纳 | A+B 实测后加，建议 64 MiB + gctrace 验证 | 待实测后拍板 | 2026-11-18 |
+| E | 重要 | ctx 取消被当上游异常触发换签重试 | 已改 | fetchRange 入口/失败后判 ctx.Err() 不换签不重试；webdav 取消类降 Debug；补 TestUpstreamCancelNoRefresh | 已实施 | 2026-11-18 |
+| F | 重要 | 崩溃即长期宕机 | 已交付 | scripts/procd-mini-cloud.init（respawn 3600 5 5）+ deploy-router.sh procd 感知 | 待 PM 安装 | 2026-11-18 |
+| G | 建议 | 缺运行时内存观测 | 已改 | -debug 下每 5 分钟 slog MemStats | 已实施 | 2026-11-18 |
 
 ---
 

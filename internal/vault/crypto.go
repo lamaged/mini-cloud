@@ -65,6 +65,12 @@ func seal(key, nonce, plaintext, aad []byte) ([]byte, error) {
 
 // open AES-256-GCM 解密；认证失败返回 ErrAuth 包装错误
 func open(key, nonce, ciphertext, aad []byte) ([]byte, error) {
+	return openInto(nil, key, nonce, ciphertext, aad)
+}
+
+// openInto 同 open，但明文写入 dst 的复用数组（dst[:0]，容量不足时自动扩容）——
+// 热路径（DecryptReader 逐块解密）每块省 1 MiB 分配（RV-2026-11-18-01 B）。
+func openInto(dst, key, nonce, ciphertext, aad []byte) ([]byte, error) {
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, fmt.Errorf("vault: AES 初始化失败: %w", err)
@@ -73,7 +79,7 @@ func open(key, nonce, ciphertext, aad []byte) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("vault: GCM 初始化失败: %w", err)
 	}
-	plain, err := gcm.Open(nil, nonce, ciphertext, aad)
+	plain, err := gcm.Open(dst[:0], nonce, ciphertext, aad)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrAuth, err)
 	}

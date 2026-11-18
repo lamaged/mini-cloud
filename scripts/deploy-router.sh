@@ -21,6 +21,7 @@ STAGING="${STAGING:-mini-cloud-staging}"
 INSTALL_DIR="${INSTALL_DIR:-/data/mini-cloud}"
 CONFIG="${CONFIG:-$INSTALL_DIR/config/config.json}"
 BINARY="mini-cloud-arm64-upx"
+PROCD_INIT="/etc/init.d/mini-cloud"
 NEW="/tmp/mini-cloud-new"
 LOG="$INSTALL_DIR/mini-cloud.log"
 PORT="8088"
@@ -35,8 +36,15 @@ LOG_START=0
 # start_daemon 脱离会话启动（P15：setsid + 显式重定向，行为可预期；回退普通后台。
 # 注：AX6 实测无 setsid，回退 & 启动并已证明可跨会话存活）
 start_daemon() {
-    cd "$INSTALL_DIR" || return 1
     touch "$LOG" 2>/dev/null || true
+    if [ -x "$PROCD_INIT" ]; then
+        # F（RV-2026-11-18-01）：已装 procd 守护 → 由 procd 启动（崩溃自动拉起）
+        "$PROCD_INIT" start
+        LOG_START=$(wc -l < "$LOG" 2>/dev/null)
+        LOG_START="${LOG_START:-0}"
+        return 0
+    fi
+    cd "$INSTALL_DIR" || return 1
     LOG_START=$(wc -l < "$LOG" 2>/dev/null)
     LOG_START="${LOG_START:-0}"
     if command -v setsid >/dev/null 2>&1; then
@@ -68,6 +76,10 @@ health_check() {
 # rollback_old 回滚旧版本并验证恢复（P16：回滚后同样健康检查，确认「已恢复」）
 rollback_old() {
     echo "==> 回滚旧版本"
+    if [ -x "$PROCD_INIT" ]; then
+        "$PROCD_INIT" stop
+        sleep 1
+    fi
     kill $(pgrep -f "$BINARY") 2>/dev/null || true
     sleep 1
     if [ ! -f "$INSTALL_DIR/$BINARY.prev" ]; then
@@ -108,6 +120,11 @@ if [ -f "$INSTALL_DIR/$BINARY" ]; then
 fi
 
 echo "==> 停止服务并确认旧进程退出"
+# F：装有 procd 守护时先走 init 脚本停止（否则 procd 会立即拉起新进程，旧进程永远杀不掉）
+if [ -x "$PROCD_INIT" ]; then
+    "$PROCD_INIT" stop
+    sleep 1
+fi
 # pgrep -f 按完整命令行匹配（AX6 已确认有 pgrep；二进制名超 15 字符时 killall 按 comm 会截断失效，I13）
 kill $(pgrep -f "$BINARY") 2>/dev/null || true
 i=0
