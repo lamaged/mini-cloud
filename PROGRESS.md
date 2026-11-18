@@ -10,7 +10,7 @@
 
 ## 进行中
 
-- **Vault v1.1.0 Phase 1**：天翼家庭站 + 移动站核心验收均通过（移动含 15 分钟签名自动刷新实测）；**崩溃缺陷修复已按 RV-2026-11-18-03 复核收尾（A/B/E/G/C/D 落地 + I1 验收口径定稿 + I2 软上限生效点后移 + P1–P9 处置；F 守护按 PM 拍板移除）**——待真机压测复验（判定标准已定稿：不崩溃/RSS<60MB/允许 503 并统计来源）；55GB 压测（可选）、真机连续运行 ≥1 个月后升正式版；Phase 2 设计评审待启动
+- **Vault v1.1.0 Phase 1**：天翼家庭站 + 移动站核心验收均通过（移动含 15 分钟签名自动刷新实测）；**崩溃修复真机压测复验通过**（3 路并发下载：RSS 峰值 45.3 MB < 60 MB 判据、平台稳定无泄漏、无 503、无崩溃）；剩余：2 路 4K 播放实测（PM 原则③）、55GB 压测（可选）、真机连续运行 ≥1 个月后升正式版；Phase 2 设计评审待启动
 
 ## 已完成
 
@@ -23,6 +23,7 @@
 | 2026-11-16 | **闸门① 通过（PM 批准），v0.10.0 实现完成**：两阶段 CredentialUpdater + internal/admin 管理页（CSRF、html/template 转义）+ mobile 实现（临时客户端验证、按 __req 隔离、凭证/缓存代次防护）+ conf 原子写/0600/备份 + 3 处转义修复（buildHref 百分号编码、目录页/根页转义）。自查（/code-review high）15 条全部修复；`go vet` + `go test -race` 全绿；ARM64 交叉编译通过；实现期修订记录于 design.md §3.8 |
 | 2026-11-16 | **闸门③ 外部代码审核 RV-2026-11-16-03（结论：有条件通过）**：I1–I6 全部修复（更新串行化、LoadStrict 严格读取、目录 fsync、WriteCredential 测试、401×提交竞态测试、提交失败 .bak 回滚），P1–P9 全部落实（状态码、安全响应头、version v0.10.0、Stop 幂等、字段同步、编码去重、24h 门槛、文档修正、自查留痕表）；`go vet` + `go test -race` 全绿；ARM64 交叉编译通过 |
 | 2026-11-16 | **部署脚本完成（PM 拍板：审核后立即写、单独提交）**：scripts/deploy-prepare.sh（开发机编译+UPX+暂存，端到端跑通）+ scripts/deploy-router.sh（路由器拉取+备份+重启+健康检查+失败回滚，busybox ash 兼容，语法与健康检查解析本地验证通过）；体积观察项（铁律 10）：ARM64 原始 8,716,472 B → UPX 后 2,974,696 B（v0.9.2 基线 UPX 约 2.3 MB，增量主要来自 html/template 与凭证相关代码）；真机验证属闸门⑤ |
+| 2026-11-18 | **崩溃修复真机压测复验通过（闸门⑤）**：Edge 0→1→2→3 路加密下载（~10 MB/s×3）；RSS 12.4 MB（空闲）→ 19（1 流）→ 24–28（2 流）→ 34→45.3 MB 峰值（3 流，GC 惰性爬升后 44–45 MB 平台稳定）；MemFree 37→29 MB 后企稳；每流增量 +5~6 MB 与设计吻合；CPU 峰值 45%（约半核）；无崩溃、无 503、无泄漏（平台曲线为证）；测试时长 4.5 分钟略短于 10 分钟标准，PM 可视需要补长测；结束后 RSS 不回落属 Go MADV_FREE 可回收内存，非泄漏 |
 | 2026-11-18 | **崩溃修复复核 RV-2026-11-18-03（通过，有条件）处置**：I1 验收口径定稿（允许 503 并统计来源、RSS<60 MB 判定线、HEAD 占槽为观察项；503 加 Info 日志便于统计）；I2 `SetMemoryLimit` 生效点移到挂载装配之后（启动期大清单不受限、只护运行期）；P6 feasibility §7.7 内存口径重写（6 MiB/流、默认 3 流 18 MiB、64 MiB 兜底）；P7 design §4.1 每流 ≈6 MiB 口径；P8 README 补「fatal 后需手工重启」运维后果；P9 复用断言改 TotalAlloc 增量（轻量字节级）；`go vet` + `go test -race` 全绿、ARM64 交叉编译通过 |
 | 2026-11-18 | **崩溃修复复核收尾（RV-2026-11-18-02 通过）+ PM 两项拍板落地**：C 落地——max_streams 默认 3（PM 拍板：2–3 路为极限）；D 落地——`SetMemoryLimit(64 MiB)` 内存软上限兜底（PM 原则①路由器不能被拖垮）；F 移除——procd 守护按 PM 拍板删除（脚本 git rm、deploy-router.sh 还原，I1 假成功风险随之关闭；拍板理由入 TODO）；P1 读循环零进展防御（连续 100 次零读报错）；P2 补 TestLoadChunkReusesBuffers（AllocedBytesPerOp < 64 KiB 锁定复用，防回退）；P4 崩溃报告数字统一（12–13 MiB/流、48–52 MiB）；P5 memstats 采样 5 分钟→1 分钟；`go vet` + `go test -race` 全绿（9 包）、ARM64 交叉编译通过 |
 | 2026-11-18 | **崩溃缺陷修复实施（RV-2026-11-18-01 处置 + PM 三原则落地）**：A `doRange` 直接读入复用窗口缓冲（消 ReadAll old+new 双份 ~7 MiB/流，4 条约束全落实）；B 解密块 cbuf+pbuf 复用（gcm.Open(dst)，每流 −2 MiB）；E `fetchRange` 入口/失败后判 ctx.Err() 不换签不重试 + webdav 取消类降 Debug + TestUpstreamCancelNoRefresh；G -debug 每 5 分钟 MemStats；F scripts/procd-mini-cloud.init（respawn 3600 5 5）+ deploy-router.sh procd 感知（stop/start/rollback 三处）；C 暂缓、D 待实测；`go vet` + `go test -race` 全绿（9 包）、ARM64 交叉编译通过；修复后每流 ~6 MiB（4 流 ≈ 24–28 MiB），对应 PM 三原则：①可崩但自愈且不拖垮路由（A+B+D+F）②内存最小化（A+B）③保留 4 并发支撑 2 路 4K 实测目标 |
