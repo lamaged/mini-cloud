@@ -711,12 +711,12 @@ master key (32B)
 - 每流：1 MiB 密文 + 1 MiB 明文 + 网络缓冲 ≈ 3–5 MB。
 - 4 路并发 ≈ 12–20 MB。
 - 加 manifest 和 Go runtime，总内存约 60–100 MB。
-- `max_streams = 4` 为**全局信号量**（含获取超时），超出返回 503 防止 OOM；不做按挂载计数。
+- `max_streams`（默认 3，PM 拍板 2026-11-18：2–3 路为极限）为**全局信号量**（含获取超时），超出返回 503 防止 OOM；不做按挂载计数。
 - URL 并发刷新锁用标准库 mutex 自实现（依赖铁律禁止引入外部库，如 `golang.org/x/sync/singleflight`）。
 
 ### 7.8 配置示例
 
-已实现字段：`enabled`、`key_file`、`paths`、`max_streams`（0 = 默认 4）。Phase 2 预留（当前未实现、会被忽略）：`manifest`（实际固定 `_mc/manifest.mcf`）、`chunk_size`（实际固定 1 MiB）、`cache_mb`（P20：JSON 示例保持合法，标注移出代码块）。
+已实现字段：`enabled`、`key_file`、`paths`、`max_streams`（0 = 默认 3）。Phase 2 预留（当前未实现、会被忽略）：`manifest`（实际固定 `_mc/manifest.mcf`）、`chunk_size`（实际固定 1 MiB）、`cache_mb`（P20：JSON 示例保持合法，标注移出代码块）。
 
 **`vault.paths` 格式与匹配规则（v1.2 定稿）**：无前导斜杠的目录名列表（挂载内相对路径的首段）。Handler 已 strip 掉 `/<mount>` 前缀，Vault 收到的是挂载内相对路径，仅比较首段字符串，**大小写敏感**（与原盘目录名一致）。
 
@@ -728,7 +728,7 @@ master key (32B)
     "paths": ["backup", "Archive"],
     "manifest": "_mc/manifest.mcf",
     "chunk_size": 1048576,
-    "max_streams": 4,
+    "max_streams": 3,
     "cache_mb": 16
   }
 }

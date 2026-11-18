@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	rtdebug "runtime/debug"
 	"strings"
 	"sync"
 	"syscall"
@@ -55,7 +56,12 @@ func main() {
 	}
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel})))
 
-	// G（RV-2026-11-18-01）：-debug 下每 5 分钟打一次内存观测（压测定位内存问题用）
+	// D（RV-2026-11-18-01/02）：内存软上限——堆接近 64 MiB 时 GC 提前介入，
+	// 防止低内存路由器上堆失控触发内核 OOM（PM 原则①：路由器不能被拖垮）。
+	// 3 并发解密流 live ≈ 18 MiB + 基线，64 MiB 仅作失控兜底，正常播放不触发。
+	rtdebug.SetMemoryLimit(64 << 20)
+
+	// G（RV-2026-11-18-01/02）：-debug 下每分钟打一次内存观测（压测定位内存问题用；P5 由 5 分钟加密）
 	if *debug {
 		go memStatsLogger()
 	}
@@ -468,9 +474,9 @@ func (r *responseLogger) Write(b []byte) (int, error) {
 	return n, err
 }
 
-// memStatsLogger -debug 模式下的内存观测（G：HeapInuse/HeapSys/NumGC/goroutine 数，5 分钟一次）
+// memStatsLogger -debug 模式下的内存观测（G：HeapInuse/HeapSys/NumGC/goroutine 数，每分钟一次）
 func memStatsLogger() {
-	t := time.NewTicker(5 * time.Minute)
+	t := time.NewTicker(1 * time.Minute)
 	defer t.Stop()
 	var m runtime.MemStats
 	for range t.C {

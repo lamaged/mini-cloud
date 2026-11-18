@@ -23,7 +23,7 @@ type VaultConfig struct {
 	Enabled    bool     `json:"enabled"`     // 总开关
 	KeyFile    string   `json:"key_file"`    // master key 文件路径（32 字节，永不传网盘）
 	Paths      []string `json:"paths"`       // vault 根目录名列表（无前导斜杠，如 ["backup"]）
-	MaxStreams int      `json:"max_streams"` // 全局并发解密流上限（0 = 默认 4）
+	MaxStreams int      `json:"max_streams"` // 全局并发解密流上限（0 = 默认 3；PM 拍板 2–3 路极限）
 }
 
 // ServerConfig WebDAV 服务配置

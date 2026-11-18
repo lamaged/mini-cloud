@@ -41,6 +41,48 @@ func encryptTestObject(t *testing.T, master []byte, fileID [16]byte, plain []byt
 	return buf.Bytes(), h, shaHex
 }
 
+// TestLoadChunkReusesBuffers P2（RV-2026-11-18-02）：块加载复用 cbuf/pbuf——
+// 预热后每次跨块加载不得出现 MiB 级分配（用 Benchmark 的 AllocedBytesPerOp 锁定，
+// 防将来改回每块 make 无人发现）
+func TestLoadChunkReusesBuffers(t *testing.T) {
+	master := bytes.Repeat([]byte{0xAA}, 32)
+	fileID, _ := NewFileID()
+	plain := make([]byte, 3*(1<<20)) // 3 块，交替读触发每次 loadChunk
+	rand.Read(plain)
+	cipher, h, _ := encryptTestObject(t, master, fileID, plain, "/a.bin")
+
+	cs := &countingSource{rs: bytes.NewReader(cipher), closer: io.NopCloser(nil)}
+	r, err := OpenDecryptReader(cs, master, fileID, h.HeaderHash())
+	if err != nil {
+		t.Fatalf("OpenDecryptReader: %v", err)
+	}
+	defer r.Close()
+
+	// 预热：cbuf/pbuf 扩容到位
+	if _, err := r.Seek(2*(1<<20), io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadFull(r, make([]byte, 16)); err != nil {
+		t.Fatal(err)
+	}
+
+	buf := make([]byte, 16)
+	res := testing.Benchmark(func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			off := int64((i % 3) * (1 << 20)) // 0/1/2 块交替，每轮一次 loadChunk
+			if _, err := r.Seek(off, io.SeekStart); err != nil {
+				b.Fatal(err)
+			}
+			if _, err := io.ReadFull(r, buf); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	if res.AllocedBytesPerOp() > 64<<10 {
+		t.Errorf("每块加载分配应 < 64 KiB（复用缓冲），实际 %d B/op", res.AllocedBytesPerOp())
+	}
+}
+
 func TestDecryptReaderFullRead(t *testing.T) {
 	master := bytes.Repeat([]byte{0xAA}, 32)
 	fileID, _ := NewFileID()

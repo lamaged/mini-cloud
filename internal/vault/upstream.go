@@ -314,6 +314,7 @@ func (u *Upstream) doRange(ctx context.Context, p []byte, off int64, length int)
 		u.mu.Unlock()
 
 		n := 0
+		zero := 0 // P1（RV-2026-11-18-02）：连续零字节读取计数（io.Copy 同款防死循环，阈值 100）
 		for n < len(data) {
 			m, err := resp.Body.Read(data[n:])
 			n += m
@@ -322,6 +323,14 @@ func (u *Upstream) doRange(ctx context.Context, p []byte, off int64, length int)
 					break // 读至 EOF 或 length+1 上限（与旧 LimitReader 语义等价）
 				}
 				return 0, fmt.Errorf("vault upstream: 读取失败: %v: %w", err, driver.ErrUpstream) // P8
+			}
+			if m == 0 {
+				zero++
+				if zero >= 100 {
+					return 0, fmt.Errorf("vault upstream: 连续 %d 次零字节读取（上游连接异常）: %w", zero, driver.ErrUpstream)
+				}
+			} else {
+				zero = 0
 			}
 		}
 		data = data[:n]

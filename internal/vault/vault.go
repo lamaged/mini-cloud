@@ -91,7 +91,9 @@ var httpClient = &http.Client{Timeout: 90 * time.Second}
 // New 创建 Vault 包装层（签名以本实现为准：vault.New(cached, raw, master, cfg)）
 func New(cached driver.Reader, raw driver.Driver, master []byte, cfg Config) *Vault {
 	if cfg.MaxStreams <= 0 {
-		cfg.MaxStreams = 4
+		// PM 拍板 2026-11-18：2–3 路并发为极限（对应 2 播放器 + 1 下载场景），
+		// 默认 3；config 可调高（每流 ≈ 6 MiB，调高前先核算路由器空闲内存）
+		cfg.MaxStreams = 3
 	}
 	return &Vault{
 		cached: cached,
