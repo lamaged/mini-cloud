@@ -24,3 +24,4 @@ env.sh
 *.exe
 *.test
 *.out
+docs/review/*.log
