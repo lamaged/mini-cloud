@@ -708,9 +708,9 @@ master key (32B)
 
 ### 7.7 并发与内存
 
-- 每流：1 MiB 密文 + 1 MiB 明文 + 网络缓冲 ≈ 3–5 MB。
-- 4 路并发 ≈ 12–20 MB。
-- 加 manifest 和 Go runtime，总内存约 60–100 MB。
+- 每流 ≈ 6 MiB：顺序窗口 4 MiB + 密文块 1 MiB + 明文块 1 MiB（RV-2026-11-18 A/B 缓冲复用后无瞬时双份，实测口径 6.02 MiB/流）。
+- 默认 3 路并发 ≈ 18 MiB（PM 拍板 2026-11-18：2–3 路为极限）。
+- 加 manifest 与 Go runtime 基线，运行期总内存约 25–35 MB；另设 64 MiB 内存软上限兜底（`debug.SetMemoryLimit`，挂载装配后生效，防内核 OOM——见崩溃缺陷报告 docs/review/2026-11-18-mobile-crash-report.md）。
 - `max_streams`（默认 3，PM 拍板 2026-11-18：2–3 路为极限）为**全局信号量**（含获取超时），超出返回 503 防止 OOM；不做按挂载计数。
 - URL 并发刷新锁用标准库 mutex 自实现（依赖铁律禁止引入外部库，如 `golang.org/x/sync/singleflight`）。
 

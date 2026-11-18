@@ -56,11 +56,6 @@ func main() {
 	}
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel})))
 
-	// D（RV-2026-11-18-01/02）：内存软上限——堆接近 64 MiB 时 GC 提前介入，
-	// 防止低内存路由器上堆失控触发内核 OOM（PM 原则①：路由器不能被拖垮）。
-	// 3 并发解密流 live ≈ 18 MiB + 基线，64 MiB 仅作失控兜底，正常播放不触发。
-	rtdebug.SetMemoryLimit(64 << 20)
-
 	// G（RV-2026-11-18-01/02）：-debug 下每分钟打一次内存观测（压测定位内存问题用；P5 由 5 分钟加密）
 	if *debug {
 		go memStatsLogger()
@@ -236,6 +231,12 @@ func main() {
 		})
 		slog.Info("挂载云盘", "name", m.Name, "prefix", m.Prefix)
 	}
+
+	// D（RV-2026-11-18-01/02，I2 修正）：内存软上限——堆接近 64 MiB 时 GC 提前介入，
+	// 防止低内存路由器上堆失控触发内核 OOM（PM 原则①：路由器不能被拖垮）。
+	// 放在挂载装配（含 manifest 解析）之后：启动期大清单的瞬时峰值不受限，
+	// 只护运行期（本次崩溃场景）；3 并发解密流 live ≈ 18 MiB + 基线，正常播放不触发。
+	rtdebug.SetMemoryLimit(64 << 20)
 
 	// 凭证生效后：清空该挂载的目录/链接缓存，避免旧账号数据残留（30s 目录 / 10min 链接）
 	adminHandler.OnCommitted = func(mountName string) {

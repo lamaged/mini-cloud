@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -67,19 +68,22 @@ func TestLoadChunkReusesBuffers(t *testing.T) {
 	}
 
 	buf := make([]byte, 16)
-	res := testing.Benchmark(func(b *testing.B) {
-		for i := 0; i < b.N; i++ {
-			off := int64((i % 3) * (1 << 20)) // 0/1/2 块交替，每轮一次 loadChunk
-			if _, err := r.Seek(off, io.SeekStart); err != nil {
-				b.Fatal(err)
-			}
-			if _, err := io.ReadFull(r, buf); err != nil {
-				b.Fatal(err)
-			}
+	// P9（RV-2026-11-18-03）：改用 TotalAlloc 增量（轻量、字节级）——
+	// 若改回每块 make，3 次跨块加载将多分配 ≥ 3 MiB，立刻可见
+	var m1, m2 runtime.MemStats
+	runtime.ReadMemStats(&m1)
+	for i := 0; i < 3; i++ {
+		off := int64(i) * (1 << 20) // 0/1/2 块各一次，每轮一次 loadChunk
+		if _, err := r.Seek(off, io.SeekStart); err != nil {
+			t.Fatal(err)
 		}
-	})
-	if res.AllocedBytesPerOp() > 64<<10 {
-		t.Errorf("每块加载分配应 < 64 KiB（复用缓冲），实际 %d B/op", res.AllocedBytesPerOp())
+		if _, err := io.ReadFull(r, buf); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runtime.ReadMemStats(&m2)
+	if d := m2.TotalAlloc - m1.TotalAlloc; d > 256<<10 {
+		t.Errorf("3 次块加载分配应 < 256 KiB（复用缓冲），实际 %d B", d)
 	}
 }
 

@@ -107,6 +107,8 @@ func (h *Handler) handleGetHead(w http.ResponseWriter, r *http.Request) (int, er
 		}
 		if errors.Is(err, driver.ErrTooManyStreams) {
 			// 并发解密流超上限（design §7.7：超出返回 503 防止 OOM）
+			// I1（RV-2026-11-18-03）：记 Info 供压测统计 503 次数与来源（HEAD 探测/seek 二次连接/真第 4 路）
+			slog.Info("并发解密流超上限（503）", "path", reqPath)
 			return http.StatusServiceUnavailable, nil
 		}
 		if errors.Is(err, driver.ErrUpstream) {
