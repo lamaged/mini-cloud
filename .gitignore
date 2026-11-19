@@ -25,3 +25,6 @@ env.sh
 *.test
 *.out
 docs/review/*.log
+
+# 真机验收日志（运行时数据，本地留存不入库）
+test_log/
