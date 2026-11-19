@@ -195,7 +195,10 @@ func (h *Handler) render(w http.ResponseWriter, status int, message, errMsg stri
 
 	for i := range h.mounts {
 		m := &h.mounts[i]
-		fm := formMount{Name: m.Name, Prefix: m.Prefix, Fields: m.Fields, CSRF: h.newToken()}
+		fm := formMount{Name: m.Name, Prefix: m.Prefix, Fields: m.Fields}
+		if len(m.Fields) > 0 {
+			fm.CSRF = h.newToken() // 仅凭证挂载需要 CSRF（无表单的状态卡不产生提交）
+		}
 		if m.Warning != nil {
 			fm.Warn = m.Warning()
 		}
@@ -237,6 +240,7 @@ a{color:#0366d6}
 <div class="card">
 <h2>{{.Name}} <span class="path">{{.Prefix}}/</span></h2>
 {{if .Warn}}<p class="warn">当前状态：{{.Warn}}</p>{{else}}<p class="warn" style="color:#1b5e20;background:#e8f5e9">当前状态：正常</p>{{end}}
+{{if .Fields}}
 <form method="POST" action="/admin/update">
 <input type="hidden" name="csrf" value="{{.CSRF}}">
 <input type="hidden" name="mount" value="{{.Name}}">
@@ -246,6 +250,7 @@ a{color:#0366d6}
 {{end}}
 <button type="submit">更新</button>
 </form>
+{{end}}
 </div>
 {{end}}
 <p><a href="/">返回导航页</a></p>

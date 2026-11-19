@@ -82,16 +82,18 @@ func main() {
 
 	// 管理页：收集支持 CredentialUpdater 的挂载（断言原始驱动，不是包装层）
 	// 挂载告警双通道（design §5.2 + 铁律 7）：驱动告警（HealthReporter 对原始驱动断言）
-	// + Vault 告警（具体方法 Warning()，在装配循环里注入）——两者合并展示
+	// + Vault 告警（具体方法 Warning()，在装配循环里注入）——两者合并展示。
+	// 全部挂载都入管理页：凭证挂载带更新表单，其余为「状态观察」卡（无表单）。
+	// （真机发现：天翼无 CredentialUpdater 曾导致其 vault 告警无处显示）
 	vaultWarn := make(map[string]func() string)
 	var adminMounts []admin.Mount
 	for i := range mounts {
 		m := &mounts[i]
-		up, ok := m.Drv.(driver.CredentialUpdater)
-		if !ok {
-			continue
+		am := admin.Mount{Name: m.Name, Prefix: m.Prefix}
+		if up, ok := m.Drv.(driver.CredentialUpdater); ok {
+			am.Fields = up.CredentialFields()
+			am.Update = up
 		}
-		am := admin.Mount{Name: m.Name, Prefix: m.Prefix, Fields: up.CredentialFields(), Update: up}
 		am.Warning = func() string {
 			var parts []string
 			if hr, ok := m.Drv.(driver.HealthReporter); ok {
