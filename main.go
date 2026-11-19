@@ -220,7 +220,7 @@ func main() {
 		m := &mounts[i]
 		cached := fs.NewCachedReader(fs.NewRetryReader(m.Drv))
 		var drv webdav.Reader = cached
-		if vaultCfg != nil {
+		if vaultCfg != nil && vaultSupported(m.Drv) {
 			v := vault.New(cached, m.Drv, vaultKey, *vaultCfg)
 			vaultWarn[m.Name] = v.Warning // 双通道：vault 告警注入管理页（§5.2）
 			if err := v.Init(ctx); err != nil {
@@ -487,6 +487,17 @@ func (r *responseLogger) Write(b []byte) (int, error) {
 	n, err := r.ResponseWriter.Write(b)
 	r.size += int64(n)
 	return n, err
+}
+
+// vaultSupported 铁律 2（加密仅支持天翼/移动）：不支持的驱动（百度等）不装配 Vault——
+// 避免对无意义的路径做容器扫描，产生「容器扫描失败」类告警噪声（真机发现 2026-11-19）。
+// 按驱动名允许列表判定；local 保留（Phase 0 开发/测试路径）。
+func vaultSupported(d driver.Driver) bool {
+	switch d.Name() {
+	case "189Personal", "189Family", "MobileCloudDrive", "local":
+		return true
+	}
+	return false
 }
 
 // memStatsLogger -debug 模式下的内存观测（G：HeapInuse/HeapSys/NumGC/goroutine 数，每分钟一次）

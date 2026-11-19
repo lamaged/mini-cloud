@@ -1,9 +1,12 @@
 package main
 
 import (
+	"context"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"mini-cloud/internal/model"
 )
 
 func TestXMLTextEscapes(t *testing.T) {
@@ -56,4 +59,36 @@ func TestServeRootIndexNoAdminLink(t *testing.T) {
 	if strings.Contains(rec.Body.String(), "/admin") {
 		t.Error("admin link should be absent when hasAdmin=false")
 	}
+}
+
+// TestVaultSupported 铁律 2：加密仅装配天翼/移动（百度等不参与，防扫描告警噪声）
+func TestVaultSupported(t *testing.T) {
+	tests := []struct {
+		name string
+		want bool
+	}{
+		{"189Personal", true},
+		{"189Family", true},
+		{"MobileCloudDrive", true},
+		{"local", true},
+		{"BaiduNetdisk", false},
+	}
+	for _, tt := range tests {
+		d := &nameOnlyDriver{name: tt.name}
+		if got := vaultSupported(d); got != tt.want {
+			t.Errorf("vaultSupported(%q) = %v, want %v", tt.name, got, tt.want)
+		}
+	}
+}
+
+// nameOnlyDriver 仅提供 Name 的假驱动
+type nameOnlyDriver struct{ name string }
+
+func (d *nameOnlyDriver) Name() string                                   { return d.name }
+func (d *nameOnlyDriver) Init(ctx context.Context) error                 { return nil }
+func (d *nameOnlyDriver) List(ctx context.Context, p string) ([]model.Obj, error) {
+	return nil, nil
+}
+func (d *nameOnlyDriver) Link(ctx context.Context, p string) (*model.Link, error) {
+	return nil, nil
 }

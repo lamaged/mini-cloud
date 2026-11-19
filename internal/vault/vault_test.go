@@ -832,3 +832,27 @@ func TestContainerLazyScanTrigger(t *testing.T) {
 	}
 }
 
+
+// TestContainerWarningClears 告警为本轮状态：问题修复后下轮扫描自动清除（真机发现）
+func TestContainerWarningClears(t *testing.T) {
+	f, master, _ := buildTestVault(t, true)
+	f.files["backup/dir2/子/_mc/manifest.mcf"] = []byte("nested")
+	v := newTestVault(t, f, master, 4)
+	defer v.Stop()
+	if !strings.Contains(v.Warning(), "更深层 _mc") {
+		t.Fatalf("应检测到深层 _mc 告警，got %q", v.Warning())
+	}
+	// 修复：删掉深层 _mc，dir2 改为正规单元（复用 dir1 的 manifest 与对象）
+	objID1 := EncodeFileID([16]byte{7, 7, 7, 7})
+	delete(f.files, "backup/dir2/子/_mc/manifest.mcf")
+	f.files["backup/dir2/_mc/manifest.mcf"] = f.files["backup/dir1/_mc/manifest.mcf"]
+	f.files["backup/dir2/"+ObjectPath(objID1)] = f.files["backup/dir1/"+ObjectPath(objID1)]
+	v.scan(context.Background(), "backup", false)
+	if w := v.Warning(); strings.Contains(w, "更深层 _mc") {
+		t.Errorf("问题修复后告警应清除，got %q", w)
+	}
+	// dir2 成为加密单元
+	if _, err := v.List(context.Background(), "/backup/dir2"); err != nil {
+		t.Errorf("dir2 应成为加密单元: %v", err)
+	}
+}

@@ -193,6 +193,21 @@ func (v *Vault) scan(ctx context.Context, name string, initial bool) {
 		v.setContainerWarning(name, fmt.Sprintf("容器扫描失败（%s）", err))
 		return
 	}
+	// 容器告警为「本轮状态」：无新问题即清空（防旧警告残留，真机发现 2026-11-19）
+	var cwMu sync.Mutex
+	var cwarns []string
+	cwarn := func(msg string) {
+		cwMu.Lock()
+		cwarns = append(cwarns, msg)
+		cwMu.Unlock()
+	}
+	defer func() {
+		v.mu.Lock()
+		if c := v.containers[name]; c != nil {
+			c.warning = strings.Join(cwarns, "；")
+		}
+		v.mu.Unlock()
+	}()
 	var dirs []string
 	for i := range objs {
 		if objs[i].IsDir {
@@ -200,7 +215,7 @@ func (v *Vault) scan(ctx context.Context, name string, initial bool) {
 		}
 	}
 	if len(dirs) > maxSubDirs {
-		v.setContainerWarning(name, fmt.Sprintf("容器下子目录过多（%d > %d），跳过扫描", len(dirs), maxSubDirs))
+		cwarn(fmt.Sprintf("容器下子目录过多（%d > %d），跳过扫描", len(dirs), maxSubDirs))
 		return
 	}
 	v.pruneRoots(name, dirs)
@@ -210,7 +225,7 @@ func (v *Vault) scan(ctx context.Context, name string, initial bool) {
 	for _, d := range dirs {
 		if strings.HasPrefix(d, "_") {
 			// 保留名（旧结构 _mc 等）：屏蔽 + 告警（§5.1，防旧结构密文泄露）
-			v.setContainerWarning(name, fmt.Sprintf("发现保留名目录 %q（旧结构？已屏蔽，请迁移到 <名字>/_mc）", d))
+			cwarn(fmt.Sprintf("发现保留名目录 %q（旧结构？已屏蔽，请迁移到 <名字>/_mc）", d))
 			continue
 		}
 		if v.isDisabled() {
@@ -219,7 +234,9 @@ func (v *Vault) scan(ctx context.Context, name string, initial bool) {
 		wg.Add(1)
 		go func(d string) {
 			defer wg.Done()
-			v.refreshRoot(bg, name, d)
+			if w := v.refreshRoot(bg, name, d); w != "" {
+				cwarn(w)
+			}
 		}(d)
 	}
 	wg.Wait()
@@ -234,9 +251,10 @@ func (v *Vault) isDisabled() bool {
 
 // refreshRoot 扫描单个子目录（加密单元）：判定 _mc 存在 → 读清单 → 摘要比对 → 原子重建。
 // 失败隔离（I3）：单目录失败记告警、跳过，绝不拖累整体；下周期重试。
-func (v *Vault) refreshRoot(ctx context.Context, cont, dir string) {
+// refreshRoot 扫描单个子目录；返回容器级告警（"" 表示无；供 scan 累积为本轮状态）
+func (v *Vault) refreshRoot(ctx context.Context, cont, dir string) string {
 	if v.isDisabled() {
-		return // P3：禁用后不再做无谓的网络调用
+		return "" // P3：禁用后不再做无谓的网络调用
 	}
 	mctx, cancel := context.WithTimeout(ctx, manifestReadTimeout)
 	defer cancel()
@@ -244,8 +262,7 @@ func (v *Vault) refreshRoot(ctx context.Context, cont, dir string) {
 	// 判定：子目录里是否有 _mc（先 List 一层，避免把「无 _mc」误判为单元）
 	objs, err := v.raw.List(mctx, "/"+cont+"/"+dir)
 	if err != nil {
-		v.setContainerWarning(cont, fmt.Sprintf("子目录 %s 读取失败，跳过本轮（%s）", dir, err))
-		return
+		return fmt.Sprintf("子目录 %s 读取失败，跳过本轮（%s）", dir, err)
 	}
 	hasMc := false
 	var subdirs []string
@@ -260,10 +277,9 @@ func (v *Vault) refreshRoot(ctx context.Context, cont, dir string) {
 		}
 	}
 	if !hasMc {
-		// 非加密目录：摘除旧树（若有）；P7 深层 _mc 检查
+		// 非加密目录：摘除旧树（若有）；P7 深层 _mc 检查（发现即返回容器告警）
 		v.removeRoot(cont, dir)
-		v.checkNestedMc(mctx, cont, dir, subdirs)
-		return
+		return v.checkNestedMc(mctx, cont, dir, subdirs)
 	}
 
 	manifestPath := path.Join(cont, dir, "_mc", "manifest.mcf")
@@ -278,7 +294,7 @@ func (v *Vault) refreshRoot(ctx context.Context, cont, dir string) {
 			v.setRootTree(cont, dir, emptyRoot(cont, dir))
 		}
 		v.setRootWarning(cont, dir, fmt.Sprintf("manifest 不可读，%s", condStr(exists, "保留旧树，下周期重试", "虚拟视图为空目录")))
-		return
+		return ""
 	}
 
 	var src io.ReadCloser
@@ -288,7 +304,7 @@ func (v *Vault) refreshRoot(ctx context.Context, cont, dir string) {
 		if _, ok := link.Reader.(io.ReaderAt); !ok {
 			link.Reader.Close()
 			v.disableVault()
-			return
+			return ""
 		}
 		src = link.Reader
 	case link.URL != "":
@@ -301,13 +317,13 @@ func (v *Vault) refreshRoot(ctx context.Context, cont, dir string) {
 				v.setRootTree(cont, dir, emptyRoot(cont, dir))
 			}
 			v.setRootWarning(cont, dir, fmt.Sprintf("manifest 读取失败，%s", condStr(exists, "保留旧树，下周期重试", "虚拟视图为空目录")))
-			return
+			return ""
 		}
 		src = &rangeReadCloser{src: up}
 	default:
 		// 既无数据流也无 URL：驱动无法提供对象内容 → 禁用整挂载（同 Phase 1）
 		v.disableVault()
-		return
+		return ""
 	}
 	defer src.Close()
 
@@ -316,7 +332,7 @@ func (v *Vault) refreshRoot(ctx context.Context, cont, dir string) {
 		// 清单损坏/校验失败：子根保留、虚拟树为空 + 警告（密文仍 403 屏蔽，§5.1）
 		v.setRootTree(cont, dir, emptyRoot(cont, dir))
 		v.setRootWarning(cont, dir, fmt.Sprintf("manifest 解密失败，虚拟视图为空目录（%s）", err))
-		return
+		return ""
 	}
 
 	// 大清单守卫（热刷新）：已有树且清单过大 → 跳过本轮（重启生效；首建不限制）
@@ -325,16 +341,17 @@ func (v *Vault) refreshRoot(ctx context.Context, cont, dir string) {
 	v.mu.RUnlock()
 	if exists && rawSize > maxHotManifest {
 		v.setRootWarning(cont, dir, fmt.Sprintf("manifest 过大（%d MiB > %d MiB），跳过热刷新，重启生效", rawSize>>20, maxHotManifest>>20))
-		return
+		return ""
 	}
 	if exists && old.manifestSum == sum {
-		return // I4：内容未变化，零成本跳过
+		return "" // I4：内容未变化，零成本跳过
 	}
 
 	nr := buildRoot(cont, dir, m, sum)
 	v.setRootTree(cont, dir, nr)
 	v.invalidateCache()
 	slog.Info("vault: 子根虚拟树就绪", "container", cont, "root", dir, "files", len(m.Files))
+	return ""
 }
 
 // condStr 条件文案（告警措辞用）
@@ -429,9 +446,9 @@ func (v *Vault) pruneRoots(cont string, present []string) {
 
 // checkNestedMc P7（RV-2026-11-19-03）：非加密子目录的更深层若出现 _mc，
 // 不会被识别为加密单元（密文将按普通文件可枚举）——检测一层并告警。
-func (v *Vault) checkNestedMc(ctx context.Context, cont, dir string, subdirs []string) {
+func (v *Vault) checkNestedMc(ctx context.Context, cont, dir string, subdirs []string) string {
 	if len(subdirs) == 0 || len(subdirs) > maxNestedCheck {
-		return
+		return ""
 	}
 	for _, sd := range subdirs {
 		objs, err := v.raw.List(ctx, "/"+cont+"/"+dir+"/"+sd)
@@ -440,11 +457,11 @@ func (v *Vault) checkNestedMc(ctx context.Context, cont, dir string, subdirs []s
 		}
 		for i := range objs {
 			if objs[i].IsDir && objs[i].Name == "_mc" {
-				v.setContainerWarning(cont, fmt.Sprintf("子目录 %s/%s 内发现更深层 _mc：仅识别第二层单元，该目录按普通数据处理（密文未受保护）", dir, sd))
-				return
+				return fmt.Sprintf("子目录 %s/%s 内发现更深层 _mc：仅识别第二层单元，该目录未找到（404）", dir, sd)
 			}
 		}
 	}
+	return ""
 }
 
 // disableVault 驱动不支持 Vault（代理流非 ReaderAt，铁律 2）——清空容器，
