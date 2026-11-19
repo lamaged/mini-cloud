@@ -1,12 +1,15 @@
 package main
 
 import (
-	"context"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
-	"mini-cloud/internal/model"
+	"mini-cloud/drivers/baidu"
+	"mini-cloud/drivers/local"
+	"mini-cloud/drivers/mobile"
+	"mini-cloud/drivers/tianyi"
+	"mini-cloud/internal/driver"
 )
 
 func TestXMLTextEscapes(t *testing.T) {
@@ -61,33 +64,30 @@ func TestServeRootIndexNoAdminLink(t *testing.T) {
 	}
 }
 
-// TestVaultSupported 铁律 2：加密仅装配天翼/移动（百度等不参与，防扫描告警噪声）
+// TestVaultSupported 铁律 2：加密仅装配天翼/移动。
+// P1（RV-2026-11-19-07）：对**真实驱动实例**断言——锁死「Name() 返回值 ↔ 允许列表」
+// 不变量（回归教训：曾手写名单与 Name() 实际值不符导致全云盘加密失效）。
 func TestVaultSupported(t *testing.T) {
 	tests := []struct {
 		name string
+		drv  driver.Driver
 		want bool
 	}{
-		{"tianyi", true},  // 天翼个人/家庭共用同一驱动名
-		{"mobile", true},
-		{"local", true},
-		{"baidu", false},
+		{"tianyi 个人", tianyi.New("t", "u", "p", "", t.TempDir()), true},
+		{"tianyi 家庭", tianyi.New("t", "u", "p", "family-1", t.TempDir()), true},
+		{"mobile", mobile.New("m", "auth", t.TempDir()), true},
+		{"local", func() driver.Driver {
+			d, err := local.New(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			return d
+		}(), true},
+		{"baidu", baidu.New("b", "rt", "cid", "cs", t.TempDir()), false},
 	}
 	for _, tt := range tests {
-		d := &nameOnlyDriver{name: tt.name}
-		if got := vaultSupported(d); got != tt.want {
-			t.Errorf("vaultSupported(%q) = %v, want %v", tt.name, got, tt.want)
+		if got := vaultSupported(tt.drv); got != tt.want {
+			t.Errorf("vaultSupported(%s) = %v, want %v（驱动 Name()=%q）", tt.name, got, tt.want, tt.drv.Name())
 		}
 	}
-}
-
-// nameOnlyDriver 仅提供 Name 的假驱动
-type nameOnlyDriver struct{ name string }
-
-func (d *nameOnlyDriver) Name() string                                   { return d.name }
-func (d *nameOnlyDriver) Init(ctx context.Context) error                 { return nil }
-func (d *nameOnlyDriver) List(ctx context.Context, p string) ([]model.Obj, error) {
-	return nil, nil
-}
-func (d *nameOnlyDriver) Link(ctx context.Context, p string) (*model.Link, error) {
-	return nil, nil
 }

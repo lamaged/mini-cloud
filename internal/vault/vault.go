@@ -190,6 +190,9 @@ func (v *Vault) scan(ctx context.Context, name string, initial bool) {
 	objs, err := v.raw.List(lctx, "/"+name)
 	cancel()
 	if err != nil {
+		// P2（RV-2026-11-19-07）注：此分支**有意**粘滞（直接 setContainerWarning、
+		// 不经本轮 cwarns 重置）——容器 List 失败时无法验证问题是否已修复，
+		// 保留旧告警比清空更安全；下一次成功的扫描会经 defer 的 cwarns 机制自然清除。
 		v.setContainerWarning(name, fmt.Sprintf("容器扫描失败（%s）", err))
 		return
 	}
