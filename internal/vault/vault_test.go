@@ -115,7 +115,7 @@ func buildTestVault(t *testing.T, withManifest bool) (*fakeRaw, []byte, []byte) 
 	}
 
 	f := &fakeRaw{files: map[string][]byte{
-		"backup/" + ObjectPath(objID): objBuf.Bytes(),
+		"backup/dir1/" + ObjectPath(objID): objBuf.Bytes(),
 		"普通视频.mkv":                    []byte("normal-video-data"),
 	}}
 
@@ -132,7 +132,7 @@ func buildTestVault(t *testing.T, withManifest bool) (*fakeRaw, []byte, []byte) 
 		if err := SaveManifest(&mf, ManifestKey(master), m); err != nil {
 			t.Fatalf("SaveManifest: %v", err)
 		}
-		f.files["backup/_mc/manifest.mcf"] = mf.Bytes()
+		f.files["backup/dir1/_mc/manifest.mcf"] = mf.Bytes()
 	}
 	return f, master, plain
 }
@@ -151,15 +151,23 @@ func TestVaultListVirtual(t *testing.T) {
 	v := newTestVault(t, f, master, 4)
 	defer v.Stop()
 
-	// vault 根：虚拟树 = 原始文件名，绝不出现 _mc
+	// 容器本身：物理列表（子目录 dir1 可见）
 	objs, err := v.List(context.Background(), "/backup")
 	if err != nil {
 		t.Fatalf("List /backup: %v", err)
 	}
-	if len(objs) != 1 || objs[0].Name != "电影" || !objs[0].IsDir {
-		t.Errorf("vault 根虚拟列表不符: %+v", objs)
+	if len(objs) != 1 || objs[0].Name != "dir1" || !objs[0].IsDir {
+		t.Errorf("容器物理列表不符: %+v", objs)
 	}
-	objs2, err := v.List(context.Background(), "/backup/电影")
+	// 子根：虚拟树 = 原始文件名，绝不出现 _mc
+	objs1, err := v.List(context.Background(), "/backup/dir1")
+	if err != nil {
+		t.Fatalf("List /backup/dir1: %v", err)
+	}
+	if len(objs1) != 1 || objs1[0].Name != "电影" || !objs1[0].IsDir {
+		t.Errorf("子根虚拟列表不符: %+v", objs1)
+	}
+	objs2, err := v.List(context.Background(), "/backup/dir1/电影")
 	if err != nil {
 		t.Fatalf("List /backup/电影: %v", err)
 	}
@@ -170,9 +178,13 @@ func TestVaultListVirtual(t *testing.T) {
 	if objs2[0].ETag == "" || objs2[0].ContentType != "video/x-matroska" {
 		t.Errorf("ETag/ContentType 未填充: %+v", objs2[0])
 	}
-	// _mc 屏蔽：PROPFIND/List 403
+	// 子根 _mc 屏蔽：PROPFIND/List 403
+	if _, err := v.List(context.Background(), "/backup/dir1/_mc"); !errors.Is(err, driver.ErrForbidden) {
+		t.Errorf("子根 _mc List 应 403，got %v", err)
+	}
+	// 容器级保留名（旧结构 _mc）：403
 	if _, err := v.List(context.Background(), "/backup/_mc"); !errors.Is(err, driver.ErrForbidden) {
-		t.Errorf("_mc List 应 403，got %v", err)
+		t.Errorf("保留名 _mc List 应 403，got %v", err)
 	}
 }
 
@@ -182,7 +194,7 @@ func TestVaultLinkPlaintextAndForbidden(t *testing.T) {
 	defer v.Stop()
 
 	// 虚拟文件 → 明文
-	link, err := v.Link(context.Background(), "/backup/电影/a.mkv")
+	link, err := v.Link(context.Background(), "/backup/dir1/电影/a.mkv")
 	if err != nil {
 		t.Fatalf("Link: %v", err)
 	}
@@ -199,14 +211,14 @@ func TestVaultLinkPlaintextAndForbidden(t *testing.T) {
 	}
 
 	// _mc 密文对象：403，绝不返回密文
-	if _, err := v.Link(context.Background(), "/backup/_mc/manifest.mcf"); !errors.Is(err, driver.ErrForbidden) {
+	if _, err := v.Link(context.Background(), "/backup/dir1/_mc/manifest.mcf"); !errors.Is(err, driver.ErrForbidden) {
 		t.Errorf("_mc Link 应 403，got %v", err)
 	}
-	if _, err := v.Link(context.Background(), "/backup/_mc/o/x.bin"); !errors.Is(err, driver.ErrForbidden) {
+	if _, err := v.Link(context.Background(), "/backup/dir1/_mc/o/x.bin"); !errors.Is(err, driver.ErrForbidden) {
 		t.Errorf("对象 Link 应 403，got %v", err)
 	}
 	// 虚拟树中不存在的路径：not found
-	if _, err := v.Link(context.Background(), "/backup/不存在.mkv"); err == nil {
+	if _, err := v.Link(context.Background(), "/backup/dir1/不存在.mkv"); err == nil {
 		t.Error("虚拟树外路径应 not found")
 	}
 }
@@ -233,12 +245,16 @@ func TestVaultMissingManifestEmptyDir(t *testing.T) {
 	v := newTestVault(t, f, master, 4)
 	defer v.Stop()
 
-	objs, err := v.List(context.Background(), "/backup")
+	objs, err := v.List(context.Background(), "/backup/dir1")
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
 	if len(objs) != 0 {
 		t.Errorf("manifest 缺失应显示空目录: %+v", objs)
+	}
+	// 含 _mc 的目录必须保有 vault 语义：_mc 恒 403
+	if _, err := v.List(context.Background(), "/backup/dir1/_mc"); !errors.Is(err, driver.ErrForbidden) {
+		t.Errorf("manifest 缺失时 _mc 仍应 403，got %v", err)
 	}
 	if v.Warning() == "" {
 		t.Error("manifest 缺失应有健康提示")
@@ -254,7 +270,7 @@ func TestVaultURLOnlyDriverUnreadableManifest(t *testing.T) {
 	v := newTestVault(t, f, master, 4)
 	defer v.Stop()
 
-	objs, err := v.List(context.Background(), "/backup")
+	objs, err := v.List(context.Background(), "/backup/dir1")
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
@@ -290,15 +306,15 @@ func buildURLVault(t *testing.T, maxStreams int) (*Vault, *fakeURLDriver, *range
 		t.Fatal(err)
 	}
 
-	objKey := "backup/" + ObjectPath(objID)
+	objKey := "backup/dir1/" + ObjectPath(objID)
 	cdn := &rangeCDN{byPath: map[string][]byte{
-		"/backup/_mc/manifest.mcf": mf.Bytes(),
+		"/backup/dir1/_mc/manifest.mcf": mf.Bytes(),
 		"/" + objKey:              objBuf.Bytes(),
 	}}
 	ts := httptest.NewServer(cdn)
 	t.Cleanup(ts.Close)
 	drv := &fakeURLDriver{baseURL: ts.URL}
-	drv.files = map[string][]byte{"backup/_mc/manifest.mcf": mf.Bytes(), objKey: objBuf.Bytes()}
+	drv.files = map[string][]byte{"backup/dir1/_mc/manifest.mcf": mf.Bytes(), objKey: objBuf.Bytes()}
 	v := New(drv, drv, master, Config{Paths: []string{"backup"}, MaxStreams: maxStreams})
 	if err := v.Init(context.Background()); err != nil {
 		t.Fatalf("Init: %v", err)
@@ -312,14 +328,14 @@ func TestVaultLinkViaUpstream(t *testing.T) {
 	v, _, _, plain, _ := buildURLVault(t, 4)
 	defer v.Stop()
 
-	objs, err := v.List(context.Background(), "/backup/电影")
+	objs, err := v.List(context.Background(), "/backup/dir1/电影")
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
 	if len(objs) != 1 || objs[0].Name != "a.mkv" {
 		t.Fatalf("虚拟列表不符: %+v", objs)
 	}
-	link, err := v.Link(context.Background(), "/backup/电影/a.mkv")
+	link, err := v.Link(context.Background(), "/backup/dir1/电影/a.mkv")
 	if err != nil {
 		t.Fatalf("Link: %v", err)
 	}
@@ -343,12 +359,12 @@ func TestVaultSemaphoreBeforeLink(t *testing.T) {
 	acquireTimeout = 100 * time.Millisecond
 	defer func() { acquireTimeout = old }()
 
-	link1, err := v.Link(context.Background(), "/backup/电影/a.mkv")
+	link1, err := v.Link(context.Background(), "/backup/dir1/电影/a.mkv")
 	if err != nil {
 		t.Fatalf("Link 1: %v", err)
 	}
 	baseline := drv.linkCalls.Load()
-	if _, err := v.Link(context.Background(), "/backup/电影/a.mkv"); !errors.Is(err, driver.ErrTooManyStreams) {
+	if _, err := v.Link(context.Background(), "/backup/dir1/电影/a.mkv"); !errors.Is(err, driver.ErrTooManyStreams) {
 		link1.Reader.Close()
 		t.Fatalf("第二路应被信号量拒绝，got %v", err)
 	}
@@ -381,22 +397,22 @@ func TestVaultBindingMismatch(t *testing.T) {
 	if err := SaveManifest(&mf, ManifestKey(master), m); err != nil {
 		t.Fatal(err)
 	}
-	objKey := "backup/" + ObjectPath(objID)
+	objKey := "backup/dir1/" + ObjectPath(objID)
 	cdn := &rangeCDN{byPath: map[string][]byte{
-		"/backup/_mc/manifest.mcf": mf.Bytes(),
+		"/backup/dir1/_mc/manifest.mcf": mf.Bytes(),
 		"/" + objKey:              objBuf.Bytes(),
 	}}
 	ts := httptest.NewServer(cdn)
 	t.Cleanup(ts.Close)
 	drv := &fakeURLDriver{baseURL: ts.URL}
-	drv.files = map[string][]byte{"backup/_mc/manifest.mcf": mf.Bytes(), objKey: objBuf.Bytes()}
+	drv.files = map[string][]byte{"backup/dir1/_mc/manifest.mcf": mf.Bytes(), objKey: objBuf.Bytes()}
 	v := New(drv, drv, master, Config{Paths: []string{"backup"}})
 	if err := v.Init(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	defer v.Stop()
 
-	if _, err := v.Link(context.Background(), "/backup/电影/a.mkv"); err == nil ||
+	if _, err := v.Link(context.Background(), "/backup/dir1/电影/a.mkv"); err == nil ||
 		!strings.Contains(err.Error(), "绑定校验失败") {
 		t.Errorf("路径绑定不一致必须被拒绝，got %v", err)
 	}
@@ -408,11 +424,11 @@ func TestVaultETagSameSource(t *testing.T) {
 	v := newTestVault(t, f, master, 4)
 	defer v.Stop()
 
-	objs, err := v.List(context.Background(), "/backup/电影")
+	objs, err := v.List(context.Background(), "/backup/dir1/电影")
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
-	link, err := v.Link(context.Background(), "/backup/电影/a.mkv")
+	link, err := v.Link(context.Background(), "/backup/dir1/电影/a.mkv")
 	if err != nil {
 		t.Fatalf("Link: %v", err)
 	}
@@ -446,13 +462,13 @@ func TestVaultLinkEmptyMIME(t *testing.T) {
 		t.Fatal(err)
 	}
 	f := &fakeRaw{files: map[string][]byte{
-		"backup/" + ObjectPath(objID): objBuf.Bytes(),
-		"backup/_mc/manifest.mcf":     mf.Bytes(),
+		"backup/dir1/" + ObjectPath(objID): objBuf.Bytes(),
+		"backup/dir1/_mc/manifest.mcf":     mf.Bytes(),
 	}}
 	v := newTestVault(t, f, master, 4)
 	defer v.Stop()
 
-	link, err := v.Link(context.Background(), "/backup/资料/无扩展名")
+	link, err := v.Link(context.Background(), "/backup/dir1/资料/无扩展名")
 	if err != nil {
 		t.Fatalf("Link（空 MIME）: %v", err)
 	}
@@ -482,7 +498,7 @@ func TestVaultStreamLimitDoubleClose(t *testing.T) {
 	acquireTimeout = 100 * time.Millisecond
 	defer func() { acquireTimeout = old }()
 
-	link1, err := v.Link(context.Background(), "/backup/电影/a.mkv")
+	link1, err := v.Link(context.Background(), "/backup/dir1/电影/a.mkv")
 	if err != nil {
 		t.Fatalf("Link 1: %v", err)
 	}
@@ -507,18 +523,18 @@ func TestVaultStreamLimit(t *testing.T) {
 	acquireTimeout = 100 * time.Millisecond
 	defer func() { acquireTimeout = old }()
 
-	link1, err := v.Link(context.Background(), "/backup/电影/a.mkv")
+	link1, err := v.Link(context.Background(), "/backup/dir1/电影/a.mkv")
 	if err != nil {
 		t.Fatalf("Link 1: %v", err)
 	}
 	// 第 2 路超上限：必须被拒绝（不排队）
-	if _, err := v.Link(context.Background(), "/backup/电影/a.mkv"); err == nil {
+	if _, err := v.Link(context.Background(), "/backup/dir1/电影/a.mkv"); err == nil {
 		link1.Reader.Close()
 		t.Fatal("max_streams=1 时第二路应被拒绝")
 	}
 	// 关闭第一路后重试应成功
 	link1.Reader.Close()
-	link2, err2 := v.Link(context.Background(), "/backup/电影/a.mkv")
+	link2, err2 := v.Link(context.Background(), "/backup/dir1/电影/a.mkv")
 	if err2 != nil {
 		t.Fatalf("关闭后 Link 2: %v", err2)
 	}
@@ -533,21 +549,285 @@ func TestVaultStreamOnlyDriverSkipped(t *testing.T) {
 	v := newTestVault(t, f, master, 4)
 	defer v.Stop()
 
-	// backup 不被虚拟树接管：List 委托 cached（物理视图，含 _mc 目录）
+	// 流式驱动禁用整挂载 Vault：全部路径物理视图（dir1 及其中 _mc 可见）
 	objs, err := v.List(context.Background(), "/backup")
 	if err != nil {
 		t.Fatalf("List /backup: %v", err)
 	}
+	if len(objs) != 1 || objs[0].Name != "dir1" {
+		t.Errorf("流式驱动应保持物理视图，实际: %+v", objs)
+	}
+	objs2, err := v.List(context.Background(), "/backup/dir1")
+	if err != nil {
+		t.Fatalf("List /backup/dir1: %v", err)
+	}
 	found := false
-	for _, o := range objs {
+	for _, o := range objs2 {
 		if o.Name == "_mc" && o.IsDir {
 			found = true
 		}
 	}
 	if !found {
-		t.Errorf("流式驱动应保持物理视图（含 _mc），实际: %+v", objs)
+		t.Errorf("流式驱动物理视图应含 _mc，实际: %+v", objs2)
 	}
 	if v.Warning() != "" {
 		t.Errorf("跳过的驱动不应产生告警，got %q", v.Warning())
 	}
 }
+
+
+// ============ Phase 2（§5.1 容器方案） ============
+
+// forceDue 把容器扫描时间拨回，使下次 List 触发懒扫描（测试用）
+func forceDue(v *Vault, cont string) {
+	v.mu.Lock()
+	if c := v.containers[cont]; c != nil {
+		c.lastScan = time.Time{}
+	}
+	v.mu.Unlock()
+}
+
+// TestContainerScanAutoDiscover 新增子目录 → 同步扫描后自动挂成加密单元
+func TestContainerScanAutoDiscover(t *testing.T) {
+	f, master, _ := buildTestVault(t, true) // backup/dir1
+	v := newTestVault(t, f, master, 4)
+	defer v.Stop()
+
+	// 新增 dir2：加密对象 + manifest（内容用同一明文重建）
+	plain2 := []byte("第二个加密单元")
+	fileID2 := [16]byte{8, 8, 8, 8}
+	objID2 := EncodeFileID(fileID2)
+	meta2 := &Metadata{V: 1, P: "/剧集/b.mkv", N: "b.mkv", S: int64(len(plain2)), M: 1}
+	var buf2 bytes.Buffer
+	h2, sha2, err := EncryptObject(&buf2, master, bytes.NewReader(plain2), int64(len(plain2)), fileID2, meta2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m2 := &Manifest{V: 1, Files: []Entry{{
+		Path: "/剧集/b.mkv", Name: "b.mkv", Size: int64(len(plain2)), MTime: 1,
+		FileID: objID2, Obj: ObjectPath(objID2),
+		HeaderSHA256: hex.EncodeToString(h2.HeaderHash()), SHA256: sha2,
+	}}}
+	var mf2 bytes.Buffer
+	if err := SaveManifest(&mf2, ManifestKey(master), m2); err != nil {
+		t.Fatal(err)
+	}
+	f.files["backup/dir2/"+ObjectPath(objID2)] = buf2.Bytes()
+	f.files["backup/dir2/_mc/manifest.mcf"] = mf2.Bytes()
+
+	// 扫描前：dir2 是普通目录（物理视图含 _mc，不含虚拟树）
+	pre, err := v.List(context.Background(), "/backup/dir2")
+	if err != nil {
+		t.Fatalf("List dir2: %v", err)
+	}
+	for _, o := range pre {
+		if o.Name == "剧集" {
+			t.Error("扫描前 dir2 不应有虚拟树")
+		}
+	}
+	// 同步扫描（模拟 TTL 到期后的后台扫描）
+	v.scan(context.Background(), "backup", false)
+
+	objs, err := v.List(context.Background(), "/backup/dir2")
+	if err != nil {
+		t.Fatalf("List dir2: %v", err)
+	}
+	if len(objs) != 1 || objs[0].Name != "剧集" {
+		t.Errorf("dir2 虚拟树未生效: %+v", objs)
+	}
+	link, err := v.Link(context.Background(), "/backup/dir2/剧集/b.mkv")
+	if err != nil {
+		t.Fatalf("Link b.mkv: %v", err)
+	}
+	got, _ := io.ReadAll(link.Reader)
+	link.Reader.Close()
+	if !bytes.Equal(got, plain2) {
+		t.Error("dir2 解密内容不符")
+	}
+}
+
+// TestContainerRefreshNoChange I4：清单未变化 → 树指针不变（零成本跳过）
+func TestContainerRefreshNoChange(t *testing.T) {
+	f, master, _ := buildTestVault(t, true)
+	v := newTestVault(t, f, master, 4)
+	defer v.Stop()
+
+	v.mu.RLock()
+	before := v.containers["backup"].roots["dir1"]
+	v.mu.RUnlock()
+	v.scan(context.Background(), "backup", false)
+	v.mu.RLock()
+	after := v.containers["backup"].roots["dir1"]
+	v.mu.RUnlock()
+	if before != after {
+		t.Error("清单未变化时不得重建树（摘要比对失效）")
+	}
+}
+
+// TestContainerRefreshRebuild 清单变化 → 原子重建（新文件可见、旧链接缓存清空）
+func TestContainerRefreshRebuild(t *testing.T) {
+	f, master, plain := buildTestVault(t, true)
+	v := newTestVault(t, f, master, 4)
+	defer v.Stop()
+
+	// 新清单：加第二个文件
+	fileID2 := [16]byte{6, 6, 6, 6}
+	objID2 := EncodeFileID(fileID2)
+	plain2 := []byte("第二个文件内容")
+	meta2 := &Metadata{V: 1, P: "/电影/b.mkv", N: "b.mkv", S: int64(len(plain2)), M: 1}
+	var buf2 bytes.Buffer
+	h2, sha2, err := EncryptObject(&buf2, master, bytes.NewReader(plain2), int64(len(plain2)), fileID2, meta2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 复用原清单里的旧条目（不得重加密——随机 nonce 会使 header 哈希改变，I2 校验会失败）
+	oldM, _, _, err := LoadManifestSum(bytes.NewReader(f.files["backup/dir1/_mc/manifest.mcf"]), ManifestKey(master))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := &Manifest{V: 1, Files: append(append([]Entry{}, oldM.Files...), Entry{
+		Path: "/电影/b.mkv", Name: "b.mkv", Size: int64(len(plain2)), MTime: 1,
+		FileID: objID2, Obj: ObjectPath(objID2),
+		HeaderSHA256: hex.EncodeToString(h2.HeaderHash()), SHA256: sha2,
+	}), Dirs: []string{"/电影"}}
+	var mf bytes.Buffer
+	if err := SaveManifest(&mf, ManifestKey(master), m); err != nil {
+		t.Fatal(err)
+	}
+	f.files["backup/dir1/"+ObjectPath(objID2)] = buf2.Bytes()
+	f.files["backup/dir1/_mc/manifest.mcf"] = mf.Bytes()
+
+	v.scan(context.Background(), "backup", false)
+	objs, err := v.List(context.Background(), "/backup/dir1/电影")
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(objs) != 2 {
+		t.Fatalf("重建后应含 2 个文件: %+v", objs)
+	}
+	// 旧对象仍可播放（fileID 不变）
+	link, err := v.Link(context.Background(), "/backup/dir1/电影/a.mkv")
+	if err != nil {
+		t.Fatalf("Link a.mkv: %v", err)
+	}
+	got, _ := io.ReadAll(link.Reader)
+	link.Reader.Close()
+	if !bytes.Equal(got, plain) {
+		t.Error("旧对象播放内容不符")
+	}
+}
+
+// TestContainerRemoveRoot 云端删除子目录 → 摘除子根、回落普通模式
+func TestContainerRemoveRoot(t *testing.T) {
+	f, master, _ := buildTestVault(t, true)
+	v := newTestVault(t, f, master, 4)
+	defer v.Stop()
+
+	delete(f.files, "backup/dir1/_mc/manifest.mcf")
+	delete(f.files, "backup/dir1/"+ObjectPath(EncodeFileID([16]byte{7, 7, 7, 7})))
+	v.scan(context.Background(), "backup", false)
+
+	v.mu.RLock()
+	_, exists := v.containers["backup"].roots["dir1"]
+	v.mu.RUnlock()
+	if exists {
+		t.Error("云端消失的子目录应被摘除")
+	}
+	// 回落普通模式：dir1 虚拟树消失（内容为空）
+	objs, err := v.List(context.Background(), "/backup/dir1")
+	if err != nil {
+		t.Fatalf("摘除后 List: %v", err)
+	}
+	for _, o := range objs {
+		if o.Name == "电影" {
+			t.Error("摘除后虚拟树残留")
+		}
+	}
+}
+
+// TestContainerReservedName 旧结构 backup/_mc → 屏蔽 403 + 告警
+func TestContainerReservedName(t *testing.T) {
+	f, master, _ := buildTestVault(t, true)
+	f.files["backup/_mc/manifest.mcf"] = []byte("old-structure")
+	v := newTestVault(t, f, master, 4)
+	defer v.Stop()
+
+	if _, err := v.List(context.Background(), "/backup/_mc"); !errors.Is(err, driver.ErrForbidden) {
+		t.Errorf("保留名目录应 403，got %v", err)
+	}
+	if _, err := v.Link(context.Background(), "/backup/_mc/manifest.mcf"); !errors.Is(err, driver.ErrForbidden) {
+		t.Errorf("保留名文件 Link 应 403，got %v", err)
+	}
+	if !strings.Contains(v.Warning(), "保留名") {
+		t.Errorf("应告警提示迁移，got %q", v.Warning())
+	}
+}
+
+// TestContainerNestedMcWarning P7：第三层 _mc 不被识别 → 检测告警
+func TestContainerNestedMcWarning(t *testing.T) {
+	f, master, _ := buildTestVault(t, true)
+	f.files["backup/dir2/子/_mc/manifest.mcf"] = []byte("nested")
+	v := newTestVault(t, f, master, 4)
+	defer v.Stop()
+
+	if !strings.Contains(v.Warning(), "更深层 _mc") {
+		t.Errorf("第三层 _mc 应触发告警，got %q", v.Warning())
+	}
+	// dir2 不是 vault 单元：物理视图
+	if _, err := v.List(context.Background(), "/backup/dir2/子"); err != nil {
+		t.Errorf("非单元目录应走物理视图，got %v", err)
+	}
+}
+
+// TestContainerLazyScanTrigger 懒刷新触发：TTL 到期后的 List 异步重建（轮询等待）
+func TestContainerLazyScanTrigger(t *testing.T) {
+	f, master, _ := buildTestVault(t, true)
+	v := newTestVault(t, f, master, 4)
+	defer v.Stop()
+
+	// 新增 dir2（同一明文快速构建）
+	fileID2 := [16]byte{8, 8, 8, 8}
+	objID2 := EncodeFileID(fileID2)
+	meta2 := &Metadata{V: 1, P: "/剧集/b.mkv", N: "b.mkv", S: 10, M: 1}
+	var buf2 bytes.Buffer
+	h2, sha2, err := EncryptObject(&buf2, master, bytes.NewReader([]byte("0123456789")), 10, fileID2, meta2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m2 := &Manifest{V: 1, Files: []Entry{{
+		Path: "/剧集/b.mkv", Name: "b.mkv", Size: 10, MTime: 1,
+		FileID: objID2, Obj: ObjectPath(objID2),
+		HeaderSHA256: hex.EncodeToString(h2.HeaderHash()), SHA256: sha2,
+	}}}
+	var mf2 bytes.Buffer
+	if err := SaveManifest(&mf2, ManifestKey(master), m2); err != nil {
+		t.Fatal(err)
+	}
+	f.files["backup/dir2/"+ObjectPath(objID2)] = buf2.Bytes()
+	f.files["backup/dir2/_mc/manifest.mcf"] = mf2.Bytes()
+
+	forceDue(v, "backup")
+	// 触发 List 立即返回（旧树），后台扫描异步生效
+	objs, err := v.List(context.Background(), "/backup")
+	if err != nil || len(objs) == 0 {
+		t.Fatalf("触发 List 应正常返回: %v %+v", err, objs)
+	}
+	// 轮询等待异步扫描完成（≤2s）
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		v.mu.RLock()
+		_, ok := v.containers["backup"].roots["dir2"]
+		v.mu.RUnlock()
+		if ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("懒扫描未在 2s 内生效")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if _, err := v.List(context.Background(), "/backup/dir2/剧集"); err != nil {
+		t.Errorf("懒扫描后 dir2 虚拟树应可用: %v", err)
+	}
+}
+

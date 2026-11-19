@@ -17,11 +17,24 @@ import (
 	"mini-cloud/internal/model"
 )
 
-// Config Vault 配置（全局一套，按挂载生效；docs/design.md §4.3）
+// Config Vault 配置（全局一套，按挂载生效；docs/design.md §4.3/§5.1）
 type Config struct {
-	Paths      []string // 根目录名列表（无前导斜杠，如 ["backup"]；首段匹配、大小写敏感）
-	MaxStreams int      // 全局并发解密流上限（0 = 默认 4）
+	Paths      []string // 容器根名列表（无前导斜杠，如 ["backup"]；首段匹配、大小写敏感；容器下子目录为独立加密单元）
+	MaxStreams int      // 全局并发解密流上限（0 = 默认 3，PM 拍板）
 }
+
+const (
+	// scanTTL 容器扫描周期（懒刷新：TTL 到期后的首次 List 触发，§5.1）
+	scanTTL = 5 * time.Minute
+	// maxSubDirs 容器直接子目录数上限（超过跳过扫描并告警，防异常结构拖垮）
+	maxSubDirs = 32
+	// maxHotManifest 热刷新清单解压后大小上限（超过跳过热刷新、重启生效——AX6 瞬时双份峰值守卫）
+	maxHotManifest = 8 << 20
+	// manifestReadTimeout 扫描期单目录读取超时（I3：区别于播放流的 90s）
+	manifestReadTimeout = 5 * time.Second
+	// maxNestedCheck 深层 _mc 检查的子目录数上限（P7）
+	maxNestedCheck = 8
+)
 
 // Vault 包装层：拦截 vault 路径（虚拟树 + 解密），其余路径原样委托 cached。
 // 断言约定（铁律 7）：Vault 不得实现 TokenManager/HealthReporter/CredentialUpdater。
@@ -32,18 +45,30 @@ type Vault struct {
 	cfg    Config
 	sem    *streamSem
 
-	mu       sync.RWMutex
-	roots    map[string]*root // vault 根名 → 虚拟树
-	stopOnce sync.Once
+	mu         sync.RWMutex
+	containers map[string]*container // 容器根名 → 容器状态（Phase 2 两级：容器 → 子根）
+	disabled   bool                  // 驱动不支持 Vault（代理流）：全部路径普通模式（铁律 2）
+	stopOnce   sync.Once
 }
 
-// root 一个 vault 根的虚拟树（manifest 唯一来源）
+// container 一个 vault 容器根（cfg.Paths 条目；其直接子目录为独立加密单元，§5.1）
+type container struct {
+	name      string
+	refreshMu sync.Mutex       // 扫描串行化（跨触发去重，TryLock）
+	lastScan  time.Time        // 上次扫描时间（v.mu 下访问）
+	warning   string           // 容器级告警（保留名/扫描失败/子目录过多/深层 _mc）
+	roots     map[string]*root // 子根名 → 虚拟树（v.mu 下访问/交换）
+}
+
+// root 一个子根的虚拟树（manifest 唯一来源）
 type root struct {
-	name     string
-	warning  string
-	entries  map[string]Entry       // 虚拟文件路径（"/电影/a.mkv"）→ 条目
-	dirs     map[string]bool        // 虚拟目录集合（含 "/"）
-	children map[string][]model.Obj // 虚拟目录 → 直接子项（loadRoot 一次性构建并排序，P15）
+	name        string
+	objBase     string                // 对象路径前缀（容器/子根，如 "backup/dir1"，Link 拼接用）
+	warning     string                // 子根告警（manifest 不可读/损坏等，接 /admin §5.2）
+	manifestSum [32]byte              // 解密后清单内容摘要（I4：变更检测，热刷新比对）
+	entries     map[string]Entry      // 虚拟文件路径（"/电影/a.mkv"）→ 条目
+	dirs        map[string]bool       // 虚拟目录集合（含 "/"）
+	children    map[string][]model.Obj // 虚拟目录 → 直接子项（构建时排序，P15）
 }
 
 // streamSem 全局解密流信号量（I6：max_streams，超限 503 语义由调用方决定）
@@ -96,106 +121,210 @@ func New(cached driver.Reader, raw driver.Driver, master []byte, cfg Config) *Va
 		cfg.MaxStreams = 3
 	}
 	return &Vault{
-		cached: cached,
-		raw:    raw,
-		master: master,
-		cfg:    cfg,
-		roots:  make(map[string]*root),
-		sem:    &streamSem{avail: cfg.MaxStreams, max: cfg.MaxStreams},
+		cached:     cached,
+		raw:        raw,
+		master:     master,
+		cfg:        cfg,
+		containers: make(map[string]*container),
+		sem:        &streamSem{avail: cfg.MaxStreams, max: cfg.MaxStreams},
 	}
 }
 
 // Name 返回原始驱动名（类型名；断言必须针对原始驱动）
 func (v *Vault) Name() string { return v.raw.Name() }
 
-// Init 扫描挂载根：命中 cfg.Paths 的目录即 vault 根，加载其 manifest 建虚拟树。
-// manifest 缺失/损坏 → 该根为空目录 + 告警日志，不崩溃（design §4.3）。
+// Init 装配容器根并做一次同步初始扫描（启动即用）。
+// 扫描失败不崩溃：容器/子根记告警，对应路径回落普通模式（design §4.3/§5.1）。
 func (v *Vault) Init(ctx context.Context) error {
-	objs, err := v.raw.List(ctx, "/")
-	if err != nil {
-		return fmt.Errorf("vault: 扫描挂载根失败: %w", err)
+	if len(v.cfg.Paths) == 0 {
+		return nil
 	}
-	for i := range objs {
-		o := &objs[i]
-		if !o.IsDir || !v.isVaultRoot(o.Name) {
-			continue
+	for _, p := range v.cfg.Paths {
+		v.mu.Lock()
+		if v.containers[p] == nil {
+			v.containers[p] = &container{name: p, roots: make(map[string]*root)}
 		}
-		v.loadRoot(ctx, o.Name)
+		v.mu.Unlock()
 	}
-	if len(v.roots) == 0 {
+	for _, p := range v.cfg.Paths {
+		v.scan(ctx, p, true)
+	}
+	total := 0
+	v.mu.RLock()
+	for _, c := range v.containers {
+		total += len(c.roots)
+	}
+	v.mu.RUnlock()
+	if total == 0 {
 		slog.Info("vault: 未发现 vault 根目录，挂载按普通模式工作", "paths", v.cfg.Paths)
 	}
 	return nil
 }
 
-func (v *Vault) isVaultRoot(name string) bool {
-	for _, p := range v.cfg.Paths {
-		if p == name {
-			return true
+// scan 扫描容器（sync=true 同步初始扫描；否则为懒刷新）。
+// refreshMu 串行化：并发触发只有一个执行（TryLock 失败即返回，§5.1 去重）。
+func (v *Vault) scan(ctx context.Context, name string, sync bool) {
+	v.mu.RLock()
+	c := v.containers[name]
+	v.mu.RUnlock()
+	if c == nil {
+		return
+	}
+	if !c.refreshMu.TryLock() {
+		return // 已有扫描在跑
+	}
+	defer c.refreshMu.Unlock()
+
+	// P9（RV-2026-11-19-03）：懒刷新用后台 ctx——客户端断开不取消扫描；
+	// 仅受每目录 manifestReadTimeout 短超时约束。
+	bg := ctx
+	if !sync {
+		bg = context.Background()
+	}
+	v.mu.Lock()
+	c.lastScan = time.Now()
+	v.mu.Unlock()
+
+	objs, err := v.raw.List(bg, "/"+name)
+	if err != nil {
+		v.setContainerWarning(name, fmt.Sprintf("容器扫描失败（%s）", err))
+		return
+	}
+	var dirs []string
+	for i := range objs {
+		if objs[i].IsDir {
+			dirs = append(dirs, objs[i].Name)
 		}
 	}
-	return false
+	if len(dirs) > maxSubDirs {
+		v.setContainerWarning(name, fmt.Sprintf("容器下子目录过多（%d > %d），跳过扫描", len(dirs), maxSubDirs))
+		return
+	}
+	v.pruneRoots(name, dirs)
+	for _, d := range dirs {
+		if strings.HasPrefix(d, "_") {
+			// 保留名（旧结构 _mc 等）：屏蔽 + 告警（§5.1，防旧结构密文泄露）
+			v.setContainerWarning(name, fmt.Sprintf("发现保留名目录 %q（旧结构？已屏蔽，请迁移到 <名字>/_mc）", d))
+			continue
+		}
+		v.refreshRoot(bg, name, d)
+	}
 }
 
-// loadRoot 加载单个 vault 根（manifest 唯一真值源）。
-// Phase 1：URL 型驱动（天翼/移动）的 manifest 也经云盘取数层读取。
-func (v *Vault) loadRoot(ctx context.Context, name string) {
-	r := &root{name: name, entries: make(map[string]Entry), dirs: map[string]bool{"/": true}, children: make(map[string][]model.Obj)}
-	manifestPath := path.Join(name, "_mc", "manifest.mcf")
+// refreshRoot 扫描单个子目录（加密单元）：判定 _mc 存在 → 读清单 → 摘要比对 → 原子重建。
+// 失败隔离（I3）：单目录失败记告警、跳过，绝不拖累整体；下周期重试。
+func (v *Vault) refreshRoot(ctx context.Context, cont, dir string) {
+	mctx, cancel := context.WithTimeout(ctx, manifestReadTimeout)
+	defer cancel()
 
-	link, err := v.raw.Link(ctx, manifestPath)
+	// 判定：子目录里是否有 _mc（先 List 一层，避免把「无 _mc」误判为单元）
+	objs, err := v.raw.List(mctx, "/"+cont+"/"+dir)
 	if err != nil {
-		r.warning = fmt.Sprintf("vault 根 %s：manifest 缺失或不可读，虚拟视图为空目录", name)
-		slog.Warn("vault: "+r.warning, "err", err)
-		r.buildChildren() // 空虚拟树：List 返回空列表而非 not found
-		v.mu.Lock()
-		v.roots[name] = r
-		v.mu.Unlock()
+		v.setContainerWarning(cont, fmt.Sprintf("子目录 %s 读取失败，跳过本轮（%s）", dir, err))
+		return
+	}
+	hasMc := false
+	var subdirs []string
+	for i := range objs {
+		if !objs[i].IsDir {
+			continue
+		}
+		if objs[i].Name == "_mc" {
+			hasMc = true
+		} else {
+			subdirs = append(subdirs, objs[i].Name)
+		}
+	}
+	if !hasMc {
+		// 非加密目录：摘除旧树（若有）；P7 深层 _mc 检查
+		v.removeRoot(cont, dir)
+		v.checkNestedMc(mctx, cont, dir, subdirs)
+		return
+	}
+
+	manifestPath := path.Join(cont, dir, "_mc", "manifest.mcf")
+	link, err := v.raw.Link(mctx, manifestPath)
+	if err != nil {
+		// 网络/对象缺失（上传中间态）：有旧树保留旧树，无旧树建空树
+		//（保证「含 _mc 的目录必有子根」→ _mc 恒受 403 屏蔽，不回落普通模式）
+		v.mu.RLock()
+		_, exists := v.containers[cont].roots[dir]
+		v.mu.RUnlock()
+		if !exists {
+			v.setRootTree(cont, dir, emptyRoot(cont, dir))
+		}
+		v.setRootWarning(cont, dir, fmt.Sprintf("manifest 不可读，%s", condStr(exists, "保留旧树，下周期重试", "虚拟视图为空目录")))
 		return
 	}
 
 	var src io.ReadCloser
 	switch {
 	case link.Reader != nil:
-		// 铁律 2（P11）：加密不支持百度——代理流非 ReaderAt 的驱动不建虚拟树，
-		// 挂载完全普通模式（密文目录按普通目录可见）
+		// 铁律 2（P11）：加密不支持百度——代理流非 ReaderAt 的驱动禁用整挂载 Vault
 		if _, ok := link.Reader.(io.ReaderAt); !ok {
 			link.Reader.Close()
-			slog.Info("vault: 该驱动不支持 Vault（仅天翼/移动），跳过该挂载的 vault 根", "root", name)
+			v.disableVault()
 			return
 		}
 		src = link.Reader
 	case link.URL != "":
-		// Phase 1 接线：URL 型驱动经取数层读 manifest（Range 请求）
-		up, err := NewUpstreamWithLink(ctx, v.raw, manifestPath, link, httpClient)
+		up, err := NewUpstreamWithLink(mctx, v.raw, manifestPath, link, httpClient)
 		if err != nil {
-			r.warning = fmt.Sprintf("vault 根 %s：manifest 读取失败，虚拟视图为空目录", name)
-			slog.Warn("vault: "+r.warning, "err", err)
-			r.buildChildren()
-			v.mu.Lock()
-			v.roots[name] = r
-			v.mu.Unlock()
+			v.mu.RLock()
+			_, exists := v.containers[cont].roots[dir]
+			v.mu.RUnlock()
+			if !exists {
+				v.setRootTree(cont, dir, emptyRoot(cont, dir))
+			}
+			v.setRootWarning(cont, dir, fmt.Sprintf("manifest 读取失败，%s", condStr(exists, "保留旧树，下周期重试", "虚拟视图为空目录")))
 			return
 		}
 		src = &rangeReadCloser{src: up}
 	default:
-		// 既无数据流也无 URL：无法读取，不建根（挂载按普通模式工作）
-		slog.Info("vault: 驱动无法提供对象内容，跳过该挂载的 vault 根", "root", name)
+		// 既无数据流也无 URL：驱动无法提供对象内容 → 禁用整挂载（同 Phase 1）
+		v.disableVault()
 		return
 	}
 	defer src.Close()
 
-	m, err := LoadManifest(src, ManifestKey(v.master))
+	m, sum, rawSize, err := LoadManifestSum(src, ManifestKey(v.master))
 	if err != nil {
-		r.warning = fmt.Sprintf("vault 根 %s：manifest 解密失败，虚拟视图为空目录", name)
-		slog.Warn("vault: "+r.warning, "err", err)
-		r.buildChildren() // 空虚拟树：List 返回空列表而非 not found
-		v.mu.Lock()
-		v.roots[name] = r
-		v.mu.Unlock()
+		// 清单损坏/校验失败：子根保留、虚拟树为空 + 警告（密文仍 403 屏蔽，§5.1）
+		v.setRootTree(cont, dir, emptyRoot(cont, dir))
+		v.setRootWarning(cont, dir, fmt.Sprintf("manifest 解密失败，虚拟视图为空目录（%s）", err))
 		return
 	}
 
+	// 大清单守卫（热刷新）：已有树且清单过大 → 跳过本轮（重启生效；首建不限制）
+	v.mu.RLock()
+	old, exists := v.containers[cont].roots[dir]
+	v.mu.RUnlock()
+	if exists && rawSize > maxHotManifest {
+		v.setRootWarning(cont, dir, fmt.Sprintf("manifest 过大（%d MiB > %d MiB），跳过热刷新，重启生效", rawSize>>20, maxHotManifest>>20))
+		return
+	}
+	if exists && old.manifestSum == sum {
+		return // I4：内容未变化，零成本跳过
+	}
+
+	nr := buildRoot(cont, dir, m, sum)
+	v.setRootTree(cont, dir, nr)
+	v.invalidateCache()
+	slog.Info("vault: 子根虚拟树就绪", "container", cont, "root", dir, "files", len(m.Files))
+}
+
+// condStr 条件文案（告警措辞用）
+func condStr(cond bool, a, b string) string {
+	if cond {
+		return a
+	}
+	return b
+}
+
+// buildRoot 从 manifest 构建子根虚拟树（锁外构建，调用方 setRootTree 原子交换）
+func buildRoot(cont, dir string, m *Manifest, sum [32]byte) *root {
+	r := &root{name: dir, objBase: path.Join(cont, dir), manifestSum: sum,
+		entries: make(map[string]Entry), dirs: map[string]bool{"/": true}, children: make(map[string][]model.Obj)}
 	for _, e := range m.Files {
 		if !strings.HasPrefix(path.Clean(e.Obj), "_mc/o/") {
 			// P18：manifest 异常条目不得把任意路径交给驱动
@@ -214,10 +343,137 @@ func (v *Vault) loadRoot(ctx context.Context, name string) {
 		r.dirs[d] = true
 	}
 	r.buildChildren()
-	slog.Info("vault: 虚拟树就绪", "root", name, "files", len(m.Files))
+	return r
+}
+
+// emptyRoot 空子根（含 _mc 的目录清单不可读/损坏时的占位：虚拟树为空、_mc 恒 403）
+func emptyRoot(cont, dir string) *root {
+	r := &root{name: dir, objBase: path.Join(cont, dir),
+		entries: make(map[string]Entry), dirs: map[string]bool{"/": true}, children: make(map[string][]model.Obj)}
+	r.buildChildren()
+	return r
+}
+
+// setRootTree 原子设置子根虚拟树（v.mu 内交换；调用方持新树引用）
+func (v *Vault) setRootTree(cont, dir string, r *root) {
 	v.mu.Lock()
-	v.roots[name] = r
+	if c := v.containers[cont]; c != nil {
+		c.roots[dir] = r
+	}
 	v.mu.Unlock()
+}
+
+// removeRoot 摘除子根（云盘上已消失或变为非加密目录）
+func (v *Vault) removeRoot(cont, dir string) {
+	v.mu.Lock()
+	c := v.containers[cont]
+	_, existed := false, false
+	if c != nil {
+		_, existed = c.roots[dir]
+		delete(c.roots, dir)
+	}
+	v.mu.Unlock()
+	if existed {
+		slog.Info("vault: 子根已摘除", "container", cont, "root", dir)
+		v.invalidateCache()
+	}
+}
+
+// pruneRoots 摘除容器扫描中已消失的子根
+func (v *Vault) pruneRoots(cont string, present []string) {
+	set := make(map[string]bool, len(present))
+	for _, d := range present {
+		set[d] = true
+	}
+	v.mu.Lock()
+	c := v.containers[cont]
+	removed := false
+	if c != nil {
+		for name := range c.roots {
+			if !set[name] {
+				delete(c.roots, name)
+				removed = true
+			}
+		}
+	}
+	v.mu.Unlock()
+	if removed {
+		slog.Info("vault: 子根已摘除", "container", cont)
+		v.invalidateCache()
+	}
+}
+
+// checkNestedMc P7（RV-2026-11-19-03）：非加密子目录的更深层若出现 _mc，
+// 不会被识别为加密单元（密文将按普通文件可枚举）——检测一层并告警。
+func (v *Vault) checkNestedMc(ctx context.Context, cont, dir string, subdirs []string) {
+	if len(subdirs) == 0 || len(subdirs) > maxNestedCheck {
+		return
+	}
+	for _, sd := range subdirs {
+		objs, err := v.raw.List(ctx, "/"+cont+"/"+dir+"/"+sd)
+		if err != nil {
+			continue
+		}
+		for i := range objs {
+			if objs[i].IsDir && objs[i].Name == "_mc" {
+				v.setContainerWarning(cont, fmt.Sprintf("子目录 %s/%s 内发现更深层 _mc：仅识别第二层单元，该目录按普通数据处理（密文未受保护）", dir, sd))
+				return
+			}
+		}
+	}
+}
+
+// disableVault 驱动不支持 Vault（代理流非 ReaderAt，铁律 2）——清空容器，
+// 全部路径回落普通模式（与 Phase 1 行为一致）
+func (v *Vault) disableVault() {
+	v.mu.Lock()
+	v.containers = map[string]*container{}
+	v.disabled = true
+	v.mu.Unlock()
+	slog.Info("vault: 该驱动不支持 Vault（仅天翼/移动），跳过该挂载的 vault 装配")
+}
+
+// maybeScan 懒刷新入口（§5.1）：请求路径首段为容器名时，TTL 到期则触发一次后台扫描
+func (v *Vault) maybeScan(reqPath string) {
+	segs := strings.Split(strings.TrimPrefix(reqPath, "/"), "/")
+	if len(segs) == 0 || segs[0] == "" {
+		return
+	}
+	v.mu.RLock()
+	c := v.containers[segs[0]]
+	due := c != nil && time.Since(c.lastScan) >= scanTTL
+	v.mu.RUnlock()
+	if !due {
+		return
+	}
+	go v.scan(context.Background(), segs[0], false)
+}
+
+// setContainerWarning / setRootWarning 记录告警（接 /admin 展示，§5.2）
+func (v *Vault) setContainerWarning(cont, msg string) {
+	v.mu.Lock()
+	if c := v.containers[cont]; c != nil {
+		c.warning = msg
+	}
+	v.mu.Unlock()
+}
+
+func (v *Vault) setRootWarning(cont, dir, msg string) {
+	v.mu.Lock()
+	if c := v.containers[cont]; c != nil {
+		if r := c.roots[dir]; r != nil {
+			r.warning = msg
+		}
+	}
+	v.mu.Unlock()
+}
+
+// invalidateCache 树变化后清空目录/链接缓存（30s 目录 / 10min 链接缓存里的
+// 旧 fileID 签名 URL 必须失效，§5.1）
+func (v *Vault) invalidateCache() {
+	if inv, ok := v.cached.(interface{ InvalidateAll() }); ok {
+		inv.InvalidateAll()
+	}
 }
 
 // etagFor 虚拟文件 ETag（I3：PROPFIND 与 GET 同一字符串、同一来源）
@@ -257,20 +513,40 @@ func (r *root) buildChildren() {
 	}
 }
 
-// findRoot 判定挂载内路径是否命中 vault 根；返回 (根, vault 内相对路径, 是否命中)
+// findRoot 两级判定（Phase 2，§5.1）：容器名（首段）→ 子根名（第二段）；
+// 返回 (子根, 子根内相对路径, 是否命中)。容器本身（无第二段）不命中 → 普通列表。
 func (v *Vault) findRoot(reqPath string) (*root, string, bool) {
 	segs := strings.Split(strings.TrimPrefix(reqPath, "/"), "/")
-	if len(segs) == 0 || segs[0] == "" {
+	if len(segs) < 2 || segs[0] == "" || segs[1] == "" {
 		return nil, "", false
 	}
 	v.mu.RLock()
-	r, ok := v.roots[segs[0]]
+	c, ok := v.containers[segs[0]]
+	var r *root
+	if ok {
+		r = c.roots[segs[1]]
+	}
 	v.mu.RUnlock()
-	if !ok {
+	if r == nil {
 		return nil, "", false
 	}
-	inner := "/" + strings.Join(segs[1:], "/")
+	inner := "/" + strings.Join(segs[2:], "/")
 	return r, inner, true
+}
+
+// isReservedContainerPath 容器直接子目录中保留名（"_" 开头，如旧结构 _mc）→ 屏蔽（§5.1）
+func (v *Vault) isReservedContainerPath(reqPath string) bool {
+	segs := strings.Split(strings.TrimPrefix(reqPath, "/"), "/")
+	if len(segs) < 2 || segs[0] == "" || segs[1] == "" {
+		return false
+	}
+	if !strings.HasPrefix(segs[1], "_") {
+		return false
+	}
+	v.mu.RLock()
+	_, ok := v.containers[segs[0]]
+	v.mu.RUnlock()
+	return ok
 }
 
 // isMcPath 是否指向密文对象区（_mc 及以下；I4：PROPFIND 隐藏、GET 403）
@@ -278,8 +554,13 @@ func isMcPath(inner string) bool {
 	return inner == "/_mc" || strings.HasPrefix(inner, "/_mc/")
 }
 
-// List：vault 路径返回虚拟树（manifest 唯一来源，_mc 绝不出现）；其余委托 cached
+// List：vault 路径返回虚拟树（manifest 唯一来源，_mc 绝不出现）；其余委托 cached。
+// 懒刷新：容器路径的首次 List（TTL 到期后）触发后台扫描（§5.1）。
 func (v *Vault) List(ctx context.Context, reqPath string) ([]model.Obj, error) {
+	v.maybeScan(reqPath)
+	if v.isReservedContainerPath(reqPath) {
+		return nil, driver.ErrForbidden
+	}
 	r, inner, hit := v.findRoot(reqPath)
 	if !hit {
 		return v.cached.List(ctx, reqPath)
@@ -296,6 +577,9 @@ func (v *Vault) List(ctx context.Context, reqPath string) ([]model.Obj, error) {
 
 // Link：vault 文件 → 解密数据流（随机访问 + Range 支持）；_mc → 403；其余委托 cached
 func (v *Vault) Link(ctx context.Context, reqPath string) (*model.Link, error) {
+	if v.isReservedContainerPath(reqPath) {
+		return nil, driver.ErrForbidden
+	}
 	r, inner, hit := v.findRoot(reqPath)
 	if !hit {
 		return v.cached.Link(ctx, reqPath)
@@ -308,7 +592,7 @@ func (v *Vault) Link(ctx context.Context, reqPath string) (*model.Link, error) {
 		return nil, fmt.Errorf("not found: %s", reqPath)
 	}
 
-	objPath := path.Join(r.name, e.Obj) // 挂载内对象路径（"backup/_mc/o/..."）
+	objPath := path.Join(r.objBase, e.Obj) // 挂载内对象路径（"backup/dir1/_mc/o/..."）
 
 	// U3/P21：全局信号量在 raw.Link（云盘 API 调用）之前获取——超限拒绝时不白开上游连接
 	if !v.sem.acquire(ctx, acquireTimeout) {
@@ -391,15 +675,21 @@ func (v *Vault) Stop() {
 	})
 }
 
-// Warning 该挂载所有 vault 根的健康提示（manifest 缺失/损坏等）。
-// 当前仅日志与测试使用；Phase 1 接入 /admin 展示（TODO 技术债）。
+// Warning 该挂载 vault 的健康提示（容器/子根告警聚合；Phase 2 §5.2 接 /admin 展示）。
+// 双通道约定（铁律 7）：驱动告警（HealthReporter）由 main 对原始驱动收集，
+// 本方法只含 vault 自身告警——两者由 main 合并展示。
 func (v *Vault) Warning() string {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
 	var parts []string
-	for _, r := range v.roots {
-		if r.warning != "" {
-			parts = append(parts, r.warning)
+	for _, c := range v.containers {
+		if c.warning != "" {
+			parts = append(parts, c.warning)
+		}
+		for _, r := range c.roots {
+			if r.warning != "" {
+				parts = append(parts, r.warning)
+			}
 		}
 	}
 	sort.Strings(parts)

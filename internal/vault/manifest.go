@@ -1,6 +1,7 @@
 package vault
 
 import (
+	"crypto/sha256"
 	"bytes"
 	"compress/gzip"
 	"crypto/rand"
@@ -91,42 +92,51 @@ const MaxManifestSize = 32 << 20 // 32 MiB
 // LoadManifest 解密并解析 manifest（认证失败返回 ErrAuth 包装错误）。
 // 读取总量受 MaxManifestSize 限制，解压后 JSON 再受同样限制（防 gzip 炸弹）。
 func LoadManifest(src io.Reader, key []byte) (*Manifest, error) {
+	m, _, _, err := LoadManifestSum(src, key)
+	return m, err
+}
+
+// LoadManifestSum 同 LoadManifest，并返回解密后清单内容的 SHA-256 摘要与解压后原始大小
+// （Phase 2 I4：变更检测用——manifest 为随机 nonce 加密，密文哈希不可用；
+// 摘要取解压后 JSON 内容，免疫 gzip mtime/压缩级别差异）。
+func LoadManifestSum(src io.Reader, key []byte) (*Manifest, [32]byte, int, error) {
+	var zero [32]byte
 	data, err := io.ReadAll(io.LimitReader(src, MaxManifestSize+1))
 	if err != nil {
-		return nil, fmt.Errorf("vault: manifest 读取失败: %w", err)
+		return nil, zero, 0, fmt.Errorf("vault: manifest 读取失败: %w", err)
 	}
 	if len(data) > MaxManifestSize {
-		return nil, fmt.Errorf("vault: manifest 超过大小上限 %d MiB", MaxManifestSize>>20)
+		return nil, zero, 0, fmt.Errorf("vault: manifest 超过大小上限 %d MiB", MaxManifestSize>>20)
 	}
 	if len(data) < 12+TagSize {
-		return nil, fmt.Errorf("vault: manifest 文件过短: %d", len(data))
+		return nil, zero, 0, fmt.Errorf("vault: manifest 文件过短: %d", len(data))
 	}
 	plain, err := open(key, data[:12], data[12:], nil)
 	if err != nil {
-		return nil, fmt.Errorf("vault: manifest 解密失败: %w", err)
+		return nil, zero, 0, fmt.Errorf("vault: manifest 解密失败: %w", err)
 	}
 	zr, err := gzip.NewReader(bytes.NewReader(plain))
 	if err != nil {
-		return nil, fmt.Errorf("vault: manifest gzip 解析失败: %w", err)
+		return nil, zero, 0, fmt.Errorf("vault: manifest gzip 解析失败: %w", err)
 	}
 	defer zr.Close()
 	// 解压总量同样受限（gzip 炸弹防护）
 	limited := io.LimitReader(zr, MaxManifestSize+1)
 	raw, err := io.ReadAll(limited)
 	if err != nil {
-		return nil, fmt.Errorf("vault: manifest 解压失败: %w", err)
+		return nil, zero, 0, fmt.Errorf("vault: manifest 解压失败: %w", err)
 	}
 	if len(raw) > MaxManifestSize {
-		return nil, fmt.Errorf("vault: manifest 解压后超过大小上限 %d MiB", MaxManifestSize>>20)
+		return nil, zero, 0, fmt.Errorf("vault: manifest 解压后超过大小上限 %d MiB", MaxManifestSize>>20)
 	}
 	var m Manifest
 	if err := json.Unmarshal(raw, &m); err != nil {
-		return nil, fmt.Errorf("vault: manifest JSON 解析失败: %w", err)
+		return nil, zero, 0, fmt.Errorf("vault: manifest JSON 解析失败: %w", err)
 	}
 	if m.V != 1 {
-		return nil, fmt.Errorf("vault: 不支持的 manifest 版本 %d", m.V)
+		return nil, zero, 0, fmt.Errorf("vault: 不支持的 manifest 版本 %d", m.V)
 	}
-	return &m, nil
+	return &m, sha256.Sum256(raw), len(raw), nil
 }
 
 // randomBytes 加密安全随机字节

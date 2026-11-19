@@ -281,3 +281,67 @@ func TestValidateAuthorizationWithMockHost(t *testing.T) {
 		t.Errorf("expiry should be in the future")
 	}
 }
+
+
+// ============ §5.3 启动健壮性 ============
+
+// TestInitDegradedNoFatal：无效凭证 + 无缓存 → Init 不失败不阻塞
+//（受限模式 + 健康提示；过期语义：List 空、Link 明确错误、不 panic）
+func TestInitDegradedNoFatal(t *testing.T) {
+	dir := t.TempDir()
+	d := New("mobile", "!!not-base64!!", dir)
+	if err := d.Init(context.Background()); err != nil {
+		t.Fatalf("Init 不得因云主机发现失败而报错（§5.3）: %v", err)
+	}
+	if w := d.HealthWarning(); w == "" {
+		t.Error("受限模式应有健康提示")
+	}
+	if objs, err := d.List(context.Background(), "/"); err != nil || len(objs) != 0 {
+		t.Errorf("过期语义 List 应返回空: %v %+v", err, objs)
+	}
+	if _, err := d.Link(context.Background(), "/a.mkv"); err == nil {
+		t.Error("受限模式 Link 应返回明确错误")
+	}
+}
+
+// TestInitRestoreFromCache：state 缓存可解析即恢复（30 天有效 token + 缓存 host），
+// 全程无网络请求（remaining > 15 天 → 跳过刷新；host 取自缓存 → 跳过发现）
+func TestInitRestoreFromCache(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"success":true,"code":"","message":"","data":{"items":[],"nextPageCursor":""}}`)
+	}))
+	defer ts.Close()
+	dir := t.TempDir()
+	auth := makeAuth("13800000000", time.Now().Add(30*24*time.Hour))
+	tok := &TokenState{Authorization: auth, Account: "13800000000", CloudHost: ts.URL}
+	if err := SaveToken("mobile", dir, tok); err != nil {
+		t.Fatal(err)
+	}
+	d := New("mobile", auth, dir)
+	if err := d.Init(context.Background()); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if w := d.HealthWarning(); w != "" {
+		t.Errorf("有效缓存不应有提示，got %q", w)
+	}
+}
+
+// TestHostWarnClearedOnCommit：提交新凭证后清除启动期发现失败提示
+func TestHostWarnClearedOnCommit(t *testing.T) {
+	stateDir := t.TempDir()
+	d := New("移动云盘", makeAuth("13800000000", time.Now().Add(30*24*time.Hour)), stateDir)
+	d.commitMu.Lock()
+	d.hostWarn = "移动云盘云主机发现失败（网络或授权问题），服务受限"
+	d.commitMu.Unlock()
+
+	newAuth := makeAuth("13800000000", time.Now().Add(30*24*time.Hour))
+	newHost := "https://cloud.example.com"
+	d.setPending("req-1", newAuth, "13800000000", newHost)
+	if err := d.CommitCredential(map[string]string{"__req": "req-1", "authorization": newAuth}); err != nil {
+		t.Fatalf("CommitCredential: %v", err)
+	}
+	if w := d.HealthWarning(); w != "" {
+		t.Errorf("提交成功后应清除发现失败提示，got %q", w)
+	}
+}
+

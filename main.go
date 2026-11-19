@@ -81,6 +81,9 @@ func main() {
 	}
 
 	// 管理页：收集支持 CredentialUpdater 的挂载（断言原始驱动，不是包装层）
+	// 挂载告警双通道（design §5.2 + 铁律 7）：驱动告警（HealthReporter 对原始驱动断言）
+	// + Vault 告警（具体方法 Warning()，在装配循环里注入）——两者合并展示
+	vaultWarn := make(map[string]func() string)
 	var adminMounts []admin.Mount
 	for i := range mounts {
 		m := &mounts[i]
@@ -90,10 +93,18 @@ func main() {
 		}
 		am := admin.Mount{Name: m.Name, Prefix: m.Prefix, Fields: up.CredentialFields(), Update: up}
 		am.Warning = func() string {
+			var parts []string
 			if hr, ok := m.Drv.(driver.HealthReporter); ok {
-				return hr.HealthWarning()
+				if w := hr.HealthWarning(); w != "" {
+					parts = append(parts, w)
+				}
 			}
-			return ""
+			if vw, ok := vaultWarn[m.Name]; ok {
+				if w := vw(); w != "" {
+					parts = append(parts, w)
+				}
+			}
+			return strings.Join(parts, "；")
 		}
 		adminMounts = append(adminMounts, am)
 	}
@@ -209,6 +220,7 @@ func main() {
 		var drv webdav.Reader = cached
 		if vaultCfg != nil {
 			v := vault.New(cached, m.Drv, vaultKey, *vaultCfg)
+			vaultWarn[m.Name] = v.Warning // 双通道：vault 告警注入管理页（§5.2）
 			if err := v.Init(ctx); err != nil {
 				slog.Warn("vault 初始化失败，该挂载按普通模式工作", "mount", m.Name, "err", err)
 			} else {

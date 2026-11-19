@@ -36,6 +36,7 @@ type Driver struct {
 	commitAuth   string
 	commitAccount string
 	commitHost   string
+	hostWarn     string // 启动期云主机发现失败提示（§5.3；commitMu 保护，随提交成功清除）
 
 	// 路径缓存代次：提交新凭证时递增，使在途解析结果作废
 	cacheGen atomic.Uint64
@@ -66,12 +67,16 @@ func (d *Driver) Name() string {
 	return "mobile"
 }
 
-// HealthWarning 返回健康提示：authorization 过期时提示用户更新
+// HealthWarning 返回健康提示：authorization 过期时提示用户更新；
+// 未过期但启动期云主机发现失败时提示服务受限（§5.3，接 /admin 展示 §5.2）
 func (d *Driver) HealthWarning() string {
 	if d.client.isExpired() {
 		return "移动云盘authorization已经过期，请更新"
 	}
-	return ""
+	d.commitMu.Lock()
+	w := d.hostWarn
+	d.commitMu.Unlock()
+	return w
 }
 
 // Init 初始化：设置认证、发现主机、刷新 Token
@@ -129,9 +134,17 @@ func (d *Driver) Init(ctx context.Context) error {
 		slog.Warn("移动云盘 token 刷新失败，尝试直接使用", "err", err)
 	}
 
-	// 发现云主机
-	if err := d.client.discoverCloudHost(ctx); err != nil {
-		return fmt.Errorf("发现云主机失败: %w", err)
+	// 发现云主机（§5.3 启动健壮性：短超时 ≤10s；失败不阻断启动、不重试——
+	// 无 host 时 List/Link 已按「过期语义」返回空目录/明确错误，
+	// HealthWarning 提示用户去 /admin 更新；云主机可从缓存恢复或随凭证更新获得）
+	dctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	err = d.client.discoverCloudHost(dctx)
+	cancel()
+	if err != nil {
+		d.commitMu.Lock()
+		d.hostWarn = "移动云盘云主机发现失败（网络或授权问题），服务受限，请稍后重启或到 /admin 更新凭证"
+		d.commitMu.Unlock()
+		slog.Warn("移动云盘云主机发现失败，挂载按受限模式启动", "err", err)
 	}
 
 	if err := d.saveTokenState(); err != nil {

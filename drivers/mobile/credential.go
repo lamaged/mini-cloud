@@ -103,6 +103,7 @@ func (d *Driver) CommitCredential(values map[string]string) error {
 	// 记录已提交凭证并递增代次：401 刷新回调据此丢弃过期刷新结果
 	d.commitMu.Lock()
 	d.commitAuth, d.commitAccount, d.commitHost = p.auth, p.account, p.host
+	d.hostWarn = "" // 提交成功即清除启动期发现失败提示（§5.3）
 	d.authorization = p.auth // 同步 Init 期字段（P5）：防止未来重新 Init 回退旧值
 	d.commitMu.Unlock()
 	d.credGen.Add(1)
