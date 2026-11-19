@@ -491,10 +491,11 @@ func (r *responseLogger) Write(b []byte) (int, error) {
 
 // vaultSupported 铁律 2（加密仅支持天翼/移动）：不支持的驱动（百度等）不装配 Vault——
 // 避免对无意义的路径做容器扫描，产生「容器扫描失败」类告警噪声（真机发现 2026-11-19）。
-// 按驱动名允许列表判定；local 保留（Phase 0 开发/测试路径）。
+// 按驱动名（drivers/*.go 的 Name() 返回值：tianyi/mobile/baidu/local）允许列表判定；
+// local 保留（Phase 0 开发/测试路径）。
 func vaultSupported(d driver.Driver) bool {
 	switch d.Name() {
-	case "189Personal", "189Family", "MobileCloudDrive", "local":
+	case "tianyi", "mobile", "local":
 		return true
 	}
 	return false

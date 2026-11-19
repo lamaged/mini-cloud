@@ -67,11 +67,10 @@ func TestVaultSupported(t *testing.T) {
 		name string
 		want bool
 	}{
-		{"189Personal", true},
-		{"189Family", true},
-		{"MobileCloudDrive", true},
+		{"tianyi", true},  // 天翼个人/家庭共用同一驱动名
+		{"mobile", true},
 		{"local", true},
-		{"BaiduNetdisk", false},
+		{"baidu", false},
 	}
 	for _, tt := range tests {
 		d := &nameOnlyDriver{name: tt.name}
