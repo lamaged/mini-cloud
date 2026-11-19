@@ -1,6 +1,7 @@
 package vault
 
 import (
+	"os"
 	"context"
 	"encoding/hex"
 	"fmt"
@@ -557,32 +558,25 @@ func (v *Vault) findRoot(reqPath string) (*root, string, bool) {
 	return r, inner, true
 }
 
-// isReservedContainerPath 容器直接子目录中保留名（"_" 开头，如旧结构 _mc）→ 屏蔽（§5.1）
-func (v *Vault) isReservedContainerPath(reqPath string) bool {
-	segs := strings.Split(strings.TrimPrefix(reqPath, "/"), "/")
-	if len(segs) < 2 || segs[0] == "" || segs[1] == "" {
-		return false
-	}
-	if !strings.HasPrefix(segs[1], "_") {
-		return false
-	}
-	v.mu.RLock()
-	_, ok := v.containers[segs[0]]
-	v.mu.RUnlock()
-	return ok
-}
-
 // isMcPath 是否指向密文对象区（_mc 及以下；I4：PROPFIND 隐藏、GET 403）
 func isMcPath(inner string) bool {
 	return inner == "/_mc" || strings.HasPrefix(inner, "/_mc/")
 }
 
-// List：vault 路径返回虚拟树（manifest 唯一来源，_mc 绝不出现）；其余委托 cached。
+// List：容器 = 加密专区（PM 拍板 2026-11-19：非加密单元一律不显示 + 403）——
+// 容器列表由当前子根合成（仅加密单元可见）；子根内为虚拟树（_mc 绝不出现）；
+// 其余路径委托 cached。
 // 懒刷新：容器路径的首次 List（TTL 到期后）触发后台扫描（§5.1）。
 func (v *Vault) List(ctx context.Context, reqPath string) ([]model.Obj, error) {
 	v.maybeScan(reqPath)
-	if v.isReservedContainerPath(reqPath) {
-		return nil, driver.ErrForbidden
+	if hit, isContainer := v.classify(reqPath); hit {
+		if isContainer {
+			return v.containerListing(reqPath)
+		}
+		// 容器下但非加密单元（stray 文件/无 _mc 目录/放错层级的密文/保留名）：
+		// 程序不认识 → 一律「未找到」（PM 口径：不是主动藏，是不认识即不管；
+		// 密文同样拿不到，P7 枚举风险根治）
+		return nil, notFoundErr(reqPath)
 	}
 	r, inner, hit := v.findRoot(reqPath)
 	if !hit {
@@ -598,10 +592,57 @@ func (v *Vault) List(ctx context.Context, reqPath string) ([]model.Obj, error) {
 	return append([]model.Obj(nil), objs...), nil // P22：返回副本，防调用方污染索引
 }
 
+// classify 容器路径分类：返回 (是否容器区路径, 是否容器本身)。
+// 首段为容器名且第二段非子根 → (true, false)（非单元路径，List 403）；
+// 首段为容器名且无第二段 → (true, true)（容器本身，合成列表）。
+func (v *Vault) classify(reqPath string) (bool, bool) {
+	segs := strings.Split(strings.TrimPrefix(reqPath, "/"), "/")
+	if len(segs) == 0 || segs[0] == "" {
+		return false, false
+	}
+	v.mu.RLock()
+	c, ok := v.containers[segs[0]]
+	isRoot := false
+	if ok && len(segs) >= 2 && segs[1] != "" {
+		_, isRoot = c.roots[segs[1]]
+	}
+	v.mu.RUnlock()
+	if !ok {
+		return false, false
+	}
+	if len(segs) < 2 || segs[1] == "" {
+		return true, true // 容器本身
+	}
+	return !isRoot, false
+}
+
+// notFoundErr 「未找到」错误（包装 os.ErrNotExist → webdav 映射 404；
+// 语义：程序不认识该路径，并非「存在但禁止」）
+func notFoundErr(reqPath string) error {
+	return fmt.Errorf("not found: %s: %w", reqPath, os.ErrNotExist)
+}
+
+// containerListing 容器列表：仅当前加密单元（子根）可见，排序返回副本
+func (v *Vault) containerListing(reqPath string) ([]model.Obj, error) {
+	segs := strings.Split(strings.TrimPrefix(reqPath, "/"), "/")
+	v.mu.RLock()
+	c := v.containers[segs[0]]
+	var objs []model.Obj
+	if c != nil {
+		for name := range c.roots {
+			objs = append(objs, model.Obj{Name: name, IsDir: true})
+		}
+	}
+	v.mu.RUnlock()
+	sort.Slice(objs, func(i, j int) bool { return objs[i].Name < objs[j].Name })
+	return objs, nil
+}
+
 // Link：vault 文件 → 解密数据流（随机访问 + Range 支持）；_mc → 403；其余委托 cached
 func (v *Vault) Link(ctx context.Context, reqPath string) (*model.Link, error) {
-	if v.isReservedContainerPath(reqPath) {
-		return nil, driver.ErrForbidden
+	if hit, _ := v.classify(reqPath); hit {
+		// 容器本身或容器下非加密单元：一律「未找到」（不认识即不管；_mc 的 403 屏蔽不受影响）
+		return nil, notFoundErr(reqPath)
 	}
 	r, inner, hit := v.findRoot(reqPath)
 	if !hit {

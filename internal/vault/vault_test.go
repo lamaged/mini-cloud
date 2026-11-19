@@ -182,9 +182,9 @@ func TestVaultListVirtual(t *testing.T) {
 	if _, err := v.List(context.Background(), "/backup/dir1/_mc"); !errors.Is(err, driver.ErrForbidden) {
 		t.Errorf("子根 _mc List 应 403，got %v", err)
 	}
-	// 容器级保留名（旧结构 _mc）：403
-	if _, err := v.List(context.Background(), "/backup/_mc"); !errors.Is(err, driver.ErrForbidden) {
-		t.Errorf("保留名 _mc List 应 403，got %v", err)
+	// 容器级保留名（旧结构 _mc）：非单元 → 未找到（统一口径；扫描告警提示迁移）
+	if _, err := v.List(context.Background(), "/backup/_mc"); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("保留名 _mc List 应未找到，got %v", err)
 	}
 }
 
@@ -615,15 +615,9 @@ func TestContainerScanAutoDiscover(t *testing.T) {
 	f.files["backup/dir2/"+ObjectPath(objID2)] = buf2.Bytes()
 	f.files["backup/dir2/_mc/manifest.mcf"] = mf2.Bytes()
 
-	// 扫描前：dir2 是普通目录（物理视图含 _mc，不含虚拟树）
-	pre, err := v.List(context.Background(), "/backup/dir2")
-	if err != nil {
-		t.Fatalf("List dir2: %v", err)
-	}
-	for _, o := range pre {
-		if o.Name == "剧集" {
-			t.Error("扫描前 dir2 不应有虚拟树")
-		}
+	// 扫描前：dir2 非加密单元 → 「未找到」（PM 口径：不认识即不管）
+	if _, err := v.List(context.Background(), "/backup/dir2"); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("扫描前非单元路径应未找到，got %v", err)
 	}
 	// 同步扫描（模拟 TTL 到期后的后台扫描）
 	v.scan(context.Background(), "backup", false)
@@ -733,14 +727,18 @@ func TestContainerRemoveRoot(t *testing.T) {
 	if exists {
 		t.Error("云端消失的子目录应被摘除")
 	}
-	// 回落普通模式：dir1 虚拟树消失（内容为空）
-	objs, err := v.List(context.Background(), "/backup/dir1")
+	// 摘除后：非单元路径「未找到」（PM 口径）
+	if _, err := v.List(context.Background(), "/backup/dir1"); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("摘除后应未找到，got %v", err)
+	}
+	// 容器列表仅含加密单元：dir1 不再出现
+	objs, err := v.List(context.Background(), "/backup")
 	if err != nil {
-		t.Fatalf("摘除后 List: %v", err)
+		t.Fatalf("容器列表: %v", err)
 	}
 	for _, o := range objs {
-		if o.Name == "电影" {
-			t.Error("摘除后虚拟树残留")
+		if o.Name == "dir1" {
+			t.Error("摘除后容器列表不应再含 dir1")
 		}
 	}
 }
@@ -752,11 +750,11 @@ func TestContainerReservedName(t *testing.T) {
 	v := newTestVault(t, f, master, 4)
 	defer v.Stop()
 
-	if _, err := v.List(context.Background(), "/backup/_mc"); !errors.Is(err, driver.ErrForbidden) {
-		t.Errorf("保留名目录应 403，got %v", err)
+	if _, err := v.List(context.Background(), "/backup/_mc"); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("保留名目录应未找到，got %v", err)
 	}
-	if _, err := v.Link(context.Background(), "/backup/_mc/manifest.mcf"); !errors.Is(err, driver.ErrForbidden) {
-		t.Errorf("保留名文件 Link 应 403，got %v", err)
+	if _, err := v.Link(context.Background(), "/backup/_mc/manifest.mcf"); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("保留名文件 Link 应未找到，got %v", err)
 	}
 	if !strings.Contains(v.Warning(), "保留名") {
 		t.Errorf("应告警提示迁移，got %q", v.Warning())
@@ -773,9 +771,12 @@ func TestContainerNestedMcWarning(t *testing.T) {
 	if !strings.Contains(v.Warning(), "更深层 _mc") {
 		t.Errorf("第三层 _mc 应触发告警，got %q", v.Warning())
 	}
-	// dir2 不是 vault 单元：物理视图
-	if _, err := v.List(context.Background(), "/backup/dir2/子"); err != nil {
-		t.Errorf("非单元目录应走物理视图，got %v", err)
+	// dir2 不是 vault 单元：「未找到」——不认识即不管（密文同样拿不到）
+	if _, err := v.List(context.Background(), "/backup/dir2/子"); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("非单元路径应未找到，got %v", err)
+	}
+	if _, err := v.Link(context.Background(), "/backup/dir2/子/_mc/manifest.mcf"); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("深层 _mc 的 Link 应未找到，got %v", err)
 	}
 }
 
