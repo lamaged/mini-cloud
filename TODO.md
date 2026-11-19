@@ -31,6 +31,8 @@
 
 ## 技术债
 
+- [ ] **天翼 limitrate 调研（Phase 2，RV-2026-11-19-01 P13）**：天翼家庭 CDN 签名 URL 带 `x-amz-limitrate=51200`（~50 Mbps 限速，4K 高码率必然卡顿）——调研能否通过天翼 Link 请求参数提高 limitrate 或换更高速的链接接口
+
 - [ ] Vault 健康提示（Warning()）接入 /admin 管理页展示——当前仅日志与测试使用（RV-17-05 P22），Phase 1 落地
 
 - [ ] 云盘驱动（tianyi / mobile / baidu）无单元测试——用 httptest 假服务器补齐（策略见 docs/design.md §2）
