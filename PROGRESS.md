@@ -24,6 +24,7 @@
 | 2026-11-16 | **闸门① 通过（PM 批准），v0.10.0 实现完成**：两阶段 CredentialUpdater + internal/admin 管理页（CSRF、html/template 转义）+ mobile 实现（临时客户端验证、按 __req 隔离、凭证/缓存代次防护）+ conf 原子写/0600/备份 + 3 处转义修复（buildHref 百分号编码、目录页/根页转义）。自查（/code-review high）15 条全部修复；`go vet` + `go test -race` 全绿；ARM64 交叉编译通过；实现期修订记录于 design.md §3.8 |
 | 2026-11-16 | **闸门③ 外部代码审核 RV-2026-11-16-03（结论：有条件通过）**：I1–I6 全部修复（更新串行化、LoadStrict 严格读取、目录 fsync、WriteCredential 测试、401×提交竞态测试、提交失败 .bak 回滚），P1–P9 全部落实（状态码、安全响应头、version v0.10.0、Stop 幂等、字段同步、编码去重、24h 门槛、文档修正、自查留痕表）；`go vet` + `go test -race` 全绿；ARM64 交叉编译通过 |
 | 2026-11-16 | **部署脚本完成（PM 拍板：审核后立即写、单独提交）**：scripts/deploy-prepare.sh（开发机编译+UPX+暂存，端到端跑通）+ scripts/deploy-router.sh（路由器拉取+备份+重启+健康检查+失败回滚，busybox ash 兼容，语法与健康检查解析本地验证通过）；体积观察项（铁律 10）：ARM64 原始 8,716,472 B → UPX 后 2,974,696 B（v0.9.2 基线 UPX 约 2.3 MB，增量主要来自 html/template 与凭证相关代码）；真机验证属闸门⑤ |
+| 2026-11-19 | **Phase 2 代码审核 RV-2026-11-19-04（闸门③ 有条件通过）处置**：无 I 级；P5 核实已闭环（credential.go:106 提交清除 hostWarn + TestHostWarnClearedOnCommit，审核员 diff 遗漏）；P1 容器级 List 包 5s 短超时；P2 初始扫描子目录并发（WaitGroup，启动总时长 ≈ 单目录）；P3 disableVault 后中断扫描循环（isDisabled 早退）；P4 移动 List/Link 对 host 为空降级（空目录/明确错误，与过期对齐）+ TestNoHostDegradedList；`go vet` + `go test -race` 全绿、ARM64 通过 |
 | 2026-11-19 | **Phase 2 实现完成（§5.1 容器自动发现 + §5.2 提示接 /admin + §5.3 移动启动健壮性）**：vault 两级重构（containers 容器 → 子根 roots；findRoot 两级匹配；保留名 `_` 屏蔽 403；scan 懒刷新 5min TTL + refreshMu TryLock 去重 + 后台 ctx P9 + 每目录 ≤5s 短超时 + 失败隔离；I4 摘要比对 LoadManifestSum（解密后内容 SHA-256）+ 原子交换 + InvalidateAll；8MiB 热刷新守卫；P7 深层 _mc 检测告警；新增 6 组容器测试 + 既有 12 组迁移）；§5.2 双通道告警（驱动 HealthReporter 原始断言 + Vault.Warning 合并，铁律 7）；§5.3 mobile Init 发现失败不阻断（10s 短超时、hostWarn 提示、提交清除）+ 3 组测试；`go vet` + `go test -race` 全绿（9 包）、ARM64 交叉编译通过 |
 | 2026-11-19 | **Phase 2 设计复核 RV-2026-11-19-03（闸门① 放行）处置**：I1–I4/P1–P6 全部闭环；P10 措辞即时修正（整块覆盖≠就地修改，入 design）；P7 嵌套 _mc 检测告警、P8 旧对象残留（TODO 记录）、P9 扫描 goroutine 后台 ctx——三条入实现期清单；评审确认原子单元模型与物理三层精确化是良好收敛 |
 | 2026-11-19 | **Phase 2 设计评审 RV-2026-11-19-02（闸门① 有条件通过）处置**：PM 拍板 I1（接受一级目录名明文，高敏感场景的间接层后续再加）、I2（子目录内全量重加密可接受，按剧集/专辑/年份适度粒度）；补 I3（扫描不阻塞：触发 List 立即返回旧树 + 一次性 goroutine 异步换树 + manifest 读独立 ≤5s 短超时 + 单目录失败隔离）；补 I4（摘要 = 解密后内容 SHA-256，不做 generation 字段）；P1 两级结构（容器→子根，isMcPath 按第二段）；P2 mcrypt 逐子目录用法与上传顺序；P3 旧单根迁移两法（云盘移 _mc 零重加密 / 逐组重跑）；P4 stray 文件按普通文件兜底；P5 PROGRESS 进行中清理；P6 交叉引用核对无残留；design 升 v0.6 待 PM 批准闸门① |
@@ -372,3 +373,13 @@
 | P8 | 建议 | 整块换新残留旧对象 | 实现期补 | 文档提示「换新后清理旧 _mc/o」；mcrypt --clean 评估入技术债（TODO 已记） | 待实现 | | 2026-11-19 |
 | P9 | 建议 | 异步扫描 goroutine 的 ctx 语义 | 实现期补 | 扫描用后台 ctx（非请求 ctx），仅受每目录 ≤5s 超时约束；代码注释注明 | 待实现 | | 2026-11-19 |
 | P10 | 建议 | 「就地覆盖 vs 就地修改」措辞 | 已改 | design 使用模型补一句：整块覆盖=换新（允许）、单文件就地改=拒绝 | 已闭环 | 通过 | 2026-11-19 |
+
+### RV-2026-11-19-04（Phase 2 代码审核，闸门③ 有条件通过，5 条）
+
+| 编号 | 级别 | 意见摘要 | 处置类别 | 处置说明 | 状态 | 复核 | 日期 |
+|---|---|---|---|---|---|---|---|
+| P5 | 需确认 | CommitCredential 是否清除 hostWarn | 已核实 | credential.go:106 已清 + TestHostWarnClearedOnCommit 已断言（审核 diff 遗漏该文件） | 已闭环 | 通过 | 2026-11-19 |
+| P1 | 建议 | 容器级 raw.List 无短超时 | 已改 | scan 的容器 List 包 manifestReadTimeout（≤5s），与每目录口径一致 | 已闭环 | 待复核 | 2026-11-19 |
+| P2 | 建议 | 初始同步扫描串行 N×5s 阻塞启动 | 已改 | 子目录并发扫描（WaitGroup），总时长 ≈ 单目录 5s | 已闭环 | 待复核 | 2026-11-19 |
+| P3 | 建议 | disableVault 后 scan 循环继续 | 已改 | isDisabled() 早退（refreshRoot 入口 + 扫描循环 break） | 已闭环 | 待复核 | 2026-11-19 |
+| P4 | 建议 | 有效 token + host 失败时 List 仍 500 | 已改 | List/Link 对 host 为空降级（空目录/明确错误，与过期语义对齐）+ 测试 | 已闭环 | 待复核 | 2026-11-19 |

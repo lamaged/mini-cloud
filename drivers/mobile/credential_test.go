@@ -345,3 +345,15 @@ func TestHostWarnClearedOnCommit(t *testing.T) {
 	}
 }
 
+// TestNoHostDegradedList P4（RV-2026-11-19-04）：token 有效但云主机不可用
+//（启动期发现失败）→ List 空目录、Link 明确错误（与过期场景对齐，不 500）
+func TestNoHostDegradedList(t *testing.T) {
+	d := New("移动云盘", makeAuth("13800000000", time.Now().Add(30*24*time.Hour)), t.TempDir())
+	// 不调用 Init（避免真实网络）；host 为空即模拟「发现失败后受限启动」状态
+	if objs, err := d.List(context.Background(), "/"); err != nil || len(objs) != 0 {
+		t.Errorf("host 不可用时 List 应返回空目录: %v %+v", err, objs)
+	}
+	if _, err := d.Link(context.Background(), "/a.mkv"); err == nil {
+		t.Error("host 不可用时 Link 应返回明确错误")
+	}
+}

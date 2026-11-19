@@ -203,8 +203,9 @@ func (d *Driver) saveTokenState() error {
 // ============================================================
 
 func (d *Driver) List(ctx context.Context, reqPath string) ([]model.Obj, error) {
-	if d.client.isExpired() {
-		// authorization 已过期：返回空目录，避免 500，由 HealthWarning 提示用户
+	if d.client.isExpired() || d.client.getCloudHost() == "" {
+		// authorization 已过期或云主机不可用（启动期发现失败，P4）：返回空目录，
+		// 避免 500，由 HealthWarning 提示用户
 		return nil, nil
 	}
 
@@ -275,6 +276,9 @@ func (d *Driver) resolveByWalk(ctx context.Context, parentID string, parts []str
 func (d *Driver) Link(ctx context.Context, filePath string) (*model.Link, error) {
 	if d.client.isExpired() {
 		return nil, fmt.Errorf("移动云盘 authorization 已过期，请更新 config.json")
+	}
+	if d.client.getCloudHost() == "" {
+		return nil, fmt.Errorf("移动云盘云主机不可用（启动期发现失败），请到 /admin 更新凭证或稍后重启")
 	}
 
 	parentPath := path.Dir(filePath)

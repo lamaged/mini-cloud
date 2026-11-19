@@ -163,7 +163,7 @@ func (v *Vault) Init(ctx context.Context) error {
 
 // scan 扫描容器（sync=true 同步初始扫描；否则为懒刷新）。
 // refreshMu 串行化：并发触发只有一个执行（TryLock 失败即返回，§5.1 去重）。
-func (v *Vault) scan(ctx context.Context, name string, sync bool) {
+func (v *Vault) scan(ctx context.Context, name string, initial bool) {
 	v.mu.RLock()
 	c := v.containers[name]
 	v.mu.RUnlock()
@@ -178,14 +178,16 @@ func (v *Vault) scan(ctx context.Context, name string, sync bool) {
 	// P9（RV-2026-11-19-03）：懒刷新用后台 ctx——客户端断开不取消扫描；
 	// 仅受每目录 manifestReadTimeout 短超时约束。
 	bg := ctx
-	if !sync {
+	if !initial {
 		bg = context.Background()
 	}
 	v.mu.Lock()
 	c.lastScan = time.Now()
 	v.mu.Unlock()
 
-	objs, err := v.raw.List(bg, "/"+name)
+	lctx, cancel := context.WithTimeout(bg, manifestReadTimeout) // P1：容器级 List 同样 ≤5s
+	objs, err := v.raw.List(lctx, "/"+name)
+	cancel()
 	if err != nil {
 		v.setContainerWarning(name, fmt.Sprintf("容器扫描失败（%s）", err))
 		return
@@ -201,19 +203,40 @@ func (v *Vault) scan(ctx context.Context, name string, sync bool) {
 		return
 	}
 	v.pruneRoots(name, dirs)
+	// P2（RV-2026-11-19-04）：子目录并发扫描——初始同步扫描最坏 N×5s 阻塞启动，
+	// 并发后受各目录 5s 超时约束、总时长 ≈ 单目录（上限 32 目录守卫）
+	var wg sync.WaitGroup
 	for _, d := range dirs {
 		if strings.HasPrefix(d, "_") {
 			// 保留名（旧结构 _mc 等）：屏蔽 + 告警（§5.1，防旧结构密文泄露）
 			v.setContainerWarning(name, fmt.Sprintf("发现保留名目录 %q（旧结构？已屏蔽，请迁移到 <名字>/_mc）", d))
 			continue
 		}
-		v.refreshRoot(bg, name, d)
+		if v.isDisabled() {
+			break // P3：驱动能力不足（铁律 2）已禁用整挂载，停止无谓的网络扫描
+		}
+		wg.Add(1)
+		go func(d string) {
+			defer wg.Done()
+			v.refreshRoot(bg, name, d)
+		}(d)
 	}
+	wg.Wait()
+}
+
+// isDisabled 驱动不支持 Vault（代理流）标记
+func (v *Vault) isDisabled() bool {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return v.disabled
 }
 
 // refreshRoot 扫描单个子目录（加密单元）：判定 _mc 存在 → 读清单 → 摘要比对 → 原子重建。
 // 失败隔离（I3）：单目录失败记告警、跳过，绝不拖累整体；下周期重试。
 func (v *Vault) refreshRoot(ctx context.Context, cont, dir string) {
+	if v.isDisabled() {
+		return // P3：禁用后不再做无谓的网络调用
+	}
 	mctx, cancel := context.WithTimeout(ctx, manifestReadTimeout)
 	defer cancel()
 
