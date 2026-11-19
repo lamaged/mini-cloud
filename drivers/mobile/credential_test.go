@@ -357,3 +357,55 @@ func TestNoHostDegradedList(t *testing.T) {
 		t.Error("host 不可用时 Link 应返回明确错误")
 	}
 }
+
+// TestCredentialFieldsDynamic PM 拍板 2026-11-19：标签按状态动态变化
+func TestCredentialFieldsDynamic(t *testing.T) {
+	// 已过期 → 获取指引
+	expiredAuth := makeAuth("13800000000", time.Now().Add(-time.Hour))
+	d := New("移动云盘", expiredAuth, t.TempDir())
+	d.client.SetAuth(expiredAuth, "13800000000", "")
+	f := d.CredentialFields()[0]
+	if f.Key != "authorization" || !strings.Contains(f.Label, "已过期") || !strings.Contains(f.Label, "开发者工具") {
+		t.Errorf("过期标签不符: %+v", f)
+	}
+	// 30 天 → 剩余天数
+	auth30 := makeAuth("13800000000", time.Now().Add(30*24*time.Hour))
+	d2 := New("移动云盘", auth30, t.TempDir())
+	d2.client.SetAuth(auth30, "13800000000", "")
+	f2 := d2.CredentialFields()[0]
+	if !strings.Contains(f2.Label, "有效期还有 30 天") {
+		t.Errorf("30 天标签不符: %q", f2.Label)
+	}
+	// 12 小时 → 不足 1 天
+	auth12h := makeAuth("13800000000", time.Now().Add(12*time.Hour))
+	d3 := New("移动云盘", auth12h, t.TempDir())
+	d3.client.SetAuth(auth12h, "13800000000", "")
+	f3 := d3.CredentialFields()[0]
+	if !strings.Contains(f3.Label, "不足 1 天") {
+		t.Errorf("12 小时标签不符: %q", f3.Label)
+	}
+	// 过期文案（HealthWarning）
+	if w := d.HealthWarning(); w != "令牌已过期，请更新令牌" {
+		t.Errorf("过期提示文案不符: %q", w)
+	}
+}
+
+// TestRemainingDaysCeil 天数向上取整
+func TestRemainingDaysCeil(t *testing.T) {
+	a25h := makeAuth("13800000000", time.Now().Add(25*time.Hour))
+	d := New("移动云盘", a25h, t.TempDir())
+	d.client.SetAuth(a25h, "13800000000", "")
+	if got := d.remainingDays(); got != 2 {
+		t.Errorf("25 小时应向上取整为 2 天，got %d", got)
+	}
+	a23h := makeAuth("13800000000", time.Now().Add(23*time.Hour))
+	d2 := New("移动云盘", a23h, t.TempDir())
+	d2.client.SetAuth(a23h, "13800000000", "")
+	if got := d2.remainingDays(); got != 1 {
+		t.Errorf("23 小时应为 1 天，got %d", got)
+	}
+	d3 := New("移动云盘", "!!invalid!!", t.TempDir())
+	if got := d3.remainingDays(); got != -1 {
+		t.Errorf("解析失败应为 -1，got %d", got)
+	}
+}

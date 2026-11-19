@@ -91,7 +91,7 @@ func main() {
 		m := &mounts[i]
 		am := admin.Mount{Name: m.Name, Prefix: m.Prefix}
 		if up, ok := m.Drv.(driver.CredentialUpdater); ok {
-			am.Fields = up.CredentialFields()
+			am.FieldsFunc = up.CredentialFields // 动态标签（剩余有效期/获取指引），渲染时现取
 			am.Update = up
 		}
 		am.Warning = func() string {
@@ -377,7 +377,7 @@ func displayName(m mountedDriver) string {
 	}
 	if hr, ok := m.Drv.(driver.HealthReporter); ok {
 		if w := hr.HealthWarning(); w != "" {
-			return w
+			return label + "：" + w // 挂载名 + 告警（如「移动云盘：令牌已过期，请更新令牌」）
 		}
 	}
 	return label

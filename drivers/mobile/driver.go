@@ -67,11 +67,11 @@ func (d *Driver) Name() string {
 	return "mobile"
 }
 
-// HealthWarning 返回健康提示：authorization 过期时提示用户更新；
+// HealthWarning 返回健康提示：authorization 过期时提示用户更新（文案 PM 拍板 2026-11-19）；
 // 未过期但启动期云主机发现失败时提示服务受限（§5.3，接 /admin 展示 §5.2）
 func (d *Driver) HealthWarning() string {
 	if d.client.isExpired() {
-		return "移动云盘authorization已经过期，请更新"
+		return "令牌已过期，请更新令牌"
 	}
 	d.commitMu.Lock()
 	w := d.hostWarn

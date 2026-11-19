@@ -21,11 +21,20 @@ import (
 
 // Mount 管理页展示的挂载信息（由 main 注入）
 type Mount struct {
-	Name    string                   // 挂载名（与配置 name 一致）
-	Prefix  string                   // URL 前缀
-	Fields  []driver.CredentialField // 凭证字段
-	Warning func() string            // 当前健康提示（可为 nil）
-	Update  driver.CredentialUpdater // 更新实现
+	Name       string                   // 挂载名（与配置 name 一致）
+	Prefix     string                   // URL 前缀
+	Fields     []driver.CredentialField // 凭证字段（静态；FieldsFunc 优先）
+	FieldsFunc func() []driver.CredentialField // 渲染时现取（动态标签，如剩余有效期，PM 拍板 2026-11-19）
+	Warning    func() string            // 当前健康提示（可为 nil）
+	Update     driver.CredentialUpdater // 更新实现
+}
+
+// fieldList 取当前凭证字段（FieldsFunc 优先，渲染/提交同一来源）
+func (m *Mount) fieldList() []driver.CredentialField {
+	if m.FieldsFunc != nil {
+		return m.FieldsFunc()
+	}
+	return m.Fields
 }
 
 // PersistFunc 把验证通过的新凭证写回配置（由 main 提供）。
@@ -127,7 +136,7 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 
 	values := make(map[string]string)
 	values["__req"] = randomToken() // 更新请求唯一标识：驱动按它关联验证与提交，隔离并发更新
-	for _, f := range m.Fields {
+	for _, f := range m.fieldList() {
 		values[f.Key] = strings.TrimSpace(r.PostFormValue(f.Key))
 	}
 
@@ -195,8 +204,9 @@ func (h *Handler) render(w http.ResponseWriter, status int, message, errMsg stri
 
 	for i := range h.mounts {
 		m := &h.mounts[i]
-		fm := formMount{Name: m.Name, Prefix: m.Prefix, Fields: m.Fields}
-		if len(m.Fields) > 0 {
+		fields := m.fieldList() // 渲染时现取（动态标签）
+		fm := formMount{Name: m.Name, Prefix: m.Prefix, Fields: fields}
+		if len(fields) > 0 {
 			fm.CSRF = h.newToken() // 仅凭证挂载需要 CSRF（无表单的状态卡不产生提交）
 		}
 		if m.Warning != nil {
@@ -238,7 +248,7 @@ a{color:#0366d6}
 {{if .Message}}<p class="ok">{{.Message}}</p>{{end}}
 {{range .Mounts}}
 <div class="card">
-<h2>{{.Name}} <span class="path">{{.Prefix}}/</span></h2>
+<h2>{{.Name}}</h2>
 {{if .Warn}}<p class="warn">当前状态：{{.Warn}}</p>{{else}}<p class="warn" style="color:#1b5e20;background:#e8f5e9">当前状态：正常</p>{{end}}
 {{if .Fields}}
 <form method="POST" action="/admin/update">

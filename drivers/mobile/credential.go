@@ -17,11 +17,37 @@ import (
 // __expiry（驱动回填，显示用）。并发更新按 __req 隔离。
 // ============================================================
 
-// CredentialFields 返回可更新的凭证字段（供管理页渲染表单）
+// CredentialFields 返回可更新的凭证字段（供管理页渲染表单）。
+// 标签按当前状态动态变化（PM 拍板 2026-11-19）：未过期显示剩余天数、已过期显示获取指引；
+// 渲染时现取（admin Mount.FieldsFunc），非启动时定死。
 func (d *Driver) CredentialFields() []driver.CredentialField {
-	return []driver.CredentialField{
-		{Key: "authorization", Label: "authorization（Base64 认证令牌，从 alist 等工具获取）", Kind: "password"},
+	label := "authorization"
+	if d.client.isExpired() {
+		label = "authorization 已过期，可登录移动云盘网页后，用浏览器开发者工具获得"
+	} else if _, _, _, expiration, err := d.client.parseAuthorization(); err == nil {
+		remain := time.Duration(expiration-time.Now().UnixMilli()) * time.Millisecond
+		if remain < 24*time.Hour {
+			label = "authorization（有效期不足 1 天，请尽快更新）"
+		} else {
+			label = fmt.Sprintf("authorization（有效期还有 %d 天）", (remain+24*time.Hour-1)/(24*time.Hour))
+		}
 	}
+	return []driver.CredentialField{
+		{Key: "authorization", Label: label, Kind: "password"},
+	}
+}
+
+// remainingDays 剩余有效天数（向上取整；解析失败返回 -1）
+func (d *Driver) remainingDays() int {
+	_, _, _, expiration, err := d.client.parseAuthorization()
+	if err != nil {
+		return -1
+	}
+	remain := time.Duration(expiration-time.Now().UnixMilli()) * time.Millisecond
+	if remain <= 0 {
+		return 0
+	}
+	return int((remain + 24*time.Hour - 1) / (24 * time.Hour))
 }
 
 // ValidateCredential 校验 authorization 格式并用一次性临时客户端做网络验证。
