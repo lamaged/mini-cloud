@@ -139,6 +139,9 @@ func buildTestVault(t *testing.T, withManifest bool) (*fakeRaw, []byte, []byte) 
 
 func newTestVault(t *testing.T, f *fakeRaw, master []byte, maxStreams int) *Vault {
 	t.Helper()
+	// R2-1：上限为进程级共享——测试按需设置并恢复（默认 3）
+	SetGlobalStreamLimit(maxStreams)
+	t.Cleanup(func() { SetGlobalStreamLimit(3) })
 	v := New(f, f, master, Config{Paths: []string{"backup"}, MaxStreams: maxStreams})
 	if err := v.Init(context.Background()); err != nil {
 		t.Fatalf("Init: %v", err)
@@ -285,6 +288,8 @@ func TestVaultURLOnlyDriverUnreadableManifest(t *testing.T) {
 // buildURLVault 构造 URL 型驱动的完整 vault（httptest CDN 同时服务 manifest 与对象）
 func buildURLVault(t *testing.T, maxStreams int) (*Vault, *fakeURLDriver, *rangeCDN, []byte, string) {
 	t.Helper()
+	SetGlobalStreamLimit(maxStreams) // R2-1：全局共享上限
+	t.Cleanup(func() { SetGlobalStreamLimit(3) })
 	master := bytes.Repeat([]byte{0x6B}, 32)
 	plain := []byte("Phase1 云盘播放端到端内容 hello tianyi!")
 	fileID := [16]byte{3, 3, 3, 3}
@@ -488,6 +493,8 @@ func TestVaultLinkEmptyMIME(t *testing.T) {
 // TestVaultStreamLimitDoubleClose P16：重复 Close 幂等（信号量只释放一次）
 func TestVaultStreamLimitDoubleClose(t *testing.T) {
 	f, master, _ := buildTestVault(t, true)
+	SetGlobalStreamLimit(1) // R2-1：全局共享上限
+	t.Cleanup(func() { SetGlobalStreamLimit(3) })
 	v := New(f, f, master, Config{Paths: []string{"backup"}, MaxStreams: 1})
 	if err := v.Init(context.Background()); err != nil {
 		t.Fatalf("Init: %v", err)
@@ -513,6 +520,8 @@ func TestVaultStreamLimitDoubleClose(t *testing.T) {
 
 func TestVaultStreamLimit(t *testing.T) {
 	f, master, _ := buildTestVault(t, true)
+	SetGlobalStreamLimit(1) // R2-1：全局共享上限
+	t.Cleanup(func() { SetGlobalStreamLimit(3) })
 	v := New(f, f, master, Config{Paths: []string{"backup"}, MaxStreams: 1})
 	if err := v.Init(context.Background()); err != nil {
 		t.Fatalf("Init: %v", err)
@@ -855,4 +864,42 @@ func TestContainerWarningClears(t *testing.T) {
 	if _, err := v.List(context.Background(), "/backup/dir2"); err != nil {
 		t.Errorf("dir2 应成为加密单元: %v", err)
 	}
+}
+
+// TestGlobalStreamSemShared R2-1：并发额度进程级共享——A 挂载占用后 B 挂载同被限制
+func TestGlobalStreamSemShared(t *testing.T) {
+	SetGlobalStreamLimit(1)
+	t.Cleanup(func() { SetGlobalStreamLimit(3) })
+	f, master, _ := buildTestVault(t, true)
+	va := New(f, f, master, Config{Paths: []string{"backup"}})
+	if err := va.Init(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer va.Stop()
+	vb := New(f, f, master, Config{Paths: []string{"backup"}})
+	if err := vb.Init(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer vb.Stop()
+
+	old := acquireTimeout
+	acquireTimeout = 100 * time.Millisecond
+	defer func() { acquireTimeout = old }()
+
+	linkA, err := va.Link(context.Background(), "/backup/dir1/电影/a.mkv")
+	if err != nil {
+		t.Fatalf("A 挂载 Link: %v", err)
+	}
+	// B 挂载（不同 Vault 实例）应受同一全局额度限制
+	if _, err := vb.Link(context.Background(), "/backup/dir1/电影/a.mkv"); err == nil {
+		linkA.Reader.Close()
+		t.Fatal("全局额度下 B 挂载应被拒绝")
+	}
+	linkA.Reader.Close()
+	// 释放后 B 可获取
+	linkB, err := vb.Link(context.Background(), "/backup/dir1/电影/a.mkv")
+	if err != nil {
+		t.Fatalf("释放后 B Link: %v", err)
+	}
+	linkB.Reader.Close()
 }

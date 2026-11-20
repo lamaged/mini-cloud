@@ -91,25 +91,30 @@ func cmdKeygen(args []string) error {
 	}
 	// P0（外部审核 2026-11-20）：排他创建，防误覆盖——
 	// 覆盖 = 所有用旧密钥加密的数据永久不可解，默认必须拒绝
-	flags := os.O_WRONLY | os.O_CREATE | os.O_EXCL
-	if *force {
-		flags = os.O_WRONLY | os.O_CREATE | os.O_TRUNC
-	}
-	f, err := os.OpenFile(*keyPath, flags, 0600)
-	if err != nil {
-		if os.IsExist(err) {
-			return fmt.Errorf("密钥文件已存在（%s）——覆盖会导致所有已加密数据无法解密；确认要作废旧密钥请加 --force", *keyPath)
+	if !*force {
+		f, err := os.OpenFile(*keyPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+		if err != nil {
+			if os.IsExist(err) {
+				return fmt.Errorf("密钥文件已存在（%s）——覆盖会导致所有已加密数据无法解密；确认要作废旧密钥请加 --force", *keyPath)
+			}
+			return fmt.Errorf("创建密钥文件失败: %w", err)
 		}
-		return fmt.Errorf("创建密钥文件失败: %w", err)
-	}
-	if _, err := f.Write(key); err != nil {
-		f.Close()
-		os.Remove(*keyPath) // 写入失败：清理不完整文件，不留半成品
-		return fmt.Errorf("写密钥失败: %w", err)
-	}
-	if err := f.Close(); err != nil {
-		os.Remove(*keyPath) // 关闭失败（如落盘错误）：同样不留半成品
-		return fmt.Errorf("关闭密钥文件失败: %w", err)
+		if _, err := f.Write(key); err != nil {
+			f.Close()
+			os.Remove(*keyPath) // 写入失败：清理不完整文件，不留半成品
+			return fmt.Errorf("写密钥失败: %w", err)
+		}
+		if err := f.Close(); err != nil {
+			os.Remove(*keyPath) // 关闭失败（如落盘错误）：同样不留半成品
+			return fmt.Errorf("关闭密钥文件失败: %w", err)
+		}
+	} else {
+		// R2-2（外部审核 2026-11-20）：--force 原子替换（temp + fsync + rename）——
+		// 先截断旧钥再写（O_TRUNC）在写失败时会永久丢失旧密钥；原子替换则
+		// 任何失败旧钥纹丝不动，且 temp 显式 0600（存量文件权限不收紧的坑一并解决）
+		if err := writeKeyAtomic(*keyPath, key); err != nil {
+			return fmt.Errorf("覆盖密钥失败（旧密钥未受影响）: %w", err)
+		}
 	}
 	if *force {
 		fmt.Printf("已覆盖 master key：%s（32 字节，0600）——旧密钥已作废！\n", *keyPath)
@@ -117,6 +122,48 @@ func cmdKeygen(args []string) error {
 		fmt.Printf("已生成 master key：%s（32 字节，0600）\n", *keyPath)
 	}
 	fmt.Println("警告：master key 永不传上网盘、必须离线备份；丢失 = 数据不可恢复。")
+	return nil
+}
+
+// mustDecodeFileID 解码 fileID（解密前已由 DecodeFileID 校验过，此处仅重解码用于路径比对）
+func mustDecodeFileID(s string) [16]byte {
+	id, _ := vault.DecodeFileID(s)
+	return id
+}
+
+// writeKeyAtomic 原子写密钥文件（temp 同目录 + chmod 0600 + fsync + rename）；
+// 任一步失败删除 temp、正式文件不动（R2-2）
+func writeKeyAtomic(keyPath string, key []byte) error {
+	dir := filepath.Dir(keyPath)
+	tmp, err := os.CreateTemp(dir, ".vault.key.tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	cleanup := func() {
+		tmp.Close()
+		os.Remove(tmpPath)
+	}
+	if err := tmp.Chmod(0600); err != nil {
+		cleanup()
+		return err
+	}
+	if _, err := tmp.Write(key); err != nil {
+		cleanup()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		cleanup()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpPath)
+		return err
+	}
+	if err := os.Rename(tmpPath, keyPath); err != nil {
+		os.Remove(tmpPath)
+		return err
+	}
 	return nil
 }
 
@@ -161,6 +208,11 @@ func cmdEncrypt(args []string) error {
 			return nil
 		}
 		virtual := "/" + filepath.ToSlash(rel)
+		// R2-5（外部审核 2026-11-20）：提前校验虚拟路径规范——
+		// 超长/超深的本地目录在加密时即报错，而非生成服务端拒载的清单
+		if err := vault.ValidateVirtualPath(virtual); err != nil {
+			return fmt.Errorf("路径不规范: %w", err)
+		}
 		if d.IsDir() {
 			m.Dirs = append(m.Dirs, virtual)
 			return nil
@@ -272,6 +324,11 @@ func cmdDecrypt(args []string) error {
 	}
 	count := 0
 	for _, e := range m.Files {
+		// R2-4（外部审核 2026-11-20）：对象路径必须与 fileID 推导一致——
+		// 防清单把解密指向任意文件（含符号链接目标）
+		if e.Obj != vault.ObjectPath(vault.EncodeFileID(mustDecodeFileID(e.FileID))) {
+			return fmt.Errorf("%s: 对象路径与 fileID 不一致，拒绝解密", e.Path)
+		}
 		fileID, err := vault.DecodeFileID(e.FileID)
 		if err != nil {
 			return fmt.Errorf("%s: %w", e.Path, err)
@@ -294,8 +351,14 @@ func cmdDecrypt(args []string) error {
 			return fmt.Errorf("%s: 路径不规范，拒绝解密: %w", e.Path, err)
 		}
 		outPath := filepath.Join(*outDir, filepath.FromSlash(strings.TrimPrefix(e.Path, "/")))
-		outAbs, _ := filepath.Abs(*outDir)
-		pAbs, _ := filepath.Abs(outPath)
+		outAbs, err := filepath.Abs(*outDir)
+		if err != nil {
+			return fmt.Errorf("输出目录解析失败: %w", err)
+		}
+		pAbs, err := filepath.Abs(outPath)
+		if err != nil {
+			return fmt.Errorf("输出路径解析失败: %w", err)
+		}
 		if !strings.HasPrefix(pAbs, outAbs+string(filepath.Separator)) {
 			return fmt.Errorf("%s: 输出路径越界，拒绝解密", e.Path)
 		}

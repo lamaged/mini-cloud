@@ -219,6 +219,9 @@ func main() {
 			os.Exit(1)
 		}
 		vaultCfg = &vault.Config{Paths: cfg.Vault.Paths, MaxStreams: cfg.Vault.MaxStreams}
+		// R2-1（外部审核 2026-11-20）：并发额度进程级共享——装配前设置一次
+		//（默认 3，PM 拍板；配置天花板 4 已由 conf 校验）
+		vault.SetGlobalStreamLimit(cfg.Vault.MaxStreams)
 	}
 
 	// 每个云盘注册到 /<prefix>/

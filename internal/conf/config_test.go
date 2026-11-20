@@ -656,3 +656,59 @@ func TestSelfHealLocalOnlyCustom(t *testing.T) {
 		t.Errorf("自愈后配置不符: %+v", cfg.Server)
 	}
 }
+
+// TestLoadSemanticErrorNoSelfHeal R2-3：JSON 合法但 vault 数值非法 → 直接报错，
+// 不触发 .bak 自愈（原文件不动、.bak 不动）
+func TestLoadSemanticErrorNoSelfHeal(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	content := `{
+    "server": {"listen": ":8088", "username": "myuser", "password": "mypass"},
+    "clouds": [{"name": "本地", "type": "local"}],
+    "vault": {"enabled": true, "key_file": "vault.key", "paths": ["backup/videos"]}
+}`
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// 有效 .bak（另一份好配置）
+	if err := os.WriteFile(path+".bak", []byte(strings.Replace(content, "backup/videos", "backup", 1)), 0644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "vault.paths") {
+		t.Fatalf("语义错误应直接报错，got %v", err)
+	}
+	// 原文件未被回退覆盖
+	got, _ := os.ReadFile(path)
+	if string(got) != content {
+		t.Error("语义错误时原 config.json 不得被 .bak 回退覆盖")
+	}
+}
+
+// TestValidateVaultRules validateVault 边界
+func TestValidateVaultRules(t *testing.T) {
+	cases := []struct {
+		name    string
+		vault   *VaultConfig
+		wantErr string
+	}{
+		{"正常", &VaultConfig{Enabled: true, KeyFile: "k", Paths: []string{"backup", "Archive"}, MaxStreams: 4}, ""},
+		{"空路径", &VaultConfig{Paths: []string{"", "x"}}, "空字符串"},
+		{"多段", &VaultConfig{Paths: []string{"backup/videos"}}, "单段"},
+		{"点", &VaultConfig{Paths: []string{".."}}, "不允许"},
+		{"保留名", &VaultConfig{Paths: []string{"_mc"}}, "保留名"},
+		{"重复", &VaultConfig{Paths: []string{"backup", "backup"}}, "重复"},
+		{"上限", &VaultConfig{Paths: []string{"backup"}, MaxStreams: 5}, "超上限"},
+		{"负数", &VaultConfig{Paths: []string{"backup"}, MaxStreams: -1}, "负数"},
+	}
+	for _, tc := range cases {
+		err := validateVault(tc.vault)
+		if tc.wantErr == "" {
+			if err != nil {
+				t.Errorf("%s 应通过，got %v", tc.name, err)
+			}
+		} else if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+			t.Errorf("%s 应含 %q，got %v", tc.name, tc.wantErr, err)
+		}
+	}
+}

@@ -76,3 +76,48 @@ func TestCmdKeygen(t *testing.T) {
 		t.Error("失败后不得残留密钥文件")
 	}
 }
+
+// TestCmdKeygenForceAtomic R2-2：--force 原子替换——覆盖成功 0600；失败旧钥不动
+func TestCmdKeygenForceAtomic(t *testing.T) {
+	dir := t.TempDir()
+	keyPath := filepath.Join(dir, "vault.key")
+	if err := cmdKeygen([]string{"-key", keyPath}); err != nil {
+		t.Fatal(err)
+	}
+	old, _ := os.ReadFile(keyPath)
+	// 权限收窄为 0644（模拟存量老文件），--force 后应回到 0600
+	if err := os.Chmod(keyPath, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmdKeygen([]string{"-key", keyPath, "--force"}); err != nil {
+		t.Fatalf("--force 覆盖: %v", err)
+	}
+	fi, err := os.Stat(keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0600 {
+		t.Errorf("--force 后权限应 0600，got %o", fi.Mode().Perm())
+	}
+	after, _ := os.ReadFile(keyPath)
+	if bytes.Equal(old, after) {
+		t.Error("--force 后应为新密钥")
+	}
+
+	// 失败路径：目标为目录 → rename 失败 → 目录（旧钥代理）原样不动
+	dirPath := filepath.Join(dir, "kdir")
+	if err := os.Mkdir(dirPath, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmdKeygen([]string{"-key", dirPath, "--force"}); err == nil {
+		t.Error("目标为目录时 --force 应失败")
+	}
+	if fi, err := os.Stat(dirPath); err != nil || !fi.IsDir() {
+		t.Error("失败后原目标必须原样保留")
+	}
+	// 写失败旧钥不变：父目录不存在（连 temp 都建不了）
+	badPath := filepath.Join(dir, "no-such-dir", "vault.key")
+	if err := cmdKeygen([]string{"-key", badPath, "--force"}); err == nil {
+		t.Error("父目录不存在应失败")
+	}
+}

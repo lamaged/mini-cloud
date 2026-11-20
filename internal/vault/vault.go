@@ -50,11 +50,6 @@ type Vault struct {
 	containers map[string]*container // 容器根名 → 容器状态（Phase 2 两级：容器 → 子根）
 	disabled   bool                  // 驱动不支持 Vault（代理流）：全部路径普通模式（铁律 2）
 	stopOnce   sync.Once
-
-	// manifestSem manifest 解析全局并发上限（#4，外部审核 2026-11-20）：
-	// 限制同时解析的清单数（含读取/解密/解压/JSON 多层瞬时内存），
-	// 防 32 子目录并发叠加撑爆 AX6
-	manifestSem chan struct{}
 }
 
 // container 一个 vault 容器根（cfg.Paths 条目；其直接子目录为独立加密单元，§5.1）
@@ -82,6 +77,26 @@ type streamSem struct {
 	mu    sync.Mutex
 	avail int
 	max   int
+}
+
+// 进程级共享额度（R2-1，外部审核 2026-11-20）：跨挂载统一账本——
+// 每挂载独立额度会使内存账失效（3 挂载 × 3 流 = 9 路解密 + 6 路清单解析）。
+// 真正的内存护栏 = 进程级解密流上限 + 进程级 manifest 解析并发 2 + 16 MiB 清单上限，
+// 64 MiB 软上限只是最后一道 GC 兜底。
+var (
+	globalStreamSem   = &streamSem{avail: 3, max: 3}
+	globalManifestSem = make(chan struct{}, 2) // manifest 解析全局并发上限（#4）
+)
+
+// SetGlobalStreamLimit 设置进程级并发解密流上限（main 在装配前按配置调用一次）。
+// n<=0 → 默认 3（PM 拍板 2026-11-20：全局默认 3，不能再高；配置天花板 4 由 conf 校验）。
+func SetGlobalStreamLimit(n int) {
+	globalStreamSem.mu.Lock()
+	if n <= 0 {
+		n = 3
+	}
+	globalStreamSem.avail, globalStreamSem.max = n, n
+	globalStreamSem.mu.Unlock()
 }
 
 func (s *streamSem) acquire(ctx context.Context, timeout time.Duration) bool {
@@ -126,14 +141,15 @@ func New(cached driver.Reader, raw driver.Driver, master []byte, cfg Config) *Va
 		// 默认 3；config 可调高（每流 ≈ 6 MiB，调高前先核算路由器空闲内存）
 		cfg.MaxStreams = 3
 	}
+	// sem 指向进程级共享信号量（R2-1：跨挂载统一额度；上限由 main 经
+	// SetGlobalStreamLimit 在装配前设置一次，cfg.MaxStreams 不再按挂载独立生效）
 	return &Vault{
-		cached:      cached,
-		raw:         raw,
-		master:      master,
-		cfg:         cfg,
-		containers:  make(map[string]*container),
-		sem:         &streamSem{avail: cfg.MaxStreams, max: cfg.MaxStreams},
-		manifestSem: make(chan struct{}, 2), // #4：全局并发解析上限 2
+		cached:     cached,
+		raw:        raw,
+		master:     master,
+		cfg:        cfg,
+		containers: make(map[string]*container),
+		sem:        globalStreamSem,
 	}
 }
 
@@ -292,9 +308,10 @@ func (v *Vault) refreshRoot(ctx context.Context, cont, dir string) string {
 	}
 
 	manifestPath := path.Join(cont, dir, "_mc", "manifest.mcf")
-	// #4：manifest 读取+解析全程持信号量（读取/解密/解压/JSON 多层瞬时内存叠加受控）
-	v.manifestSem <- struct{}{}
-	defer func() { <-v.manifestSem }()
+	// #4/R2-1：manifest 读取+解析全程持**进程级**信号量（读取/解密/解压/JSON
+	// 多层瞬时内存叠加受控；跨挂载共享，3 挂载时仍只有 2 路解析）
+	globalManifestSem <- struct{}{}
+	defer func() { <-globalManifestSem }()
 	link, err := v.raw.Link(mctx, manifestPath)
 	if err != nil {
 		// 网络/对象缺失（上传中间态）：有旧树保留旧树，无旧树建空树

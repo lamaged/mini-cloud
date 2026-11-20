@@ -292,3 +292,62 @@ func writeTestFile(t *testing.T, dir, name string, data []byte) {
 		t.Fatal(err)
 	}
 }
+
+// TestEncryptObjectByteCount #5（外部审核 2026-11-20）：声明与实读字节数不符必须报错
+func TestEncryptObjectByteCount(t *testing.T) {
+	master := bytes.Repeat([]byte{0x42}, 32)
+	fileID := [16]byte{5, 5, 5, 5}
+	meta := &Metadata{V: 1, P: "/a.bin", N: "a.bin", S: 1000, M: 1}
+
+	// 声明 1000，实际 999 → 报错
+	var buf bytes.Buffer
+	_, _, err := EncryptObject(&buf, master, bytes.NewReader(bytes.Repeat([]byte{1}, 999)), 1000, fileID, meta)
+	if err == nil || !strings.Contains(err.Error(), "字节") {
+		t.Errorf("999/1000 应报字节不符，got %v", err)
+	}
+	// 声明 1000，实际 1001 → 报错
+	var buf2 bytes.Buffer
+	_, _, err = EncryptObject(&buf2, master, bytes.NewReader(bytes.Repeat([]byte{1}, 1001)), 1000, fileID, meta)
+	if err == nil || !strings.Contains(err.Error(), "字节") {
+		t.Errorf("1001/1000 应报字节不符，got %v", err)
+	}
+	// 声明 1 MiB+100，实际 1 MiB+99（同为 2 块，块数一致但字节不符）→ 报错
+	var buf3 bytes.Buffer
+	size3 := int64(1<<20 + 100)
+	_, _, err = EncryptObject(&buf3, master, bytes.NewReader(bytes.Repeat([]byte{1}, int(size3)-1)), size3, fileID, meta)
+	if err == nil || !strings.Contains(err.Error(), "字节") {
+		t.Errorf("跨块字节不符应报错，got %v", err)
+	}
+	// 负数 → 报错
+	if _, _, err := EncryptObject(&buf3, master, bytes.NewReader(nil), -1, fileID, meta); err == nil {
+		t.Error("负数 size 应报错")
+	}
+	// 空文件（0/0）→ 成功
+	var buf4 bytes.Buffer
+	if _, _, err := EncryptObject(&buf4, master, bytes.NewReader(nil), 0, fileID, meta); err != nil {
+		t.Errorf("空文件应成功，got %v", err)
+	}
+}
+
+// TestValidateVirtualPathBoundary #3 边界（相对/超深/超长/冗余段）
+func TestValidateVirtualPathBoundary(t *testing.T) {
+	ok := []string{"/a.mkv", "/电影/a.mkv", "/a/b/c/d.mkv"}
+	bad := []string{
+		"a.mkv",            // 相对
+		"/a/../b.mkv",      // ..
+		"/a//b.mkv",        // 冗余段
+		"/",                // 根
+		"/" + strings.Repeat("x/", 100) + "a.mkv",   // 超深
+		"/" + strings.Repeat("x", 2000) + ".mkv",    // 超长
+	}
+	for _, p := range ok {
+		if err := ValidateVirtualPath(p); err != nil {
+			t.Errorf("%q 应通过：%v", p, err)
+		}
+	}
+	for _, p := range bad {
+		if err := ValidateVirtualPath(p); err == nil {
+			t.Errorf("%q 应拒绝", p)
+		}
+	}
+}

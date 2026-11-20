@@ -1,6 +1,7 @@
 package conf
 
 import (
+	"errors"
 	"strings"
 	"encoding/json"
 	"fmt"
@@ -79,6 +80,11 @@ func Load(path string) (*Config, error) {
 		return cfg, nil
 	}
 	if !os.IsNotExist(err) {
+		// R2-3（外部审核 2026-11-20）：语义错误（JSON 合法但数值不合法）直接报错，
+		// 不得进自愈——自愈仅针对 JSON 语法损坏，否则会静默回退用户手工编辑
+		if isSemanticError(err) {
+			return nil, err
+		}
 		// JSON 损坏：自愈（I4/I5，真机经验 2026-11-17）——
 		// ① 备份先在内存中验证可解析，通过才替换（避免「覆盖后才发现备份也坏」）；
 		// ② 损坏原文件另存副本 config.json.broken-<时间戳>（0600），不静默丢失；
@@ -192,6 +198,18 @@ func LoadStrict(path string) (*Config, error) {
 	return cfg, nil
 }
 
+// semanticError 配置语义错误（JSON 合法但数值不合法）。
+// R2-3（外部审核 2026-11-20）：语义错误必须直接报错退出，不得触发 .bak 自愈
+//（自愈仅针对 JSON 语法损坏；否则用户的手工编辑会被静默回退、可能复活旧凭证）
+type semanticError struct{ msg string }
+
+func (e *semanticError) Error() string { return e.msg }
+
+func isSemanticError(err error) bool {
+	var se *semanticError
+	return errors.As(err, &se)
+}
+
 // validateVault vault 段语义校验（外部审核 #2，2026-11-20）：
 // 不合法配置必须启动失败，不得静默忽略——否则「backup/videos」类多段路径
 // 会让容器识别失效、密文回落物理视图泄露。
@@ -203,24 +221,24 @@ func validateVault(v *VaultConfig) error {
 	for _, p := range v.Paths {
 		switch {
 		case p == "":
-			return fmt.Errorf("vault.paths 含空字符串")
+			return &semanticError{msg: "vault.paths 含空字符串"}
 		case strings.ContainsAny(p, "/\\"):
-			return fmt.Errorf("vault.paths 必须为单段目录名，不允许路径分隔符：%q", p)
+			return &semanticError{msg: fmt.Sprintf("vault.paths 必须为单段目录名，不允许路径分隔符：%q", p)}
 		case p == "." || p == "..":
-			return fmt.Errorf("vault.paths 不允许 . 或 ..：%q", p)
+			return &semanticError{msg: fmt.Sprintf("vault.paths 不允许 . 或 ..：%q", p)}
 		case strings.HasPrefix(p, "_"):
-			return fmt.Errorf("vault.paths 不允许下划线开头的保留名：%q", p)
+			return &semanticError{msg: fmt.Sprintf("vault.paths 不允许下划线开头的保留名：%q", p)}
 		case seen[p]:
-			return fmt.Errorf("vault.paths 重复配置：%q", p)
+			return &semanticError{msg: fmt.Sprintf("vault.paths 重复配置：%q", p)}
 		}
 		seen[p] = true
 	}
 	if v.MaxStreams < 0 {
-		return fmt.Errorf("vault.max_streams 不得为负数：%d", v.MaxStreams)
+		return &semanticError{msg: fmt.Sprintf("vault.max_streams 不得为负数：%d", v.MaxStreams)}
 	}
 	if v.MaxStreams > 4 {
 		// PM 拍板 2026-11-20：实测天花板 4，再高非常危险（AX6 内存）
-		return fmt.Errorf("vault.max_streams 超上限：%d > 4（PM 拍板天花板，防止误配拖垮路由器）", v.MaxStreams)
+		return &semanticError{msg: fmt.Sprintf("vault.max_streams 超上限：%d > 4（PM 拍板天花板，防止误配拖垮路由器）", v.MaxStreams)}
 	}
 	return nil
 }
