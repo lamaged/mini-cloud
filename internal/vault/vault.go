@@ -237,8 +237,8 @@ func (v *Vault) scan(ctx context.Context, name string, initial bool) {
 		if c := v.containers[name]; c != nil {
 			c.warning = strings.Join(cwarns, "；")
 			if len(cwarns) > 0 {
-				// 本轮有未完成/异常：下轮提前重试（1 分钟），
-				// 正常完成则维持 scanTTL（外部审核 2026-11-20 第四轮）
+				// 本轮有未完成/异常：下次访问的最早触发时间提前到 1 分钟后
+				//（懒刷新语义——1 分钟是"最早可重试"，非后台定时器；S4 措辞）
 				c.lastScan = time.Now().Add(-scanTTL + scanRetryShort)
 			}
 		}
@@ -328,7 +328,7 @@ func (v *Vault) refreshRoot(ctx context.Context, cont, dir string) string {
 	case <-mctx.Done():
 		// 外部审核 2026-11-20 第四轮：超时不得静默——返回非空告警由上层记录
 		//（并触发短重试）；本分支不触碰树，旧树原样保留
-		return fmt.Sprintf("子目录 %s：manifest 解析排队超时，本轮未扫描（保留旧树，稍后自动重试）", dir)
+		return fmt.Sprintf("子目录 %s：manifest 解析排队超时，本轮未扫描（保留旧树，下次访问时重试）", dir)
 	}
 	link, err := v.raw.Link(mctx, manifestPath)
 	if err != nil {

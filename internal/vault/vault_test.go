@@ -983,4 +983,15 @@ func TestManifestSemBudgetTimeout(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("额度等待应在预算超时后退出（2s 内），不得傻等")
 	}
+	// S3（RV-2026-11-20-05）：超时不得静默——①告警含"排队超时"；②lastScan 已缩短
+	//（1 分钟短重试生效，锁住不变量）
+	if w := v.Warning(); !strings.Contains(w, "排队超时") {
+		t.Errorf("超时应产生非空告警，got %q", w)
+	}
+	v.mu.RLock()
+	due := time.Since(v.containers["backup"].lastScan) >= scanTTL-scanRetryShort
+	v.mu.RUnlock()
+	if !due {
+		t.Error("有告警的扫描应把下次触发提前到 1 分钟后（短重试未生效）")
+	}
 }
