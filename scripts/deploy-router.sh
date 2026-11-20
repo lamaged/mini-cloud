@@ -36,6 +36,9 @@ LOG_START=0
 # 注：AX6 实测无 setsid，回退 & 启动并已证明可跨会话存活）
 start_daemon() {
     cd "$INSTALL_DIR" || return 1
+    # 日志文件缺失时自动创建（PM 常清日志；缺失会令下方重定向失败导致部署中断——
+    # 2026-11-20 真机教训，曾被误删造成回归）
+    touch "$LOG" 2>/dev/null || true
     LOG_START=$(wc -l < "$LOG" 2>/dev/null)
     LOG_START="${LOG_START:-0}"
     if command -v setsid >/dev/null 2>&1; then
