@@ -1,6 +1,7 @@
 package conf
 
 import (
+	"strings"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -182,10 +183,46 @@ func LoadStrict(path string) (*Config, error) {
 		return nil, err
 	}
 	cfg.normalize()
+	if err := validateVault(cfg.Vault); err != nil {
+		return nil, err
+	}
 	// 存量文件收紧权限（旧版 Save 写 0644；升级后启动即改为 0600）。
 	// 只读文件系统等场景下失败可忽略：下次 Save 会再次尝试。
 	os.Chmod(path, 0600)
 	return cfg, nil
+}
+
+// validateVault vault 段语义校验（外部审核 #2，2026-11-20）：
+// 不合法配置必须启动失败，不得静默忽略——否则「backup/videos」类多段路径
+// 会让容器识别失效、密文回落物理视图泄露。
+func validateVault(v *VaultConfig) error {
+	if v == nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	for _, p := range v.Paths {
+		switch {
+		case p == "":
+			return fmt.Errorf("vault.paths 含空字符串")
+		case strings.ContainsAny(p, "/\\"):
+			return fmt.Errorf("vault.paths 必须为单段目录名，不允许路径分隔符：%q", p)
+		case p == "." || p == "..":
+			return fmt.Errorf("vault.paths 不允许 . 或 ..：%q", p)
+		case strings.HasPrefix(p, "_"):
+			return fmt.Errorf("vault.paths 不允许下划线开头的保留名：%q", p)
+		case seen[p]:
+			return fmt.Errorf("vault.paths 重复配置：%q", p)
+		}
+		seen[p] = true
+	}
+	if v.MaxStreams < 0 {
+		return fmt.Errorf("vault.max_streams 不得为负数：%d", v.MaxStreams)
+	}
+	if v.MaxStreams > 4 {
+		// PM 拍板 2026-11-20：实测天花板 4，再高非常危险（AX6 内存）
+		return fmt.Errorf("vault.max_streams 超上限：%d > 4（PM 拍板天花板，防止误配拖垮路由器）", v.MaxStreams)
+	}
+	return nil
 }
 
 // normalize 向后兼容：如果用了旧的 cloud 字段，包装为 clouds 数组；

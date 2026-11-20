@@ -155,10 +155,10 @@ func (h *Handler) getObj(ctx context.Context, reqPath string) (*model.Obj, error
 
 	objs, err := h.Driver.List(ctx, parent)
 	if err != nil {
-		return &model.Obj{
-			Name:  name,
-			IsDir: true,
-		}, nil
+		// #10（外部审核 2026-11-20）：不得把 List 错误伪装成目录——
+		// ErrForbidden（如 _mc 路径）必须透传 403，其余错误如实上抛，
+		// 否则 PROPFIND 会返回虚假 207 且与 Vault 访问控制语义不一致
+		return nil, err
 	}
 
 	for i := range objs {

@@ -12,6 +12,9 @@ import (
 // 写入 manifest.Entry.SHA256；对象内嵌元数据的 H 字段已废弃，见 meta.go I1 说明）。
 // 不变量（I1）：fileID 必须每次新生成；调用方负责随机生成并保证不复用。
 func EncryptObject(dst io.Writer, master []byte, plain io.Reader, size int64, fileID [16]byte, meta *Metadata) (*Header, string, error) {
+	if size < 0 {
+		return nil, "", fmt.Errorf("vault: 明文大小不得为负数：%d", size)
+	}
 	prefix, err := randomBytes(4)
 	if err != nil {
 		return nil, "", err
@@ -56,9 +59,11 @@ func EncryptObject(dst io.Writer, master []byte, plain io.Reader, size int64, fi
 	hasher := sha256.New()
 	buf := make([]byte, h.ChunkSize)
 	var idx uint64
+	var total int64 // #5（外部审核 2026-11-20）：累计实际读入字节数，防「头说 N、密文 M」坏对象
 	for {
 		n, rerr := io.ReadFull(plain, buf)
 		if n > 0 {
+			total += int64(n)
 			hasher.Write(buf[:n])
 			ct, err := seal(key, h.ChunkNonce(idx), buf[:n], h.ChunkAAD(idx))
 			if err != nil {
@@ -75,6 +80,11 @@ func EncryptObject(dst io.Writer, master []byte, plain io.Reader, size int64, fi
 		if rerr != nil {
 			return nil, "", rerr
 		}
+	}
+	// #5：块数一致不等于字节一致（如加密中文件被改动 1000→999，同为一块）——
+	// 必须校验实际总字节数，否则产出头部声明与实际密文不符的坏对象
+	if total != size {
+		return nil, "", fmt.Errorf("vault: 明文大小不符：期望 %d 字节，实际 %d 字节（加密中文件被改动？）", size, total)
 	}
 	if idx != h.ChunkCount() {
 		return nil, "", fmt.Errorf("vault: 明文大小不符：期望 %d 块，实际 %d 块", h.ChunkCount(), idx)

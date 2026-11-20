@@ -1,6 +1,8 @@
 package vault
 
 import (
+	"path"
+	"strings"
 	"crypto/sha256"
 	"bytes"
 	"compress/gzip"
@@ -57,9 +59,14 @@ func ObjectPath(fileID string) string {
 
 // SaveManifest gzip(JSON) 后以 manifest 密钥 GCM 加密写盘（nonce 12B 前置）
 func SaveManifest(dst io.Writer, key []byte, m *Manifest) error {
+	// #6（外部审核 2026-11-20）：三层尺寸与读取端一致——
+	// 工具不得生成服务端拒绝读取的清单
 	raw, err := json.Marshal(m)
 	if err != nil {
 		return fmt.Errorf("vault: manifest 序列化失败: %w", err)
+	}
+	if len(raw) > MaxManifestSize {
+		return fmt.Errorf("vault: manifest JSON 超上限 %d MiB（%d B）", MaxManifestSize>>20, len(raw))
 	}
 	var gz bytes.Buffer
 	zw := gzip.NewWriter(&gz)
@@ -69,6 +76,9 @@ func SaveManifest(dst io.Writer, key []byte, m *Manifest) error {
 	if err := zw.Close(); err != nil {
 		return err
 	}
+	if gz.Len() > MaxManifestSize {
+		return fmt.Errorf("vault: manifest 压缩后超上限 %d MiB（%d B）", MaxManifestSize>>20, gz.Len())
+	}
 	nonce, err := randomBytes(12)
 	if err != nil {
 		return err
@@ -76,6 +86,9 @@ func SaveManifest(dst io.Writer, key []byte, m *Manifest) error {
 	ct, err := seal(key, nonce, gz.Bytes(), nil)
 	if err != nil {
 		return err
+	}
+	if len(ct)+len(nonce) > MaxManifestSize {
+		return fmt.Errorf("vault: manifest 密文超上限 %d MiB（%d B）", MaxManifestSize>>20, len(ct)+len(nonce))
 	}
 	if _, err := dst.Write(nonce); err != nil {
 		return err
@@ -86,8 +99,42 @@ func SaveManifest(dst io.Writer, key []byte, m *Manifest) error {
 	return nil
 }
 
+// ValidateVirtualPath 校验 manifest 虚拟路径规范（#3，外部审核 2026-11-20）：
+// 必须以 / 开头、path.Clean 不变、无 . / .. 段、非根、长度与深度有上限。
+// 不规范的路径（如相对路径）会使 buildRoot 的 path.Dir 循环永不收敛（死循环）。
+const (
+	maxVirtualPathLen   = 1024 // 单条虚拟路径长度上限
+	maxVirtualPathDepth = 64   // 虚拟路径深度上限
+)
+
+// ValidateVirtualPath 校验单条虚拟路径（Entry.Path 或 Dirs 元素）
+func ValidateVirtualPath(p string) error {
+	if !strings.HasPrefix(p, "/") {
+		return fmt.Errorf("必须以 / 开头：%q", p)
+	}
+	if path.Clean(p) != p {
+		return fmt.Errorf("路径不规范（含冗余 ./ ../ 或尾斜杠）：%q", p)
+	}
+	if p == "/" {
+		return fmt.Errorf("不允许根路径 / 作为条目路径")
+	}
+	if len(p) > maxVirtualPathLen {
+		return fmt.Errorf("路径超长（%d > %d）：%q", len(p), maxVirtualPathLen, p)
+	}
+	segs := strings.Split(strings.TrimPrefix(p, "/"), "/")
+	if len(segs) > maxVirtualPathDepth {
+		return fmt.Errorf("路径过深（%d > %d）：%q", len(segs), maxVirtualPathDepth, p)
+	}
+	for _, seg := range segs {
+		if seg == "" || seg == "." || seg == ".." {
+			return fmt.Errorf("路径含非法段：%q", p)
+		}
+	}
+	return nil
+}
+
 // MaxManifestSize manifest 密文大小上限（资源约束：伪造超大清单不得撑爆路由器内存）
-const MaxManifestSize = 32 << 20 // 32 MiB
+const MaxManifestSize = 16 << 20 // 16 MiB（PM 拍板 2026-11-20：实测 KB 级清单，16 MiB 足够；原 32 MiB 下调）
 
 // LoadManifest 解密并解析 manifest（认证失败返回 ErrAuth 包装错误）。
 // 读取总量受 MaxManifestSize 限制，解压后 JSON 再受同样限制（防 gzip 炸弹）。

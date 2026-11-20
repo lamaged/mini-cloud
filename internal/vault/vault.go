@@ -50,6 +50,11 @@ type Vault struct {
 	containers map[string]*container // 容器根名 → 容器状态（Phase 2 两级：容器 → 子根）
 	disabled   bool                  // 驱动不支持 Vault（代理流）：全部路径普通模式（铁律 2）
 	stopOnce   sync.Once
+
+	// manifestSem manifest 解析全局并发上限（#4，外部审核 2026-11-20）：
+	// 限制同时解析的清单数（含读取/解密/解压/JSON 多层瞬时内存），
+	// 防 32 子目录并发叠加撑爆 AX6
+	manifestSem chan struct{}
 }
 
 // container 一个 vault 容器根（cfg.Paths 条目；其直接子目录为独立加密单元，§5.1）
@@ -122,12 +127,13 @@ func New(cached driver.Reader, raw driver.Driver, master []byte, cfg Config) *Va
 		cfg.MaxStreams = 3
 	}
 	return &Vault{
-		cached:     cached,
-		raw:        raw,
-		master:     master,
-		cfg:        cfg,
-		containers: make(map[string]*container),
-		sem:        &streamSem{avail: cfg.MaxStreams, max: cfg.MaxStreams},
+		cached:      cached,
+		raw:         raw,
+		master:      master,
+		cfg:         cfg,
+		containers:  make(map[string]*container),
+		sem:         &streamSem{avail: cfg.MaxStreams, max: cfg.MaxStreams},
+		manifestSem: make(chan struct{}, 2), // #4：全局并发解析上限 2
 	}
 }
 
@@ -286,6 +292,9 @@ func (v *Vault) refreshRoot(ctx context.Context, cont, dir string) string {
 	}
 
 	manifestPath := path.Join(cont, dir, "_mc", "manifest.mcf")
+	// #4：manifest 读取+解析全程持信号量（读取/解密/解压/JSON 多层瞬时内存叠加受控）
+	v.manifestSem <- struct{}{}
+	defer func() { <-v.manifestSem }()
 	link, err := v.raw.Link(mctx, manifestPath)
 	if err != nil {
 		// 网络/对象缺失（上传中间态）：有旧树保留旧树，无旧树建空树
@@ -337,6 +346,13 @@ func (v *Vault) refreshRoot(ctx context.Context, cont, dir string) string {
 		v.setRootWarning(cont, dir, fmt.Sprintf("manifest 解密失败，虚拟视图为空目录（%s）", err))
 		return ""
 	}
+	// #3（外部审核 2026-11-20）：虚拟路径规范校验（fail-closed）——
+	// 相对路径等不规范条目会使 buildRoot 的 path.Dir 循环不收敛（死循环）
+	if perr := validateManifestPaths(m); perr != nil {
+		v.setRootTree(cont, dir, emptyRoot(cont, dir))
+		v.setRootWarning(cont, dir, fmt.Sprintf("manifest 含不规范路径，拒绝加载（%s）", perr))
+		return ""
+	}
 
 	// 大清单守卫（热刷新）：已有树且清单过大 → 跳过本轮（重启生效；首建不限制）
 	v.mu.RLock()
@@ -347,6 +363,9 @@ func (v *Vault) refreshRoot(ctx context.Context, cont, dir string) string {
 		return ""
 	}
 	if exists && old.manifestSum == sum {
+		// #11（外部审核 2026-11-20）：读取成功即先清旧告警（如网络瞬断产生的
+		// 「manifest 不可读」），再判断摘要——否则旧告警残留
+		v.clearRootWarning(cont, dir)
 		return "" // I4：内容未变化，零成本跳过
 	}
 
@@ -363,6 +382,21 @@ func condStr(cond bool, a, b string) string {
 		return a
 	}
 	return b
+}
+
+// validateManifestPaths 校验清单全部虚拟路径规范（#3）：任一不合格即拒绝加载
+func validateManifestPaths(m *Manifest) error {
+	for i := range m.Files {
+		if err := ValidateVirtualPath(m.Files[i].Path); err != nil {
+			return fmt.Errorf("条目 %d：%w", i, err)
+		}
+	}
+	for i := range m.Dirs {
+		if err := ValidateVirtualPath(m.Dirs[i]); err != nil {
+			return fmt.Errorf("目录 %d：%w", i, err)
+		}
+	}
+	return nil
 }
 
 // buildRoot 从 manifest 构建子根虚拟树（锁外构建，调用方 setRootTree 原子交换）
@@ -491,6 +525,17 @@ func (v *Vault) maybeScan(reqPath string) {
 		return
 	}
 	go v.scan(context.Background(), segs[0], false)
+}
+
+// clearRootWarning 清除子根告警（读取成功即清，防旧告警残留，#11）
+func (v *Vault) clearRootWarning(cont, dir string) {
+	v.mu.Lock()
+	if c := v.containers[cont]; c != nil {
+		if r := c.roots[dir]; r != nil {
+			r.warning = ""
+		}
+	}
+	v.mu.Unlock()
 }
 
 // setContainerWarning / setRootWarning 记录告警（接 /admin 展示，§5.2）
@@ -694,8 +739,9 @@ func (v *Vault) Link(ctx context.Context, reqPath string) (*model.Link, error) {
 		return nil, err
 	}
 	headerSHA, err := hex.DecodeString(e.HeaderSHA256)
-	if err != nil {
-		return nil, fmt.Errorf("vault: header_sha256 解析失败: %w", err)
+	if err != nil || len(headerSHA) != 32 {
+		// #8：解码失败/长度异常 → fail-closed（跳过校验 = 放行可能被篡改的对象）
+		return nil, fmt.Errorf("vault: header_sha256 非法（解码失败或长度 %d ≠ 32）", len(headerSHA))
 	}
 
 	link, err := v.raw.Link(ctx, objPath)
@@ -714,8 +760,10 @@ func (v *Vault) Link(ctx context.Context, reqPath string) (*model.Link, error) {
 		}
 		src = &readAtCloser{r: ra, c: link.Reader}
 	} else if link.URL != "" {
-		// URL 型驱动（天翼/移动 302 模式）：走云盘取数层（Phase 1 接线）
-		up, err := NewUpstream(ctx, v.raw, objPath, httpClient)
+		// URL 型驱动（天翼/移动 302 模式）：走云盘取数层。
+		// #12（外部审核 2026-11-20）：复用上方已获取的 link（NewUpstreamWithLink），
+		// 避免每次开播重复调用一次云盘 API
+		up, err := NewUpstreamWithLink(ctx, v.raw, objPath, link, httpClient)
 		if err != nil {
 			return nil, err
 		}

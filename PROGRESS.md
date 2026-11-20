@@ -24,6 +24,7 @@
 | 2026-11-16 | **闸门① 通过（PM 批准），v0.10.0 实现完成**：两阶段 CredentialUpdater + internal/admin 管理页（CSRF、html/template 转义）+ mobile 实现（临时客户端验证、按 __req 隔离、凭证/缓存代次防护）+ conf 原子写/0600/备份 + 3 处转义修复（buildHref 百分号编码、目录页/根页转义）。自查（/code-review high）15 条全部修复；`go vet` + `go test -race` 全绿；ARM64 交叉编译通过；实现期修订记录于 design.md §3.8 |
 | 2026-11-16 | **闸门③ 外部代码审核 RV-2026-11-16-03（结论：有条件通过）**：I1–I6 全部修复（更新串行化、LoadStrict 严格读取、目录 fsync、WriteCredential 测试、401×提交竞态测试、提交失败 .bak 回滚），P1–P9 全部落实（状态码、安全响应头、version v0.10.0、Stop 幂等、字段同步、编码去重、24h 门槛、文档修正、自查留痕表）；`go vet` + `go test -race` 全绿；ARM64 交叉编译通过 |
 | 2026-11-16 | **部署脚本完成（PM 拍板：审核后立即写、单独提交）**：scripts/deploy-prepare.sh（开发机编译+UPX+暂存，端到端跑通）+ scripts/deploy-router.sh（路由器拉取+备份+重启+健康检查+失败回滚，busybox ash 兼容，语法与健康检查解析本地验证通过）；体积观察项（铁律 10）：ARM64 原始 8,716,472 B → UPX 后 2,974,696 B（v0.9.2 基线 UPX 约 2.3 MB，增量主要来自 html/template 与凭证相关代码）；真机验证属闸门⑤ |
+| 2026-11-20 | **外部审核（更严格第三方，12 条）全批处置完成 + PM 拍板数字落地**：P0 keygen 排他创建+`--force`+4 组测试、.gitignore 加 vault.key/*.key；#2 vault.paths 启动严格校验（单段/保留名/去重）+ max_streams 天花板 4（PM 实测拍板）；#3 虚拟路径规范校验（ValidateVirtualPath 导出，buildRoot 前 fail-closed，防 path.Dir 死循环）；#4 manifest 解析全局并发限 2 + SetMemoryLimit 前移 vault.Init 前；#5 EncryptObject 实际总字节校验（+size<0）；#6 SaveManifest 三层尺寸校验（16 MiB，PM 拍板下调）+ mcrypt manifest temp+rename 原子写；#8 hex 解码失败/长度≠32 fail-closed（verify 与 Vault.Link）；#9 mcrypt decrypt 路径规范+输出边界校验；#10 getObj 不再伪装目录（ErrForbidden 透传）；#11 子根告警读取成功即清；#12 改判成立（常驻审核记错位置）——Vault.Link 复用已取链接；**端到端测试 5 组 9 场景全链路**（PROPFIND/GET/Range/Seek/SHA-256/错钥/篡改/清单缺失损坏）；`go vet`+`go test -race` 全绿（9 包）、ARM64+Windows 编译通过 |
 | 2026-11-19 | **复核 RV-2026-11-19-07（通过）处置**：本轮修复链获正面确认（回归处置链/双层告警清除/动态标签边界/并发正确）；P1 `TestVaultSupported` 改为对真实驱动实例断言（锁死「Name() ↔ 允许列表」不变量，防驱动改名后静默失效）；P2 容器 List 失败分支补注释（有意粘滞语义，成功后自然清除）；`go vet` + `go test -race` 全绿（9 包）、ARM64 通过 |
 | 2026-11-19 | **文档恒同步规则落地（PM 拍板）**：沟通协议新增第 6 条「不论改动对错，设计文档必须与代码同步、不得欠账」；补齐两处文档欠账——design §3.3 管理页现状（全挂载状态卡/动态有效期标签/过期文案/根页显示名组合）、design §5.1 装配门机制（vaultSupported 允许列表 + 回归教训注记） |
 | 2026-11-19 | **⚠️ 回归事故与紧急修复**：`vaultSupported` 允许列表误用驱动类型名（189Personal 等，实为日志 type 字段），而 Name() 实际返回 tianyi/mobile/baidu/local——上一版部署后真实云盘全部判「不支持」，Vault 无一装配、加密全部失效（PM 真机发现）；已修正为 Name() 实际值并同步测试，教训：允许列表必须按 drivers/*.go 的 Name() 返回值核对，不得引用日志字段 |
@@ -404,3 +405,21 @@
 |---|---|---|---|---|---|---|---|
 | P1 | 建议 | TestVaultSupported 改真实驱动断言 | 已改 | 对 tianyi（个人/家庭）/mobile/local/baidu 真实实例断言 Name() ↔ 允许列表 | 已闭环 | 通过 | 2026-11-19 |
 | P2 | 建议 | scan List 失败分支粘滞语义注释 | 已改 | 注释说明「有意粘滞：失败无法验证修复，保留更安全；成功后自然清除」 | 已闭环 | 通过 | 2026-11-19 |
+
+### RV-2026-11-20-01（外部审核意见二次核实，12 条 + e2e）
+
+| 编号 | 级别 | 意见摘要 | 处置类别 | 处置说明 | 状态 | 复核 | 日期 |
+|---|---|---|---|---|---|---|---|
+| 1 | P0 | keygen 覆盖已有 master key | 阻断 | O_CREATE\|O_EXCL + --force 覆盖 + 4 组测试（存在拒绝/内容不变/force/失败无残留） | 已闭环 | 待复核 | 2026-11-20 |
+| 7 | P1 | vault.key 未入 .gitignore | 阻断 | 加 vault.key、*.key | 已闭环 | 待复核 | 2026-11-20 |
+| 4 | P1 | manifest 并发扫描峰值 + 软上限时机 | 补充 | 全局解析并发限 2 + SetMemoryLimit 前移 vault.Init 前 | 已闭环 | 待复核 | 2026-11-20 |
+| 5 | P1 | EncryptObject 不校验总字节 | 补充 | total!=size 报错 + size<0 校验 | 已闭环 | 待复核 | 2026-11-20 |
+| 2 | P1 | vault.paths 缺严格校验 | 补充 | 启动严格校验（含 MaxStreams 天花板 4，PM 拍板） | 已闭环 | 待复核 | 2026-11-20 |
+| 3 | P1 | buildRoot 相对路径死循环 | 补充 | ValidateVirtualPath + validateManifestPaths fail-closed | 已闭环 | 待复核 | 2026-11-20 |
+| 10 | P2 | getObj 伪装目录（含 403） | 补充 | List 错误如实上抛，ErrForbidden 透传 403 | 已闭环 | 待复核 | 2026-11-20 |
+| 8 | P2 | verify/服务端忽略 hex 解码错误 | 补充 | 解码失败/长度≠32 判校验失败（两处） | 已闭环 | 待复核 | 2026-11-20 |
+| 6 | P1 | SaveManifest 无约束/非原子 | 可选 | 三层尺寸校验（16 MiB，PM 拍板）+ temp+rename | 已闭环 | 待复核 | 2026-11-20 |
+| 9 | P2 | decrypt 路径逃逸 | 可选 | ValidateVirtualPath + 输出边界校验 | 已闭环 | 待复核 | 2026-11-20 |
+| 11 | P2 | 告警残留（root 级） | 可选 | 读取成功即 clearRootWarning | 已闭环 | 待复核 | 2026-11-20 |
+| 12 | P2 | 双重 raw.Link | 改判成立 | 常驻审核记错位置（NewUpstreamWithLink 仅在清单加载）；Vault.Link 已改为复用已取链接 | 已闭环 | 待复核 | 2026-11-20 |
+| — | — | 端到端测试 | 补充 | e2e_test.go 5 组 9 场景（PROPFIND/GET/Range/Seek/SHA-256/错钥/篡改/清单缺失/损坏） | 已闭环 | 待复核 | 2026-11-20 |

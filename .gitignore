@@ -28,3 +28,10 @@ docs/review/*.log
 
 # 真机验收日志（运行时数据，本地留存不入库）
 test_log/
+
+# Vault 主密钥（永不入库——误提交 = 云盘加密数据失去保护）
+vault.key
+*.key
+
+# 加密工具构建产物
+mcrypt

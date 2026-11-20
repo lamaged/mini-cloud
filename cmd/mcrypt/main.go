@@ -2,7 +2,7 @@
 //
 // 用法：
 //
-//	mcrypt keygen  [-key vault.key]                         生成 32B master key（0600）
+//	mcrypt keygen  [-key vault.key]                         生成 32B master key（0600；已存在则拒绝，--force 覆盖）
 //	mcrypt encrypt -key vault.key -in 明文目录 -out vault根  加密整个目录树（manifest 最后写入）
 //	mcrypt decrypt -key vault.key -in vault根 -out 明文目录  还原明文（校验 SHA-256）
 //	mcrypt verify  -key vault.key -in vault根               校验对象与 manifest 的一致性
@@ -60,7 +60,7 @@ func main() {
 func usage() {
 	fmt.Fprint(os.Stderr, `mcrypt —— mini-cloud Vault 加密工具（Phase 0）
 
-  mcrypt keygen  [-key vault.key]
+  mcrypt keygen  [-key vault.key] [--force]
   mcrypt encrypt -key vault.key -in <明文目录> -out <vault根目录>
   mcrypt decrypt -key vault.key -in <vault根目录> -out <明文目录>
   mcrypt verify  -key vault.key -in <vault根目录>
@@ -82,20 +82,40 @@ func loadKey(path string) ([]byte, error) {
 func cmdKeygen(args []string) error {
 	fset := flag.NewFlagSet("keygen", flag.ExitOnError)
 	keyPath := fset.String("key", "vault.key", "密钥输出路径")
+	force := fset.Bool("force", false, "覆盖已存在的密钥文件（危险：旧密钥作废，已加密数据全部无法解密）")
 	fset.Parse(args)
 
 	key, err := vault.NewMasterKey()
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(*keyPath, key, 0600); err != nil {
+	// P0（外部审核 2026-11-20）：排他创建，防误覆盖——
+	// 覆盖 = 所有用旧密钥加密的数据永久不可解，默认必须拒绝
+	flags := os.O_WRONLY | os.O_CREATE | os.O_EXCL
+	if *force {
+		flags = os.O_WRONLY | os.O_CREATE | os.O_TRUNC
+	}
+	f, err := os.OpenFile(*keyPath, flags, 0600)
+	if err != nil {
+		if os.IsExist(err) {
+			return fmt.Errorf("密钥文件已存在（%s）——覆盖会导致所有已加密数据无法解密；确认要作废旧密钥请加 --force", *keyPath)
+		}
+		return fmt.Errorf("创建密钥文件失败: %w", err)
+	}
+	if _, err := f.Write(key); err != nil {
+		f.Close()
+		os.Remove(*keyPath) // 写入失败：清理不完整文件，不留半成品
 		return fmt.Errorf("写密钥失败: %w", err)
 	}
-	// P2：WriteFile 的 perm 只对新建文件生效，存量文件显式收紧
-	if err := os.Chmod(*keyPath, 0600); err != nil {
-		return fmt.Errorf("设置密钥权限失败: %w", err)
+	if err := f.Close(); err != nil {
+		os.Remove(*keyPath) // 关闭失败（如落盘错误）：同样不留半成品
+		return fmt.Errorf("关闭密钥文件失败: %w", err)
 	}
-	fmt.Printf("已生成 master key：%s（32 字节，0600）\n", *keyPath)
+	if *force {
+		fmt.Printf("已覆盖 master key：%s（32 字节，0600）——旧密钥已作废！\n", *keyPath)
+	} else {
+		fmt.Printf("已生成 master key：%s（32 字节，0600）\n", *keyPath)
+	}
 	fmt.Println("警告：master key 永不传上网盘、必须离线备份；丢失 = 数据不可恢复。")
 	return nil
 }
@@ -208,16 +228,25 @@ func cmdEncrypt(args []string) error {
 	if err := os.MkdirAll(manifestDir, 0755); err != nil {
 		return err
 	}
-	mf, err := os.Create(filepath.Join(manifestDir, "manifest.mcf"))
+	// #6b（外部审核 2026-11-20）：临时文件 + 原子 rename——写失败不破坏原 manifest
+	finalPath := filepath.Join(manifestDir, "manifest.mcf")
+	mf, err := os.CreateTemp(manifestDir, "manifest.mcf.tmp-*")
 	if err != nil {
 		return err
 	}
+	tmpPath := mf.Name()
 	if err := vault.SaveManifest(mf, vault.ManifestKey(key), m); err != nil {
 		mf.Close()
+		os.Remove(tmpPath)
 		return err
 	}
 	if err := mf.Close(); err != nil {
+		os.Remove(tmpPath)
 		return err
+	}
+	if err := os.Rename(tmpPath, finalPath); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("manifest 写入失败: %w", err)
 	}
 	fmt.Printf("完成：%d 个文件（%d B）加密到 %s，manifest 已写入\n", fileCount, totalSize, *outDir)
 	return nil
@@ -260,7 +289,16 @@ func cmdDecrypt(args []string) error {
 			obj.Close()
 			return fmt.Errorf("%s: %w", e.Path, err)
 		}
+		// #9（外部审核 2026-11-20）：校验虚拟路径规范 + 输出边界，防 ../ 逃逸
+		if err := vault.ValidateVirtualPath(e.Path); err != nil {
+			return fmt.Errorf("%s: 路径不规范，拒绝解密: %w", e.Path, err)
+		}
 		outPath := filepath.Join(*outDir, filepath.FromSlash(strings.TrimPrefix(e.Path, "/")))
+		outAbs, _ := filepath.Abs(*outDir)
+		pAbs, _ := filepath.Abs(outPath)
+		if !strings.HasPrefix(pAbs, outAbs+string(filepath.Separator)) {
+			return fmt.Errorf("%s: 输出路径越界，拒绝解密", e.Path)
+		}
 		if err := os.MkdirAll(filepath.Dir(outPath), 0755); err != nil {
 			r.Close()
 			return err
@@ -322,7 +360,14 @@ func cmdVerify(args []string) error {
 			failCount++
 			continue
 		}
-		headerSHA, _ := hex.DecodeString(e.HeaderSHA256)
+		headerSHA, err := hex.DecodeString(e.HeaderSHA256)
+		if err != nil || len(headerSHA) != 32 {
+			// #8（外部审核 2026-11-20）：解码失败/长度异常 → 校验失败（fail-closed），
+			// 不得以 nil 跳过头部哈希校验
+			fmt.Printf("  ✗ %s（header_sha256 非法）\n", e.Path)
+			failCount++
+			continue
+		}
 		obj, err := os.Open(filepath.Join(*inDir, filepath.FromSlash(e.Obj)))
 		if err != nil {
 			fmt.Printf("  ✗ %s: 对象缺失\n", e.Path)
