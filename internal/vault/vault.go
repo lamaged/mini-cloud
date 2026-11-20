@@ -31,11 +31,14 @@ const (
 	maxSubDirs = 32
 	// maxHotManifest 热刷新清单解压后大小上限（超过跳过热刷新、重启生效——AX6 瞬时双份峰值守卫）
 	maxHotManifest = 8 << 20
-	// manifestReadTimeout 扫描期单目录读取超时（I3：区别于播放流的 90s）
-	manifestReadTimeout = 5 * time.Second
+
 	// maxNestedCheck 深层 _mc 检查的子目录数上限（P7）
 	maxNestedCheck = 8
 )
+
+// manifestReadTimeout 扫描期单目录读取超时（I3：区别于播放流的 90s）。
+// var 以便测试缩短（P2-3 等待取消测试需要）
+var manifestReadTimeout = 5 * time.Second
 
 // Vault 包装层：拦截 vault 路径（虚拟树 + 解密），其余路径原样委托 cached。
 // 断言约定（铁律 7）：Vault 不得实现 TokenManager/HealthReporter/CredentialUpdater。
@@ -309,9 +312,14 @@ func (v *Vault) refreshRoot(ctx context.Context, cont, dir string) string {
 
 	manifestPath := path.Join(cont, dir, "_mc", "manifest.mcf")
 	// #4/R2-1：manifest 读取+解析全程持**进程级**信号量（读取/解密/解压/JSON
-	// 多层瞬时内存叠加受控；跨挂载共享，3 挂载时仍只有 2 路解析）
-	globalManifestSem <- struct{}{}
-	defer func() { <-globalManifestSem }()
+	// 多层瞬时内存叠加受控；跨挂载共享，3 挂载时仍只有 2 路解析）。
+	// P2-3（外部审核 2026-11-20）：等待额度时响应超时/取消，不傻等
+	select {
+	case globalManifestSem <- struct{}{}:
+		defer func() { <-globalManifestSem }()
+	case <-mctx.Done():
+		return "" // 扫描超时/取消：不阻塞在额度等待上
+	}
 	link, err := v.raw.Link(mctx, manifestPath)
 	if err != nil {
 		// 网络/对象缺失（上传中间态）：有旧树保留旧树，无旧树建空树

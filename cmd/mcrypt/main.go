@@ -164,6 +164,12 @@ func writeKeyAtomic(keyPath string, key []byte) error {
 		os.Remove(tmpPath)
 		return err
 	}
+	// P2-2（外部审核 2026-11-20）：父目录同步——rename 的目录项持久化
+	//（与 conf.writeFileAtomic 同口径；不支持目录同步的平台降级忽略，尽力而为）
+	if d, err := os.Open(filepath.Dir(keyPath)); err == nil {
+		_ = d.Sync()
+		d.Close()
+	}
 	return nil
 }
 
@@ -304,6 +310,46 @@ func cmdEncrypt(args []string) error {
 	return nil
 }
 
+// safeOutPath 统一输出路径安全处理（P2-1，外部审核 2026-11-20）：
+// ① 虚拟路径规范校验（含拒反斜杠）；② 词法边界（拼接后在 outDir 内）；
+// ③ 逐级检查已存在的目录不是符号链接——词法检查只能证明「路径字符串在目录内」，
+// 不能证明「真实写入位置在目录内」（预置符号链接目录可把写入引到 outDir 之外）。
+// Files 与 Dirs 必须都走本函数（禁止分别实现）。
+func safeOutPath(outDir, virtual string) (string, error) {
+	if err := vault.ValidateVirtualPath(virtual); err != nil {
+		return "", fmt.Errorf("%s: 路径不规范，拒绝解密: %w", virtual, err)
+	}
+	outAbs, err := filepath.Abs(outDir)
+	if err != nil {
+		return "", fmt.Errorf("输出目录解析失败: %w", err)
+	}
+	rel := filepath.FromSlash(strings.TrimPrefix(virtual, "/"))
+	target := filepath.Join(outAbs, rel)
+	if !strings.HasPrefix(target, outAbs+string(filepath.Separator)) {
+		return "", fmt.Errorf("%s: 输出路径越界，拒绝解密", virtual)
+	}
+	// 逐级符号链接检查：已存在的每一级目录不得是符号链接
+	//（Windows 交接点/重解析点在 Go 中同样报 ModeSymlink）；未存在的级别安全。
+	cur := outAbs
+	for _, seg := range strings.Split(rel, string(filepath.Separator)) {
+		if seg == "" {
+			continue
+		}
+		cur = filepath.Join(cur, seg)
+		fi, err := os.Lstat(cur)
+		if err != nil {
+			if os.IsNotExist(err) {
+				break // 剩余级别尚不存在，可安全创建
+			}
+			return "", fmt.Errorf("检查输出路径失败: %w", err)
+		}
+		if fi.Mode()&os.ModeSymlink != 0 {
+			return "", fmt.Errorf("%s: 输出路径含符号链接目录，拒绝解密", virtual)
+		}
+	}
+	return target, nil
+}
+
 func cmdDecrypt(args []string) error {
 	fset := flag.NewFlagSet("decrypt", flag.ExitOnError)
 	keyPath := fset.String("key", "vault.key", "master key 路径")
@@ -346,21 +392,11 @@ func cmdDecrypt(args []string) error {
 			obj.Close()
 			return fmt.Errorf("%s: %w", e.Path, err)
 		}
-		// #9（外部审核 2026-11-20）：校验虚拟路径规范 + 输出边界，防 ../ 逃逸
-		if err := vault.ValidateVirtualPath(e.Path); err != nil {
-			return fmt.Errorf("%s: 路径不规范，拒绝解密: %w", e.Path, err)
-		}
-		outPath := filepath.Join(*outDir, filepath.FromSlash(strings.TrimPrefix(e.Path, "/")))
-		outAbs, err := filepath.Abs(*outDir)
+		// P2-1：统一安全路径处理（规范校验 + 词法边界 + 符号链接检查）
+		outPath, err := safeOutPath(*outDir, e.Path)
 		if err != nil {
-			return fmt.Errorf("输出目录解析失败: %w", err)
-		}
-		pAbs, err := filepath.Abs(outPath)
-		if err != nil {
-			return fmt.Errorf("输出路径解析失败: %w", err)
-		}
-		if !strings.HasPrefix(pAbs, outAbs+string(filepath.Separator)) {
-			return fmt.Errorf("%s: 输出路径越界，拒绝解密", e.Path)
+			r.Close()
+			return err
 		}
 		if err := os.MkdirAll(filepath.Dir(outPath), 0755); err != nil {
 			r.Close()
@@ -388,9 +424,13 @@ func cmdDecrypt(args []string) error {
 		fmt.Printf("  已还原 %s（%d B）\n", e.Path, e.Size)
 		count++
 	}
-	// 重建空目录（manifest Dirs 记录）
+	// 重建空目录（manifest Dirs 记录）——P2-1：与文件同一安全路径处理
+	//（此前 Dirs 完全未校验，是漏网）
 	for _, d := range m.Dirs {
-		dirPath := filepath.Join(*outDir, filepath.FromSlash(strings.TrimPrefix(d, "/")))
+		dirPath, err := safeOutPath(*outDir, d)
+		if err != nil {
+			return err
+		}
 		if err := os.MkdirAll(dirPath, 0755); err != nil {
 			return err
 		}

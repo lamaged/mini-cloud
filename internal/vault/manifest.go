@@ -112,6 +112,11 @@ func ValidateVirtualPath(p string) error {
 	if !strings.HasPrefix(p, "/") {
 		return fmt.Errorf("必须以 / 开头：%q", p)
 	}
+	if strings.Contains(p, "\\") {
+		// 外部审核 2026-11-20：拒绝反斜杠——同一清单在 Linux/Windows
+		// 上不得产生不同路径解释（跨平台一致性）
+		return fmt.Errorf("路径含反斜杠：%q", p)
+	}
 	if path.Clean(p) != p {
 		return fmt.Errorf("路径不规范（含冗余 ./ ../ 或尾斜杠）：%q", p)
 	}

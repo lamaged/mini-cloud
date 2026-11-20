@@ -24,6 +24,7 @@
 | 2026-11-16 | **闸门① 通过（PM 批准），v0.10.0 实现完成**：两阶段 CredentialUpdater + internal/admin 管理页（CSRF、html/template 转义）+ mobile 实现（临时客户端验证、按 __req 隔离、凭证/缓存代次防护）+ conf 原子写/0600/备份 + 3 处转义修复（buildHref 百分号编码、目录页/根页转义）。自查（/code-review high）15 条全部修复；`go vet` + `go test -race` 全绿；ARM64 交叉编译通过；实现期修订记录于 design.md §3.8 |
 | 2026-11-16 | **闸门③ 外部代码审核 RV-2026-11-16-03（结论：有条件通过）**：I1–I6 全部修复（更新串行化、LoadStrict 严格读取、目录 fsync、WriteCredential 测试、401×提交竞态测试、提交失败 .bak 回滚），P1–P9 全部落实（状态码、安全响应头、version v0.10.0、Stop 幂等、字段同步、编码去重、24h 门槛、文档修正、自查留痕表）；`go vet` + `go test -race` 全绿；ARM64 交叉编译通过 |
 | 2026-11-16 | **部署脚本完成（PM 拍板：审核后立即写、单独提交）**：scripts/deploy-prepare.sh（开发机编译+UPX+暂存，端到端跑通）+ scripts/deploy-router.sh（路由器拉取+备份+重启+健康检查+失败回滚，busybox ash 兼容，语法与健康检查解析本地验证通过）；体积观察项（铁律 10）：ARM64 原始 8,716,472 B → UPX 后 2,974,696 B（v0.9.2 基线 UPX 约 2.3 MB，增量主要来自 html/template 与凭证相关代码）；真机验证属闸门⑤ |
+| 2026-11-20 | **外部审核第三轮（3×P1 确认闭合 + 3×P2）处置完成**：P2-1 decrypt 统一安全路径 safeOutPath（Files/Dirs 同处理、拒反斜杠、词法边界 + 逐级符号链接检查——修掉「预置符号链接目录把写入引到 outDir 之外」的逃逸）+ 符号链接逃逸/Dirs 非法路径 2 组测试；P2-2 writeKeyAtomic 补父目录同步 + 目录只读写失败旧钥不变测试（root 自动跳过）；P2-3 manifest 额度等待响应超时（select mctx.Done）+ 双实例争抢/等待取消 2 组测试（manifestReadTimeout 改 var 便于测试）；测试可行性清单：4 全可测 + 1 条件可测 + 1（同步失败）审查覆盖；`go vet`+`go test -race` 全绿（9 包）、ARM64+Windows 编译通过 |
 | 2026-11-20 | **外部审核第二轮（RV-2026-11-20-03，3×P1 + 2×P2）处置完成**：R2-1 信号量进程级共享（globalStreamSem/globalManifestSem，main 经 SetGlobalStreamLimit 设置一次；**全局默认 3 = PM 拍板**；补跨挂载共享测试）；R2-2 keygen --force 原子替换（temp+fsync+rename，失败旧钥不动、恒 0600 + 3 组测试）；R2-3 配置语义错误不触发 .bak 自愈（semanticError 哨兵 + isSemanticError 分流 + 2 组测试）；R2-4 decrypt e.Obj 与 fileID 推导一致校验 + Abs 错误处理；R2-5 encrypt 复用 ValidateVirtualPath；补 EncryptObject 字节校验 4 组 + 路径边界测试；`go vet`+`go test -race` 全绿（9 包）、ARM64+Windows 编译通过 |
 | 2026-11-20 | **外部审核（更严格第三方，12 条）全批处置完成 + PM 拍板数字落地**：P0 keygen 排他创建+`--force`+4 组测试、.gitignore 加 vault.key/*.key；#2 vault.paths 启动严格校验（单段/保留名/去重）+ max_streams 天花板 4（PM 实测拍板）；#3 虚拟路径规范校验（ValidateVirtualPath 导出，buildRoot 前 fail-closed，防 path.Dir 死循环）；#4 manifest 解析全局并发限 2 + SetMemoryLimit 前移 vault.Init 前；#5 EncryptObject 实际总字节校验（+size<0）；#6 SaveManifest 三层尺寸校验（16 MiB，PM 拍板下调）+ mcrypt manifest temp+rename 原子写；#8 hex 解码失败/长度≠32 fail-closed（verify 与 Vault.Link）；#9 mcrypt decrypt 路径规范+输出边界校验；#10 getObj 不再伪装目录（ErrForbidden 透传）；#11 子根告警读取成功即清；#12 改判成立（常驻审核记错位置）——Vault.Link 复用已取链接；**端到端测试 5 组 9 场景全链路**（PROPFIND/GET/Range/Seek/SHA-256/错钥/篡改/清单缺失损坏）；`go vet`+`go test -race` 全绿（9 包）、ARM64+Windows 编译通过 |
 | 2026-11-19 | **复核 RV-2026-11-19-07（通过）处置**：本轮修复链获正面确认（回归处置链/双层告警清除/动态标签边界/并发正确）；P1 `TestVaultSupported` 改为对真实驱动实例断言（锁死「Name() ↔ 允许列表」不变量，防驱动改名后静默失效）；P2 容器 List 失败分支补注释（有意粘滞语义，成功后自然清除）；`go vet` + `go test -race` 全绿（9 包）、ARM64 通过 |
@@ -434,3 +435,13 @@
 | R2-3 | P1 | 配置语义错误误触发 .bak 自愈 | 阻断 | semanticError 哨兵 + Load 分流（仅语法错误自愈）+ 2 组测试 | 已闭环 | 待复核 | 2026-11-20 |
 | R2-4 | P2 | decrypt 符号链接/e.Obj 同源/Abs 错误 | 补充 | e.Obj == ObjectPath(EncodeFileID(fileID)) 不变量校验 + Abs 错误如实返回 | 已闭环 | 待复核 | 2026-11-20 |
 | R2-5 | P2 | mcrypt encrypt 未复用路径校验 | 补充 | 加密时即校验虚拟路径规范（超长/超深提前报错） | 已闭环 | 待复核 | 2026-11-20 |
+
+### RV-2026-11-20-04（外部审核第三轮，3×P1 闭合确认 + 3×P2）
+
+| 编号 | 级别 | 意见摘要 | 处置类别 | 处置说明 | 状态 | 复核 | 日期 |
+|---|---|---|---|---|---|---|---|
+| — | P1 | R2-1/R2-2/R2-3 复核确认闭合 | 确认 | 审核员逐条核对代码确认（全局信号量生命周期/原子替换/自愈分流） | 已闭环 | 通过 | 2026-11-20 |
+| P2-1 | P2 | decrypt 输出目录符号链接逃逸 + Dirs 未校验 | 已改 | safeOutPath 统一处理（Files/Dirs 同函数、拒反斜杠、逐级 Lstat 符号链接检查）+ 2 组测试（Linux 全测，Windows 自动跳过） | 已闭环 | 待复核 | 2026-11-20 |
+| P2-2 | P2 | keygen 原子替换缺父目录同步 | 已改 | rename 后父目录 Sync（与 conf 同口径，降级忽略）+ 目录只读写失败旧钥不变测试（root 跳过） | 已闭环 | 待复核 | 2026-11-20 |
+| P2-3 | P2 | manifest 额度等待不响应取消 | 已改 | select mctx.Done() 退出；双实例争抢/预算超时退出 2 组测试（manifestReadTimeout 改 var） | 已闭环 | 待复核 | 2026-11-20 |
+| — | 测试 | 审核 5 条缺失测试可行性评估 | 已评估 | 4 全可测 + 1 条件可测（root/Windows 跳过）+ 1 不可测（同步失败，审查覆盖） | 已闭环 | — | 2026-11-20 |

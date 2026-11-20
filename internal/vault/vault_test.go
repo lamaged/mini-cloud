@@ -903,3 +903,77 @@ func TestGlobalStreamSemShared(t *testing.T) {
 	}
 	linkB.Reader.Close()
 }
+
+// TestManifestSemCrossInstanceContention ③：两个 Vault 实例共享同一 manifest 解析额度——
+// 占满额度后另一实例的扫描阻塞，释放后恢复（确定性：手工占额度 + goroutine + 时限断言）
+func TestManifestSemCrossInstanceContention(t *testing.T) {
+	f, master, _ := buildTestVault(t, true)
+	va := New(f, f, master, Config{Paths: []string{"backup"}})
+	if err := va.Init(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer va.Stop()
+
+	old := manifestReadTimeout
+	manifestReadTimeout = 2 * time.Second // 缩短预算，防测试慢与超时边界抖动
+	defer func() { manifestReadTimeout = old }()
+
+	// 占满全局额度（2 槽）
+	globalManifestSem <- struct{}{}
+	globalManifestSem <- struct{}{}
+
+	done := make(chan struct{})
+	go func() {
+		va.scan(context.Background(), "backup", false) // refreshRoot 会在额度上阻塞
+		close(done)
+	}()
+	// 100ms 内不得完成（正在等待额度）
+	select {
+	case <-done:
+		t.Fatal("额度占满时扫描不应完成")
+	case <-time.After(100 * time.Millisecond):
+	}
+	// 释放一个槽 → 扫描应完成
+	<-globalManifestSem
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("释放额度后扫描应在 2s 内完成")
+	}
+	<-globalManifestSem // 释放另一槽
+}
+
+// TestManifestSemCtxCancel ④：等待额度期间 ctx 取消 → 限时退出，不傻等
+func TestManifestSemCtxCancel(t *testing.T) {
+	f, master, _ := buildTestVault(t, true)
+	v := New(f, f, master, Config{Paths: []string{"backup"}})
+	if err := v.Init(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer v.Stop()
+
+	// 注（P9）：懒扫描用后台 ctx——调用方取消不传导；额度等待的退出依据是
+	// 每目录 manifestReadTimeout 预算。测试缩短预算验证「等待不傻等」。
+	old := manifestReadTimeout
+	manifestReadTimeout = 300 * time.Millisecond
+	defer func() { manifestReadTimeout = old }()
+
+	// 占满全局额度
+	globalManifestSem <- struct{}{}
+	globalManifestSem <- struct{}{}
+	defer func() {
+		<-globalManifestSem
+		<-globalManifestSem
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		v.scan(context.Background(), "backup", false)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("额度等待应在预算超时后退出（2s 内），不得傻等")
+	}
+}
