@@ -904,8 +904,10 @@ func TestGlobalStreamSemShared(t *testing.T) {
 	linkB.Reader.Close()
 }
 
-// TestManifestSemCrossInstanceContention ③：两个 Vault 实例共享同一 manifest 解析额度——
-// 占满额度后另一实例的扫描阻塞，释放后恢复（确定性：手工占额度 + goroutine + 时限断言）
+// TestManifestSemCrossInstanceContention ③：两个 Vault 实例（模拟两个挂载）共享同一
+// manifest 解析额度——额度占满后另一实例的扫描阻塞，释放后恢复。
+// 注：占额度用「手工填 token」这一确定性手段（等价于另一实例正在解析中；
+// fakeRaw 解析瞬时完成，无法靠真实解析自然占住额度）。
 func TestManifestSemCrossInstanceContention(t *testing.T) {
 	f, master, _ := buildTestVault(t, true)
 	va := New(f, f, master, Config{Paths: []string{"backup"}})
@@ -913,6 +915,11 @@ func TestManifestSemCrossInstanceContention(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer va.Stop()
+	vb := New(f, f, master, Config{Paths: []string{"backup"}})
+	if err := vb.Init(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer vb.Stop()
 
 	old := manifestReadTimeout
 	manifestReadTimeout = 2 * time.Second // 缩短预算，防测试慢与超时边界抖动
@@ -924,7 +931,7 @@ func TestManifestSemCrossInstanceContention(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		va.scan(context.Background(), "backup", false) // refreshRoot 会在额度上阻塞
+		vb.scan(context.Background(), "backup", false) // vb（另一实例）在额度上阻塞
 		close(done)
 	}()
 	// 100ms 内不得完成（正在等待额度）
@@ -943,8 +950,10 @@ func TestManifestSemCrossInstanceContention(t *testing.T) {
 	<-globalManifestSem // 释放另一槽
 }
 
-// TestManifestSemCtxCancel ④：等待额度期间 ctx 取消 → 限时退出，不傻等
-func TestManifestSemCtxCancel(t *testing.T) {
+// TestManifestSemBudgetTimeout ④：等待额度期间按 manifestReadTimeout 预算退出，不傻等。
+// 注（P9）：懒扫描用后台 ctx，调用方取消不传导（设计如此）——额度等待的退出
+// 依据是每目录 5s 预算，而非父 ctx 取消；测试缩短预算验证该路径。
+func TestManifestSemBudgetTimeout(t *testing.T) {
 	f, master, _ := buildTestVault(t, true)
 	v := New(f, f, master, Config{Paths: []string{"backup"}})
 	if err := v.Init(context.Background()); err != nil {
@@ -952,8 +961,6 @@ func TestManifestSemCtxCancel(t *testing.T) {
 	}
 	defer v.Stop()
 
-	// 注（P9）：懒扫描用后台 ctx——调用方取消不传导；额度等待的退出依据是
-	// 每目录 manifestReadTimeout 预算。测试缩短预算验证「等待不傻等」。
 	old := manifestReadTimeout
 	manifestReadTimeout = 300 * time.Millisecond
 	defer func() { manifestReadTimeout = old }()

@@ -27,6 +27,9 @@ type Config struct {
 const (
 	// scanTTL 容器扫描周期（懒刷新：TTL 到期后的首次 List 触发，§5.1）
 	scanTTL = 5 * time.Minute
+	// scanRetryShort 本轮扫描有未完成/异常时的重试间隔（外部审核 2026-11-20
+	// 第四轮：排队超时等瞬态问题不得等满 5 分钟才重试）
+	scanRetryShort = 1 * time.Minute
 	// maxSubDirs 容器直接子目录数上限（超过跳过扫描并告警，防异常结构拖垮）
 	maxSubDirs = 32
 	// maxHotManifest 热刷新清单解压后大小上限（超过跳过热刷新、重启生效——AX6 瞬时双份峰值守卫）
@@ -233,6 +236,11 @@ func (v *Vault) scan(ctx context.Context, name string, initial bool) {
 		v.mu.Lock()
 		if c := v.containers[name]; c != nil {
 			c.warning = strings.Join(cwarns, "；")
+			if len(cwarns) > 0 {
+				// 本轮有未完成/异常：下轮提前重试（1 分钟），
+				// 正常完成则维持 scanTTL（外部审核 2026-11-20 第四轮）
+				c.lastScan = time.Now().Add(-scanTTL + scanRetryShort)
+			}
 		}
 		v.mu.Unlock()
 	}()
@@ -318,7 +326,9 @@ func (v *Vault) refreshRoot(ctx context.Context, cont, dir string) string {
 	case globalManifestSem <- struct{}{}:
 		defer func() { <-globalManifestSem }()
 	case <-mctx.Done():
-		return "" // 扫描超时/取消：不阻塞在额度等待上
+		// 外部审核 2026-11-20 第四轮：超时不得静默——返回非空告警由上层记录
+		//（并触发短重试）；本分支不触碰树，旧树原样保留
+		return fmt.Sprintf("子目录 %s：manifest 解析排队超时，本轮未扫描（保留旧树，稍后自动重试）", dir)
 	}
 	link, err := v.raw.Link(mctx, manifestPath)
 	if err != nil {

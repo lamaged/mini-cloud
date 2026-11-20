@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os/exec"
+	"runtime"
 	"bytes"
 	"os"
 	"path/filepath"
@@ -228,5 +230,36 @@ func TestCmdKeygenWriteFailureOldIntact(t *testing.T) {
 	after, _ := os.ReadFile(keyPath)
 	if !bytes.Equal(old, after) {
 		t.Error("写失败时旧密钥不得改变")
+	}
+}
+
+// TestDecryptWindowsJunction 外部审核 2026-11-20 第四轮：Windows 目录交接点（junction）
+// 逃逸拒绝。仅在 Windows 且 mklink 可用时执行；其他平台/不可用时**明确跳过**
+//（不把普通符号链接测试通过等同于 junction 安全）。
+func TestDecryptWindowsJunction(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows 专属测试（junction 无法在其他平台创建）")
+	}
+	vaultDir, keyPath := buildVaultDir(t)
+	dir := t.TempDir()
+	outDir := filepath.Join(dir, "restore")
+	if err := os.MkdirAll(outDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	external := filepath.Join(dir, "victim")
+	if err := os.MkdirAll(external, 0755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(outDir, "Movies")
+	if out, err := exec.Command("cmd", "/c", "mklink", "/J", link, external).CombinedOutput(); err != nil {
+		t.Skipf("无法创建 junction：%v（%s）", err, out)
+	}
+	err := cmdDecrypt([]string{"-key", keyPath, "-in", vaultDir, "-out", outDir})
+	if err == nil || !strings.Contains(err.Error(), "符号链接") {
+		t.Fatalf("junction 目录应被拒绝，got %v", err)
+	}
+	entries, _ := os.ReadDir(external)
+	if len(entries) != 0 {
+		t.Errorf("外部目录不得被写入，实际 %d 项", len(entries))
 	}
 }

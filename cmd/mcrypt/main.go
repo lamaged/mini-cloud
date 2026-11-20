@@ -12,6 +12,7 @@
 package main
 
 import (
+	"runtime"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/sha256"
@@ -165,10 +166,16 @@ func writeKeyAtomic(keyPath string, key []byte) error {
 		return err
 	}
 	// P2-2（外部审核 2026-11-20）：父目录同步——rename 的目录项持久化
-	//（与 conf.writeFileAtomic 同口径；不支持目录同步的平台降级忽略，尽力而为）
+	//（与 conf.syncDir 同口径）。第四轮补充：同步失败/目录打不开时打警告
+	//（此时 rename 已成功、旧钥已替换，不能返回失败暗示旧钥仍有效——
+	// 仅提示「替换动作」的持久性风险）
 	if d, err := os.Open(filepath.Dir(keyPath)); err == nil {
-		_ = d.Sync()
+		if err := d.Sync(); err != nil {
+			fmt.Fprintf(os.Stderr, "警告：密钥目录同步失败（替换已成功，断电可能丢失本次替换）：%v\n", err)
+		}
 		d.Close()
+	} else {
+		fmt.Fprintf(os.Stderr, "警告：无法打开密钥目录做同步（替换已成功）：%v\n", err)
 	}
 	return nil
 }
@@ -343,8 +350,13 @@ func safeOutPath(outDir, virtual string) (string, error) {
 			}
 			return "", fmt.Errorf("检查输出路径失败: %w", err)
 		}
-		if fi.Mode()&os.ModeSymlink != 0 {
-			return "", fmt.Errorf("%s: 输出路径含符号链接目录，拒绝解密", virtual)
+		// 符号链接 + Windows 目录交接点（junction）一并拒绝：
+		// Go 1.23 起 Windows 重解析点（Mount Point 类型）不再置 ModeSymlink、
+		// 而归入 ModeIrregular——仅查 ModeSymlink 会漏掉 junction（外部审核
+		// 2026-11-20 第四轮）。ModeIrregular 仅按 Windows 门控，避免 Linux
+		// 上特殊文件类型误伤。
+		if fi.Mode()&os.ModeSymlink != 0 || (runtime.GOOS == "windows" && fi.Mode()&os.ModeIrregular != 0) {
+			return "", fmt.Errorf("%s: 输出路径含符号链接/交接点目录，拒绝解密", virtual)
 		}
 	}
 	return target, nil
