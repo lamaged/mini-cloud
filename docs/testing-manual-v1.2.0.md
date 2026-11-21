@@ -13,6 +13,25 @@
 - [ ] 测试设备就绪：红米电视（Nova Player）、手机（网易爆米花）、电脑（Edge）——三端各可访问 `http://192.168.2.1:8088`
 - [ ] 三个云盘（移动、天翼个人、天翼家庭）的 `backup/` 下各有至少一个加密单元（`backup/<名字>/_mc/`）
 - [ ] 监控脚本可用：`/data/memwatch.sh`（如无：`while true; do date; free; sleep 30; done` 记录亦可）
+- [ ] Windows 加密工具就位：从开发机 `~/mini-cloud-staging/mcrypt.exe` 复制到 Windows（每次发版后重新复制，确保用最新版）
+
+### mcrypt 命令速查（Windows，管理员 PowerShell/CMD）
+
+```bat
+:: 生成主密钥（仅首次；已存在会拒绝，--force 才覆盖——覆盖=全部已加密数据作废！）
+mcrypt.exe keygen -key vault.key
+
+:: 加密一个目录（生成 上传目录\_mc\）
+mcrypt.exe encrypt -key vault.key -in 明文目录 -out 上传目录
+
+:: 解密还原（验证用；拒绝输出路径中的快捷方式目录）
+mcrypt.exe decrypt -key vault.key -in vault根目录 -out 明文输出目录
+
+:: 完整性校验（不输出明文，只核对 SHA-256）
+mcrypt.exe verify -key vault.key -in vault根目录
+```
+
+> 注意：`vault.key` 必须是**同一把**（与加密云盘文件时用的完全一致）；上传新单元后 ≤5 分钟自动生效（免重启）。
 
 ## 1. 部署与启动确认
 
