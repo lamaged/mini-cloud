@@ -124,6 +124,17 @@ OpenSSL 的数字不能直接等同于 Go `crypto/aes` + `crypto/cipher` 的吞�
 
 预期量级：100–300 MB/s。即使只有 100 MB/s，也足够 4K；如果低于 40 MB/s，才需要重新评估并发策略。
 
+**AX6 实测（Phase 0 验收）：Seal 384.6 / Open 383.8 MB/s**——远超 40 MB/s 验收线（9.6×）。
+
+**硬件加速 A/B 对比（PM 实测 2026-11-21，128 MB）**：
+
+| 模式 | Seal | Open |
+|---|---|---|
+| 默认（ARMv8 AES/PMULL 自动启用） | 386.6 MB/s | 442.8 MB/s |
+| `GODEBUG=cpu.aes=off,cpu.pmull=off`（强制纯软件） | 7.7 MB/s | 7.9 MB/s |
+
+**结论**：① Go 在 AX6 上自动使用硬件 AES/PMULL 指令（50× 差距为证，无需任何平台代码）；② 硬件加速是 4K 目标的**性命攸关前提**——纯软件 7.7 MB/s 低于 4K 所需的 ~9.4 MB/s（75 Mbps），连一路 4K 都跑不动。
+
 ---
 
 ## 3. 测试环境与方法
