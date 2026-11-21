@@ -2,6 +2,8 @@ package driver
 
 import (
 	"context"
+	"errors"
+
 	"mini-cloud/internal/model"
 )
 
@@ -37,4 +39,41 @@ type TokenManager interface {
 type HealthReporter interface {
 	// HealthWarning 返回需要展示给用户的提示信息；空字符串表示正常
 	HealthWarning() string
+}
+
+// CredentialField 凭证字段描述（供管理页渲染表单）
+type CredentialField struct {
+	Key   string // 表单字段名
+	Label string // 显示名
+	Kind  string // "password" 或 "text"
+}
+
+// ErrStateWriteFailed 凭证已生效但本地 token state 写入失败。
+// CommitCredential 用 %w 包裹该哨兵返回，调用方据此区分「生效但有告警」与「提交失败」。
+var ErrStateWriteFailed = errors.New("credential applied but state write failed")
+
+// ErrForbidden 禁止访问（Vault 的 _mc 密文对象目录：PROPFIND 隐藏、GET 403，绝不回落 302）
+var ErrForbidden = errors.New("forbidden")
+
+// ErrTooManyStreams 并发解密流超上限（max_streams 信号量：等待超时后拒绝，webdav 映射 503）
+var ErrTooManyStreams = errors.New("too many concurrent streams")
+
+// ErrUpstream 上游（云盘 CDN）失败（网络/签名/截断等；webdav 映射 502，契约 design §7.7）
+var ErrUpstream = errors.New("upstream failure")
+
+// CredentialUpdater 凭证更新（可选接口）：两阶段——先验证后提交（docs/design.md §3.2）
+//
+// values 中的保留键：调用方在 ValidateCredential 前写入 "__req"（本次更新请求的唯一标识，
+// 驱动按它关联 Validate 与 Commit，隔离并发更新）；驱动可回填 "__expiry"（显示用，
+// 格式 2006-01-02 15:04）。其余键为 CredentialField.Key。
+type CredentialUpdater interface {
+	// CredentialFields 返回可更新的凭证字段（供管理页渲染表单）
+	CredentialFields() []CredentialField
+	// ValidateCredential 校验格式并做网络验证（调用方须带超时，建议 10s，ctx 必须传导）。
+	// 不得改变任何生效状态（内存凭证、token state、config 均不动）。
+	ValidateCredential(ctx context.Context, values map[string]string) error
+	// CommitCredential 应用该次验证过的凭证到内存并写入 token state；同步、不联网、不回滚。
+	// token state 写入失败时凭证仍生效（重启后以 config.json 为准），
+	// 返回 fmt.Errorf("%w: ...", ErrStateWriteFailed, err) 由调用方按告警提示。
+	CommitCredential(values map[string]string) error
 }

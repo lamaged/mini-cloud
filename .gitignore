@@ -1,5 +1,7 @@
-# 本地配置文件（包含真实凭证）
+# 本地配置文件（含真实凭证；.bak/.tmp 为管理页写回时产生的备份与临时文件，同样含凭证）
 config.json
+config.json.bak
+config.json.tmp
 
 # OAuth token 缓存
 state/
@@ -22,3 +24,14 @@ env.sh
 *.exe
 *.test
 *.out
+docs/review/*.log
+
+# 真机验收日志（运行时数据，本地留存不入库）
+test_log/
+
+# Vault 主密钥（永不入库——误提交 = 云盘加密数据失去保护）
+vault.key
+*.key
+
+# 加密工具构建产物
+mcrypt

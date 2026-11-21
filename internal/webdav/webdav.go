@@ -2,15 +2,19 @@ package webdav
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"html/template"
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"strings"
 	"time"
 
+	"mini-cloud/internal/driver"
 	"mini-cloud/internal/model"
 )
 
@@ -55,7 +59,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err != nil {
-		slog.Error("WebDAV error", "method", r.Method, "path", r.URL.Path, "err", err)
+		// E（RV-2026-11-18-01）：客户端断开/取消不是服务端故障，降为 Debug
+		//（播放器 seek/取消频繁发生，记 ERROR 会刷屏并掩盖真实异常）
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			slog.Debug("WebDAV 请求被取消", "method", r.Method, "path", r.URL.Path)
+		} else {
+			slog.Error("WebDAV error", "method", r.Method, "path", r.URL.Path, "err", err)
+		}
 	}
 	if status != 0 {
 		w.WriteHeader(status)
@@ -90,6 +100,20 @@ func (h *Handler) handleGetHead(w http.ResponseWriter, r *http.Request) (int, er
 	if err != nil {
 		if os.IsNotExist(err) {
 			return http.StatusNotFound, nil
+		}
+		if errors.Is(err, driver.ErrForbidden) {
+			// Vault _mc 密文对象：403 屏蔽（I4）
+			return http.StatusForbidden, nil
+		}
+		if errors.Is(err, driver.ErrTooManyStreams) {
+			// 并发解密流超上限（design §7.7：超出返回 503 防止 OOM）
+			// I1（RV-2026-11-18-03）：记 Info 供压测统计 503 次数与来源（HEAD 探测/seek 二次连接/真第 4 路）
+			slog.Info("并发解密流超上限（503）", "path", reqPath)
+			return http.StatusServiceUnavailable, nil
+		}
+		if errors.Is(err, driver.ErrUpstream) {
+			// 上游（云盘 CDN）失败：网络/签名/截断等（契约 design §7.7 → 502）
+			return http.StatusBadGateway, nil
 		}
 		return http.StatusInternalServerError, err
 	}
@@ -226,7 +250,8 @@ func cleanPath(p string) string {
 	return "/" + p
 }
 
-// serveDirHTML 为目录 GET 请求生成 HTML 浏览页面
+// serveDirHTML 为目录 GET 请求生成 HTML 浏览页面。
+// 动态内容（文件名等）经 html/template 转义（v0.10.0 独立修复：文件名 XSS）。
 func (h *Handler) serveDirHTML(w http.ResponseWriter, r *http.Request, reqPath string) (int, error) {
 	if r.Method == http.MethodHead {
 		return http.StatusOK, nil
@@ -237,12 +262,52 @@ func (h *Handler) serveDirHTML(w http.ResponseWriter, r *http.Request, reqPath s
 		return http.StatusInternalServerError, err
 	}
 
+	type entry struct {
+		Href  string
+		Name  string
+		Size  string
+		Time  string
+		IsDir bool
+	}
+	data := struct {
+		Path      string
+		Parent    string
+		HasParent bool
+		Entries   []entry
+	}{Path: reqPath}
+
+	if reqPath != "/" {
+		parent := path.Dir(reqPath)
+		if parent == "." {
+			parent = "/"
+		}
+		data.Parent = h.escPath(parent)
+		data.HasParent = true
+	}
+
+	for _, obj := range objs {
+		e := entry{Name: obj.Name, IsDir: obj.IsDir, Href: h.escPath(path.Join(reqPath, obj.Name))}
+		if obj.IsDir {
+			e.Href += "/"
+		} else {
+			e.Size = formatSize(obj.Size)
+		}
+		if !obj.ModTime.IsZero() {
+			e.Time = obj.ModTime.Format("2006-01-02 15:04")
+		}
+		data.Entries = append(data.Entries, e)
+	}
+
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
+	if err := dirHTMLTmpl.Execute(w, data); err != nil {
+		return 0, err
+	}
+	return 0, nil
+}
 
-	// 简易 HTML 目录列表
-	fmt.Fprintf(w, `<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>%s</title>
+var dirHTMLTmpl = template.Must(template.New("dir").Parse(`<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Index of {{.Path}}</title>
 <style>
 body{font-family:sans-serif;max-width:800px;margin:20px auto;padding:0 15px}
 h1{font-size:18px;border-bottom:1px solid #ddd;padding-bottom:10px}
@@ -250,56 +315,39 @@ a{text-decoration:none;color:#0366d6}
 a:hover{text-decoration:underline}
 .dir:before{content:"📁 "}
 .file:before{content:"📄 "}
-table{width:100%%;border-collapse:collapse}
+table{width:100%;border-collapse:collapse}
 td{padding:6px 10px;border-bottom:1px solid #eee}
 .size{text-align:right;color:#666;white-space:nowrap}
 .time{color:#999;font-size:13px;white-space:nowrap}
 </style></head><body>
-<h1>Index of %s</h1>
-<table>`, reqPath, reqPath)
+<h1>Index of {{.Path}}</h1>
+<table>
+{{if .HasParent}}<tr><td><a class="dir" href="{{.Parent}}">..</a></td><td></td><td></td></tr>{{end}}
+{{range .Entries}}<tr><td><a class="{{if .IsDir}}dir{{else}}file{{end}}" href="{{.Href}}">{{.Name}}</a></td><td class="size">{{.Size}}</td><td class="time">{{.Time}}</td></tr>
+{{end}}</table></body></html>
+`))
 
-	// 返回上级链接（根目录除外）
-	if reqPath != "/" {
-		parent := path.Dir(reqPath)
-		if parent == "." {
-			parent = "/"
-		}
-		fmt.Fprintf(w, `<tr><td><a class="dir" href="%s">..</a></td><td></td><td></td></tr>`, h.escPath(parent))
-	}
-
-	for _, obj := range objs {
-		name := obj.Name
-		href := h.escPath(path.Join(reqPath, name))
-		class := "file"
-		if obj.IsDir {
-			class = "dir"
-			href += "/"
-		}
-		size := ""
-		if !obj.IsDir {
-			size = formatSize(obj.Size)
-		}
-		modTime := ""
-		if !obj.ModTime.IsZero() {
-			modTime = obj.ModTime.Format("2006-01-02 15:04")
-		}
-		fmt.Fprintf(w, `<tr><td><a class="%s" href="%s">%s</a></td><td class="size">%s</td><td class="time">%s</td></tr>`,
-			class, href, name, size, modTime)
-	}
-
-	fmt.Fprint(w, "</table></body></html>")
-	return 0, nil
-}
-
-// escPath 返回带 Prefix 的完整 URL 路径
+// escPath 返回带 Prefix 的完整 URL 路径（Prefix 与路径均逐段百分号编码）
 func (h *Handler) escPath(p string) string {
+	p = EncodePathSegments(p)
 	if h.Prefix != "" {
-		p = path.Join("/", h.Prefix, p)
+		p = path.Join("/", EncodePathSegments(h.Prefix), p)
 	}
 	if !strings.HasPrefix(p, "/") {
 		p = "/" + p
 	}
 	return p
+}
+
+// EncodePathSegments 对路径逐段百分号编码（保留 "/" 分隔符）：
+// 中文、空格、#、? 等在严格客户端与浏览器中需要编码才能正确访问。
+// 导出供 main 的根页面/根 PROPFIND 复用（P6：避免两份实现漂移）。
+func EncodePathSegments(p string) string {
+	segs := strings.Split(p, "/")
+	for i := range segs {
+		segs[i] = url.PathEscape(segs[i])
+	}
+	return strings.Join(segs, "/")
 }
 
 // formatSize 格式化文件大小

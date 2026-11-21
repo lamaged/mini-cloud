@@ -3,6 +3,7 @@ package webdav
 import (
 	"context"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"mime"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"mini-cloud/internal/driver"
 	"mini-cloud/internal/model"
 )
 
@@ -23,6 +25,10 @@ func (h *Handler) handlePropfind(w http.ResponseWriter, r *http.Request) (int, e
 	if err != nil {
 		if isNotFound(err) {
 			return http.StatusNotFound, nil
+		}
+		if errors.Is(err, driver.ErrForbidden) {
+			// Vault _mc 密文对象：PROPFIND 隐藏（I4）
+			return http.StatusForbidden, nil
 		}
 		return http.StatusInternalServerError, err
 	}
@@ -106,9 +112,11 @@ func (h *Handler) buildPropsXML(obj *model.Obj) string {
 		textProps["getlastmodified"] = t.UTC().Format(http.TimeFormat)
 	}
 
-	// getcontenttype
+	// getcontenttype（D3：ContentType 非空时为唯一来源，Vault 虚拟树填充）
 	if obj.IsDir {
 		textProps["getcontenttype"] = "httpd/unix-directory"
+	} else if obj.ContentType != "" {
+		textProps["getcontenttype"] = obj.ContentType
 	} else {
 		ext := filepath.Ext(obj.Name)
 		ct := mime.TypeByExtension(ext)
@@ -118,8 +126,12 @@ func (h *Handler) buildPropsXML(obj *model.Obj) string {
 		textProps["getcontenttype"] = ct
 	}
 
-	// getetag
-	textProps["getetag"] = fmt.Sprintf(`"%x-%x"`, obj.ModTime.UnixNano(), obj.Size)
+	// getetag（D3：ETag 非空时为唯一来源）
+	if obj.ETag != "" {
+		textProps["getetag"] = obj.ETag
+	} else {
+		textProps["getetag"] = fmt.Sprintf(`"%x-%x"`, obj.ModTime.UnixNano(), obj.Size)
+	}
 
 	return buildPropXML(textProps, dirProps)
 }
@@ -143,10 +155,10 @@ func (h *Handler) getObj(ctx context.Context, reqPath string) (*model.Obj, error
 
 	objs, err := h.Driver.List(ctx, parent)
 	if err != nil {
-		return &model.Obj{
-			Name:  name,
-			IsDir: true,
-		}, nil
+		// #10（外部审核 2026-11-20）：不得把 List 错误伪装成目录——
+		// ErrForbidden（如 _mc 路径）必须透传 403，其余错误如实上抛，
+		// 否则 PROPFIND 会返回虚假 207 且与 Vault 访问控制语义不一致
+		return nil, err
 	}
 
 	for i := range objs {
@@ -158,14 +170,12 @@ func (h *Handler) getObj(ctx context.Context, reqPath string) (*model.Obj, error
 	return nil, fmt.Errorf("not found: %s", reqPath)
 }
 
-// buildHref 构建 WebDAV href
+// buildHref 构建 WebDAV href（经 escPath 逐段百分号编码：
+// 中文、空格、#、? 文件名在严格客户端上需要编码，v0.10.0 独立修复）
 func (h *Handler) buildHref(reqPath string, isDir bool) string {
-	href := path.Join(h.Prefix, reqPath)
+	href := h.escPath(reqPath)
 	if isDir && !strings.HasSuffix(href, "/") {
 		href += "/"
-	}
-	if !strings.HasPrefix(href, "/") {
-		href = "/" + href
 	}
 	return href
 }
