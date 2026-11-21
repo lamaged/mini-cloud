@@ -21,7 +21,7 @@
         {
             "name": "移动云盘",
             "type": "mobile",
-            "authorization": "Base64编码的认证令牌，从alist等工具获取"
+            "authorization": "Base64编码的认证令牌，登录移动云盘网页后从浏览器开发者工具获取"
         },
         {
             "name": "百度网盘",
@@ -30,5 +30,13 @@
             "client_id": "（可选）百度OAuth client_id，不填使用内置默认值",
             "client_secret": "（可选）百度OAuth client_secret，不填使用内置默认值"
         }
-    ]
+    ],
+    "vault": {
+        "enabled": true,
+        "key_file": "/data/mini-cloud/config/vault.key（master key 绝对路径，永不传上网盘）",
+        "paths": [
+            "backup（容器根名：云盘根目录下只放目录的文件夹，可多个；子目录为独立加密单元）"
+        ],
+        "max_streams": 3
+    }
 }
