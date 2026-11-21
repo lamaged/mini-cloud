@@ -31,7 +31,7 @@ import (
 	"mini-cloud/internal/webdav"
 )
 
-const version = "v1.1.0-beta" // Phase 1 完成（真机验收通过，进入 ≥1 个月运行观察；正式版 v1.1.0 按发布策略）
+const version = "v1.2.0-beta" // Phase 2 完成（真机验收全部通过并合入 master；≥1 个月观察后升正式版 v1.2.0）
 
 // mountedDriver 已挂载的云盘驱动信息
 type mountedDriver struct {
