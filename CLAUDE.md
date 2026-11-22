@@ -23,7 +23,7 @@ source ./env.sh
 
 # 构建与运行
 go build -o mini-cloud .
-./mini-cloud -config config.json        # -debug 调试日志，-quiet 仅错误日志
+./mini-cloud -config config.json        # -debug 调试日志，-quiet 仅警告和错误日志
 
 # 交叉编译（OpenWrt ARM64 路由器，发版/真机验收必用）
 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o mini-cloud-arm64 .
