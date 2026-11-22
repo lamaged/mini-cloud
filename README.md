@@ -243,6 +243,54 @@ mcrypt.exe encrypt -key vault.key -in 明文目录 -out 上传目录
 | Infuse / 网易爆米花 / Kodi | 同上：新建 WebDAV/SMB 源时选 WebDAV，填地址与账号密码 |
 | 电脑浏览器 | 直接打开 `http://<router-ip>:8088/`，点目录浏览、点文件下载 |
 
+## 附录 C：命令行参数（完整清单）
+
+两个程序都有 `-h` 参数，随时可以看帮助。
+
+### mini-cloud（路由器上的主程序）
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `-config 路径` | `config.json` | 配置文件路径 |
+| `-debug` | 关 | 调试日志：额外记录每个请求一行（谁访问、什么文件、成没成、传了多少字节）+ 每分钟一行内存占用 |
+| `-quiet` | 关 | 静默模式：只记警告和错误 |
+
+**日志档位**（同时给 `-debug` 和 `-quiet` 时，`-debug` 优先）：
+
+| 启动方式 | 记什么 |
+|---|---|
+| 不带参数 | 关键节点：启动、挂载、停止、出错 |
+| `-debug` | 最详细：上面全部 + 每个请求 + 内存观测 |
+| `-quiet` | 最安静：只有警告和错误 |
+
+所有日志都打到屏幕上（一行一条：时间、级别、消息、细节），启动命令里的 `>> mini-cloud.log` 就是把它们存进文件；网页 `/admin` 上的警告提示是另一条路，与日志开关无关。
+
+```bash
+# 默认（只记关键节点）
+/data/mini-cloud/mini-cloud-arm64-upx -config /data/mini-cloud/config/config.json
+
+# 排查卡顿/内存问题
+/data/mini-cloud/mini-cloud-arm64-upx -config /data/mini-cloud/config/config.json -debug
+
+# 长期运行（日志文件长得最慢）
+/data/mini-cloud/mini-cloud-arm64-upx -config /data/mini-cloud/config/config.json -quiet
+
+# 盯着日志看实时输出
+tail -f /data/mini-cloud/mini-cloud.log
+```
+
+### mcrypt.exe（Windows 加密工具）
+
+子命令制：`mcrypt.exe <子命令> <参数>`。加密解密都用同一把钥匙（`-key` 指向同一个 `vault.key`）。
+
+| 子命令 | 参数 | 说明 |
+|---|---|---|
+| `keygen` | `-key 路径`（默认 `vault.key`）、`-force` | 生成钥匙（**只做一次**；已存在会拒绝，`-force` 覆盖 = 旧加密文件全部解不开） |
+| `encrypt` | `-key 路径`、`-in 明文目录`、`-out 上传目录` | 加密文件夹（生成 `上传目录\_mc\`）；`-out` 不能放在 `-in` 里面 |
+| `decrypt` | `-key 路径`、`-in 加密目录`、`-out 明文目录` | 把加密目录（含 `_mc` 的目录）解回明文 |
+| `verify` | `-key 路径`、`-in 加密目录` | 校验加密目录是否完整、能否解开（不上传也能自检） |
+| `bench` | `-size MB`（默认 64） | 测本机加密速度（看看有没有硬件加速） |
+
 ---
 
 ## 变更记录

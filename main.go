@@ -44,10 +44,10 @@ type mountedDriver struct {
 func main() {
 	configPath := flag.String("config", "config.json", "配置文件路径")
 	debug := flag.Bool("debug", false, "启用调试日志（含请求追踪）")
-	quiet := flag.Bool("quiet", false, "静默模式（仅错误日志）")
+	quiet := flag.Bool("quiet", false, "静默模式（仅警告和错误日志）")
 	flag.Parse()
 
-	// 日志级别：quiet > debug > 默认(WARN)
+	// 日志级别：debug > 默认(INFO) > quiet(WARN)
 	logLevel := slog.LevelWarn
 	if *debug {
 		logLevel = slog.LevelDebug
