@@ -174,7 +174,7 @@ OpenSSL 的数字不能直接等同于 Go `crypto/aes` + `crypto/cipher` 的吞�
 
 ### 4.1 天翼个人
 
-- 路径：`/189Personal/我的视频/M2TS_ATMOS测试/DTS_OBJECT_EMULATOR.mkv`
+- 路径：`/189Personal/<dir>/<file>.mkv`
 - 请求 URL：
 
 ```text
@@ -205,7 +205,7 @@ http://<router-ip>:8088/189Personal/<dir>/<file>.mkv
 
 ### 4.2 天翼家庭
 
-- 路径：`/189Family/电影/The.Hobbit.An.Unexpected.Journey.2012.EXTENDED.2160p...mkv`
+- 路径：`/189Family/<dir>/<file>.mkv`
 - 请求 URL：
 
 ```text
@@ -251,7 +251,7 @@ http://<router-ip>:8088/189Family/<dir>/<file>.mkv
 
 ### 4.3 移动云盘
 
-- 路径：`/MobileCloudDrive/视频/20250905_140406.mp4`
+- 路径：`/MobileCloudDrive/<dir>/<file>.mp4`
 - 请求 URL：
 
 ```text
