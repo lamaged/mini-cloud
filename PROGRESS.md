@@ -24,6 +24,7 @@
 | 2026-11-16 | **闸门① 通过（PM 批准），v0.10.0 实现完成**：两阶段 CredentialUpdater + internal/admin 管理页（CSRF、html/template 转义）+ mobile 实现（临时客户端验证、按 __req 隔离、凭证/缓存代次防护）+ conf 原子写/0600/备份 + 3 处转义修复（buildHref 百分号编码、目录页/根页转义）。自查（/code-review high）15 条全部修复；`go vet` + `go test -race` 全绿；ARM64 交叉编译通过；实现期修订记录于 design.md §3.8 |
 | 2026-11-16 | **闸门③ 外部代码审核 RV-2026-11-16-03（结论：有条件通过）**：I1–I6 全部修复（更新串行化、LoadStrict 严格读取、目录 fsync、WriteCredential 测试、401×提交竞态测试、提交失败 .bak 回滚），P1–P9 全部落实（状态码、安全响应头、version v0.10.0、Stop 幂等、字段同步、编码去重、24h 门槛、文档修正、自查留痕表）；`go vet` + `go test -race` 全绿；ARM64 交叉编译通过 |
 | 2026-11-16 | **部署脚本完成（PM 拍板：审核后立即写、单独提交）**：scripts/deploy-prepare.sh（开发机编译+UPX+暂存，端到端跑通）+ scripts/deploy-router.sh（路由器拉取+备份+重启+健康检查+失败回滚，busybox ash 兼容，语法与健康检查解析本地验证通过）；体积观察项（铁律 10）：ARM64 原始 8,716,472 B → UPX 后 2,974,696 B（v0.9.2 基线 UPX 约 2.3 MB，增量主要来自 html/template 与凭证相关代码）；真机验证属闸门⑤ |
+| 2026-11-22 | **提交范围最小化落地（PM 拍板两原则）**：①外审必需→脱敏保留；②非必需→不推送。文档脱敏批量执行——process/design/TODO/验收清单/测试手册/feasibility 的内网 IP 与 /home 路径全部占位符化（`<router-ip>`/`<dev-host>`/`~/go`），SSH 认证方式细节删除（保留部署方向），云盘真实内容名→`<dir>/<file>.mkv`+注记，测试设备泛化；CLAUDE.md 隐私节按两原则改写（替换安全管理员原版）+ 例外口径（部署脚本功能默认值/docs/review 历史档案/AX6）；env.example.sh 改 `$HOME/go`；自查 grep 工作区命中归零（仅例外项）；.private 清单例外更新 |
 | 2026-11-22 | **发布策略再修订（PM 拍板：master 强制回退）+ 隐私脱敏机制落地**：master 回退到 v0.9.2 冻结（等成熟再合并），process.md 口径归位，tag v1.2.0-beta 重指 feature 分支；安全管理员三件套按序执行——.gitignore 增 .private/、.private/privacy-checklist.md 本地建（两道闸门验证通过）、CLAUDE.md 增「隐私与脱敏」硬规则；自查命中清单已列，存量内容处置待 PM 逐项拍板 |
 | 2026-11-21 | **Phase 2 合入 master + tag v1.2.0-beta（PM 拍板）**：版本升 v1.2.0-beta；README 变更记录补 Phase 2 全貌；process.md 发布策略修订（master 承接已验收代码）；经 PR #1 合入 master（GitHub 保护规则要求 PR，完整历史保留）；tag v1.2.0-beta 打在合并点并推送；staging 重建；正式版 v1.2.0 待真机连续运行 ≥1 个月（观察起点 2026-11-19） |
 | 2026-11-21 | **Phase 2 真机验收全部通过（ACC-2026-11-21）**：C1 跨挂载播放器实测无问题；C4 释放恢复通过（Edge 取消一路→重下成功 6.6 MB/s、改名可播）；「.txt」现象定性为客户端命名产物（503 纯文本错误体 + Edge 沿用首登记文件名，内容为正确视频流）；完整验收报告归档 docs/review/2026-11-21-phase2-acceptance.md（六节逐项 + 全局并发两口径数据 + 中间态 + 硬件加速 A/B）；待：版本升 v1.2.0-beta + tag |
@@ -125,7 +126,7 @@
 | P9 | 流程 | 内网地址与 SSH 密码登录入库，与 P5 处置矛盾 | 已拍板 | PM 拍板（2026-11-16）：内网地址允许入库（仅私有网段、无凭证）；SSH 表述统一「免密优先，密码回退」；报告 §12.B 加「测试环境地址」注记 | 已裁决（RV-04 复核落实） | RV-04 | 2026-11-16 |
 | P10 | 流程 | 处置类别越出模板；「待复核」缺关闭规则 | 已改 | 模板补「已拍板」类别与状态取值；process.md §2.4 增关闭规则；RV-01 状态列据此更新 | 已关闭 | RV-04 | 2026-11-16 |
 | P11 | 流程 | §8.2 静默删除 getObj 错误处理修改项 | 已改 | 报告 §8.2 prop.go 行恢复「getObj 错误处理（List 失败不得返回伪目录，Vault 降级路径依赖）」 | 已关闭 | RV-04 | 2026-11-16 |
-| P12 | 流程 | 归档件铁律条数、env 模板 GOPATH 两处小不一致 | 已改 | 归档件 r1 加「aeb928e 快照」注记；CLAUDE.md GOPATH 表述修正为 /home/test/go-path | 已关闭 | RV-04 | 2026-11-16 |
+| P12 | 流程 | 归档件铁律条数、env 模板 GOPATH 两处小不一致 | 已改 | 归档件 r1 加「aeb928e 快照」注记；CLAUDE.md GOPATH 表述修正为 ~/go-path | 已关闭 | RV-04 | 2026-11-16 |
 
 ### RV-2026-11-16-03（代码审核，15 条）
 

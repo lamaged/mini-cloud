@@ -10,7 +10,7 @@
 ## 0. 测试前准备
 
 - [ ] 开发机：`./scripts/deploy-prepare.sh` 成功，记录 UPX 后体积：________ 字节（预期 ~3.0 MB）
-- [ ] 测试设备就绪：红米电视（Nova Player）、手机（网易爆米花）、电脑（Edge）——三端各可访问 `http://192.168.2.1:8088`
+- [ ] 测试设备就绪：电视（播放器 App）、手机（播放器 App）、电脑（浏览器）——三端各可访问 `http://<router-ip>:8088`
 - [ ] 三个云盘（移动、天翼个人、天翼家庭）的 `backup/` 下各有至少一个加密单元（`backup/<名字>/_mc/`）
 - [ ] 监控脚本可用：`/data/memwatch.sh`（如无：`while true; do date; free; sleep 30; done` 记录亦可）
 - [ ] Windows 加密工具就位：从开发机 `~/mini-cloud-staging/mcrypt.exe` 复制到 Windows（每次发版后重新复制，确保用最新版）

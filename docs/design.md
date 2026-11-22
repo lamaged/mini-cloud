@@ -49,11 +49,11 @@
 | 项目 | 开发机 | 目标设备 |
 |---|---|---|
 | 硬件 | x86 Ubuntu 24.04 虚机 | Redmi AX6 / OpenWrt ARM64 |
-| Go | 1.24.5（/home/test/go，先 `source env.sh`；模板 env.example.sh 入库，env.sh 不入库） | 交叉编译静态二进制 |
+| Go | 1.24.5（`~/go`，先 `source env.sh`；模板 env.example.sh 入库，env.sh 不入库） | 交叉编译静态二进制 |
 | 构建 | `go build` | `CGO_ENABLED=0 GOOS=linux GOARCH=arm64` + UPX（`~/upx-5.2.1-amd64_linux`） |
 | 测试 | `go test -race`、httptest 模拟云盘 API | 真机验收（功能/性能/内存/CA 证书） |
 
-**部署方向（PM 明确）**：路由器（192.168.2.1，SSH 登录；免密优先，密码回退）作为 SSH 客户端**主动连接开发机拉取产物**；开发机不作为客户端登录路由器。开发机局域网 IP（路由器视角）：**192.168.2.21**。内网地址允许入库（PM 拍板 2026-11-16：仅私有网段地址、不含凭证）。部署脚本（v0.10.0 已提供）：
+**部署方向（PM 明确）**：路由器（`<router-ip>`）作为 SSH 客户端**主动连接开发机拉取产物**；开发机不作为客户端登录路由器。开发机局域网 IP（路由器视角）：**`<dev-host>`**。文档中的内网地址一律占位符（PM 拍板 2026-11-22；例外：部署脚本功能默认值与 docs/review/ 历史档案）。部署脚本（v0.10.0 已提供）：
 
 - `scripts/deploy-prepare.sh`（开发机）：交叉编译 ARM64 + UPX 压缩 → 暂存目录（默认 `~/mini-cloud-staging`）；
 - `scripts/deploy-router.sh`（路由器，busybox ash 兼容）：scp 拉取 → 备份旧二进制（`.prev`）→ 停服务 → 安装 → 重启 → 健康检查（期望 401/200）→ **失败自动回滚**。

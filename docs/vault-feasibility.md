@@ -178,7 +178,7 @@ OpenSSL 的数字不能直接等同于 Go `crypto/aes` + `crypto/cipher` 的吞�
 - 请求 URL：
 
 ```text
-http://192.168.2.1:8088/189Personal/%E6%88%91%E7%9A%84%E8%A7%86%E9%A2%91/M2TS_ATMOS%E6%B5%8B%E8%AF%95/DTS_OBJECT_EMULATOR.mkv
+http://<router-ip>:8088/189Personal/<dir>/<file>.mkv
 ```
 
 | 项目 | 结果 |
@@ -209,7 +209,7 @@ http://192.168.2.1:8088/189Personal/%E6%88%91%E7%9A%84%E8%A7%86%E9%A2%91/M2TS_AT
 - 请求 URL：
 
 ```text
-http://192.168.2.1:8088/189Family/%E7%94%B5%E5%BD%B1/The.Hobbit.An.Unexpected.Journey.2012.EXTENDED.2160p.BluRay.x265.10bit.SDR.DTS-HD.MA.TrueHD.7.1.Atmos-SWTYBLZ/The.Hobbit.An.Unexpected.Journey.2012.EXTENDED.2160p.BluRay.x265.10bit.SDR.DTS-HD.MA.TrueHD.7.1.Atmos-SWTYBLZ.mkv
+http://<router-ip>:8088/189Family/<dir>/<file>.mkv
 ```
 
 | 项目 | 结果 |
@@ -255,7 +255,7 @@ http://192.168.2.1:8088/189Family/%E7%94%B5%E5%BD%B1/The.Hobbit.An.Unexpected.Jo
 - 请求 URL：
 
 ```text
-http://192.168.2.1:8088/MobileCloudDrive/%E8%A7%86%E9%A2%91/20250905_140406.mp4
+http://<router-ip>:8088/MobileCloudDrive/<dir>/<file>.mp4
 ```
 
 | 项目 | 结果 |
@@ -913,11 +913,11 @@ AX6 AES-256-GCM 8 KiB : 136,306.69k B/s ≈ 136 MB/s ≈ 1.09 Gbps
 
 ### B. 可复现命令
 
-> 注：命令中的 `192.168.2.1` 为测试环境地址（历史实测记录），非产品配置。
+> 注：命令中的地址为测试环境地址（历史实测记录，已占位符化）；正文实测 URL 已按「范围最小化」拍板脱敏（真实目录与文件名→占位符）。
 
 ```bash
 AUTH='admin:<WebDAV密码>'
-URL='http://192.168.2.1:8088/189Personal/%E6%88%91%E7%9A%84%E8%A7%86%E9%A2%91/M2TS_ATMOS%E6%B5%8B%E8%AF%95/DTS_OBJECT_EMULATOR.mkv'
+URL='http://<router-ip>:8088/189Personal/<dir>/<file>.mkv'
 
 # 1. 确认 302（不要用 -I，HEAD 不返回 Location）
 curl -s -o /dev/null -w 'status=%{http_code}\n' -u "$AUTH" "$URL"
