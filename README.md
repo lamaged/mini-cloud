@@ -11,8 +11,8 @@
   照片、视频、设计稿、文档、素材包都能放，只读，不会被误删。
 - **大文件边播边取**：视频、音频支持拖动进度条（Range），不用等整个文件缓冲下来；
   **加密过的视频同样能边解密边播放、照常拖动**；
-- **文件加密**：加密在**上传之前**于本地完成，云盘上只有密文。钥匙（`vault.key`）只保存在你的路由器上，
-  不上传、不同步、不入库。
+- **文件加密**：加密在**上传之前**于本地完成，云盘上只有密文。钥匙（`vault.key`）不上传云盘、不入代码仓库，
+  **务必离线备份一份**（丢钥匙 = 密文永久解不开；备份别放进存密文的那个网盘账号里）。
 
 **它不是什么：**
 
@@ -61,7 +61,7 @@
     ],
     "vault": {
         "enabled": true,
-        "key_file": "/data/mini-cloud/vault.key",
+        "key_file": "/data/mini-cloud/config/vault.key",
         "paths": ["backup"],
         "max_streams": 3
     }
@@ -70,7 +70,7 @@
 
 说明：
 
-- `clouds` 里每加一个 `{}` 就多挂一个网盘——**没有数量限制，同一网盘类型可以配多个**（比如两个天翼账号各配一个），只要 `name` 不重复（它会显示在页面上）；
+- `clouds` 里每加一个 `{}` 就多挂一个网盘——**没有固定上限，同一网盘类型可以配多个**（比如两个天翼账号各配一个），只要 `name` 不重复（它会显示在页面上）；实际能挂几个受路由器资源和网盘接口限制；
 - `vault.paths` = 加密容器根的名字（云盘根目录下的一个文件夹，只放目录不放文件），可多个；
 - **不用加密功能**就把整个 `vault` 段删掉；
 - 完整模板见 [config.example.json](config.example.json)（含百度网盘等所有支持的网盘）。
@@ -86,6 +86,8 @@
 scp mini-cloud-arm64-upx root@<router-ip>:/data/mini-cloud/
 scp config.json root@<router-ip>:/data/mini-cloud/config/config.json
 ```
+
+> **用加密功能的话**，启动前还要把钥匙传上去：先在 Windows 上生成钥匙（命令见[「上传加密文件」](#上传加密文件可选)里的 `keygen`，只做一次），再用 WinSCP 把 `vault.key` 拖到路由器的 `/data/mini-cloud/config/`（与 `key_file` 路径一致）。**钥匙没就位之前先别启动**（会直接报错退出）；不用加密就把 `config.json` 里的 `vault` 段删掉。
 
 ### 第 4 步：启动
 
@@ -119,19 +121,33 @@ START=99
 PROG=/data/mini-cloud/mini-cloud-arm64-upx
 CONFIG=/data/mini-cloud/config/config.json
 LOG=/data/mini-cloud/mini-cloud.log
+PID_FILE=/tmp/mini-cloud.pid
+RUN_FLAG=/tmp/mini-cloud.run
 
 start() {
+    # 已经在跑就不重复启动；上次崩溃留下的标记要清掉重新拉起
+    if [ -f ${RUN_FLAG} ] && kill -0 $(cat ${PID_FILE}) 2>/dev/null; then
+        return 0
+    fi
+    rm -f ${RUN_FLAG} ${PID_FILE}
     touch ${LOG}
     echo "" >> ${LOG}
     echo "===== boot $(date) =====" >> ${LOG}
+    touch ${RUN_FLAG}
     sleep 20    # 等网络就绪（如果启动时网盘没连上，可调大到 60）
+    [ -f ${RUN_FLAG} ] || return 0    # 等待期间被 stop 了，就不启动
     ${PROG} -config ${CONFIG} >> ${LOG} 2>&1 &
+    echo $! > ${PID_FILE}
 }
 
 stop() {
-    kill $(pgrep -f mini-cloud-arm64) >> ${LOG} 2>&1
+    rm -f ${RUN_FLAG}    # 先摘标记，防止 start 的等待醒来后又拉起进程
+    [ -f ${PID_FILE} ] && kill $(cat ${PID_FILE}) >> ${LOG} 2>&1
+    rm -f ${PID_FILE}
 }
 ```
+
+> 说明：`RUN_FLAG` 是运行标记——防止重复启动、也防止「stop 之后等待期醒来又自己拉起来」；`PID_FILE` 记着进程号，`stop` 只杀本程序的进程。
 
 第 2 步：SSH 登录路由器，执行：
 
@@ -165,7 +181,7 @@ mcrypt.exe keygen -key vault.key
 mcrypt.exe encrypt -key vault.key -in 明文目录 -out 上传目录
 ```
 
-把 `vault.key` 放到路由器的 `/data/mini-cloud/`（与 config.json 里 `key_file` 一致），然后用**网盘自己的 App** 把「上传目录」传到云盘根的 `backup/` 下。**传完等 5 分钟**（期间浏览一次该目录），加密文件自动出现，免重启。
+把 `vault.key` 放到路由器的 `/data/mini-cloud/config/`（与 config.json 里 `key_file` 一致），然后用**网盘自己的 App** 把「上传目录」传到云盘根的 `backup/` 下。**传完等 5 分钟**（期间浏览一次该目录），加密文件自动出现，免重启。
 
 > 加密目录的结构规则：`backup/` 下只放文件夹；每个文件夹是一个独立加密单元（里面才有 `_mc`）。单元整体增删、不做内部修改。
 
@@ -191,7 +207,7 @@ mcrypt.exe encrypt -key vault.key -in 明文目录 -out 上传目录
 - 百度网盘挂载不启用加密（只读直连）；非会员高码率可能卡顿（百度 CDN 策略）；
 - 加密播放仅支持天翼 / 移动；
 - 天翼家庭 CDN 单链接限速 ~50 Mbps（4K 高码率必然卡顿，与网关无关）；
-- 进程崩溃后需手工重启（见「升级新版本」里的启动命令）；
+- 进程崩溃后需手工重启：SSH 登录路由器，执行 `/etc/init.d/mini-cloud restart`（脚本会自动清掉崩溃残留的标记）；
 - 局域网内 HTTP 明文传输（含 Basic Auth 口令）；需要更安全请自行前置 HTTPS 反向代理；
 - 仅支持单账户单用户。
 
