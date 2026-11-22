@@ -1,59 +1,237 @@
-# Mini Cloud WebDAV Gateway
+# mini-cloud —— 把云盘变成装在你路由器上的只读硬盘
 
-轻量级只读 WebDAV 网关，将多个云盘（百度网盘、天翼云盘、移动云盘）桥接为统一的 WebDAV 服务，专为路由器（OpenWrt ARM64）等资源受限设备设计。
+## 这是什么
 
-## 支持的云盘
+把云盘变成装在你路由器上的**只读硬盘**：局域网里的电视、电脑、手机、平板，用任何一个支持 WebDAV
+的程序，就能浏览、播放、下载云盘里的文件；需要保密的文件，可以在上传之前先加密，云盘上只留密文。
 
-| 云盘 | 驱动类型 | 认证方式 | 视频播放 |
-|------|---------|---------|---------|
-| 天翼云盘（个人/家庭） | `tianyi` | 用户名+密码 | 302 重定向，直连 CDN |
-| 移动云盘（和彩云） | `mobile` | Authorization 令牌 | 302 重定向，直连 CDN |
-| 百度网盘 | `baidu` | refresh_token (OAuth2) | 服务端代理下载，支持 Range（**遗留支持**：2026-11-17 起不再作为支持目标，不做新开发与 Vault 适配） |
-| 本地文件系统 | `local` | 无 | 直接读取 |
+**主要功能：**
 
-## 架构
+- **文件共享**：不装客户端、不登录各家网盘 App——家里任何一台设备连上路由器，看到的是同一份文件列表。
+  照片、视频、设计稿、文档、素材包都能放，只读，不会被误删。
+- **大文件边播边取**：视频、音频支持拖动进度条（Range），不用等整个文件缓冲下来；
+  **加密过的视频同样能边解密边播放、照常拖动**；
+- **文件加密**：加密在**上传之前**于本地完成，云盘上只有密文。钥匙（`vault.key`）只保存在你的路由器上，
+  不上传、不同步、不入库。
 
+**它不是什么：**
+
+- 不是网盘客户端：**只读**，不能上传、删除、改名（加密文件及文件夹写入只有一条路：`mcrypt` 加密后，用网盘自己的 App 上传）；
+- 不是公网服务：默认只在局域网可用；想从外网访问要自己配反向代理，不在支持范围；
+
+**安全及风险**
+
+云盘上只有密文。没有路由器上的 `vault.key`，所有加密文件都无法解密
+（唯一的例外：连得上你的服务、并且知道 WebDAV 账号密码的人，可以让路由器替他解密）。
+
+| 安全 | 风险 |
+|---|---|
+| 云盘上只有密文，服务商看不到文件内容 | 拿到 `vault.key` 文件——可离线解密 |
+| 分享链接被转发，对方也只能拿到密文 | 能连上路由器所在网络、且知道 WebDAV 账号密码可在线读取 |
+| 云端文件被篡改会解密失败（GCM 校验），不会悄悄换成别的内容 | 文件大小、修改时间等元数据仍可推断 |
+| 仓库公开、只含密文的备份外泄，都不会泄露内容 | 弱口令被撞开（默认 `admin`/`admin`，部署第一步必须改） |
+
+> 只有放在加密目录（`vault.paths`）里的文件才受保护，其余目录仍是明文直读。
+
+---
+
+## 快速开始（第一次安装，照做 5 步）
+
+> 前提：红米 AX6 这类 **ARM64 架构的 OpenWrt 路由器**，已开启 SSH。下文命令里的 `<router-ip>` 换成你路由器的局域网地址（一般是 192.168.31.1，小米路由器出厂基本如此）。
+
+### 第 1 步：拿到程序
+
+两个文件：
+
+| 文件 | 用途 |
+|---|---|
+| `mini-cloud-arm64-upx` | 路由器上运行的主程序 |
+| `mcrypt.exe` | Windows 上的加密工具（不用加密功能可不要） |
+
+### 第 2 步：写配置文件
+
+新建一个 `config.json`，照抄下面的模板，把占位符换成你的真实值（各网盘令牌的获取方式见[附录 A](#附录-a各云盘凭证怎么拿)）：
+
+```json
+{
+    "server": { "listen": ":8088", "username": "admin", "password": "请改成你的密码" },
+    "clouds": [
+        { "name": "天翼个人", "type": "tianyi", "username": "手机号", "password": "密码" },
+        { "name": "移动云盘", "type": "mobile", "authorization": "Base64令牌" }
+    ],
+    "vault": {
+        "enabled": true,
+        "key_file": "/data/mini-cloud/vault.key",
+        "paths": ["backup"],
+        "max_streams": 3
+    }
+}
 ```
-TV / Nova Player / 网易爆米花 / Infuse
-          │
-          ▼
-┌─────────────────────────┐
-│   Mini Cloud WebDAV     │  ← 路由器 (OpenWrt ARM64)
-│   :8088                 │
-│                         │
-│  ┌─────────────────────┐│
-│  │ WebDAV Handler      ││  PROPFIND / GET / HEAD / OPTIONS
-│  │ (Basic Auth)        ││
-│  └──────┬──────────────┘│
-│         │               │
-│  ┌──────▼──────────────┐│
-│  │ CachedReader        ││  目录缓存 + 链接缓存 (30s TTL)
-│  │ RetryReader         ││  失败重试 (最多3次)
-│  └──────┬──────────────┘│
-│         │               │
-│  ┌──────▼──────────────┐│
-│  │ Drivers             ││  ┌─────────┬──────────┬─────────┐
-│  │                     ││  │ tianyi  │ mobile   │ baidu   │
-│  │                     ││  │ session │ auth     │ OAuth2  │
-│  │                     ││  └─────────┴──────────┴─────────┘
-│  └─────────────────────┘│
-└─────────────────────────┘
-          │
-          ▼
-   ☁️ 天翼云盘 / 移动云盘 / 百度网盘
+
+说明：
+
+- `clouds` 里每加一个 `{}` 就多挂一个网盘——**没有数量限制，同一网盘类型可以配多个**（比如两个天翼账号各配一个），只要 `name` 不重复（它会显示在页面上）；
+- `vault.paths` = 加密容器根的名字（云盘根目录下的一个文件夹，只放目录不放文件），可多个；
+- **不用加密功能**就把整个 `vault` 段删掉；
+- 完整模板见 [config.example.json](config.example.json)（含百度网盘等所有支持的网盘）。
+
+### 第 3 步：传到路由器
+
+把 `mini-cloud-arm64-upx` 和 `config.json` 放到路由器的 `/data/mini-cloud/` 目录（目录不存在就先建）。两种传法：
+
+- **图形界面（WinSCP）**：用 WinSCP 拖过去即可；
+- **命令行**：在电脑的终端里执行：
+
+```bash
+scp mini-cloud-arm64-upx root@<router-ip>:/data/mini-cloud/
+scp config.json root@<router-ip>:/data/mini-cloud/config/config.json
 ```
 
-### 认证刷新策略（各驱动独立）
+### 第 4 步：启动
 
-| 驱动 | 策略 | 说明 |
-|------|------|------|
-| **天翼** | 被动响应 | API 返回 session 过期时触发刷新，**含家庭云 session 同步更新**；重试上限 1 次防死循环 |
-| **移动** | 不自动续期 | token 约 30 天硬过期，过期后显示空目录 + 提示名，需手动更新 authorization |
-| **百度** | 主动 + 被动 | OAuth2 access_token 过期前 5 分钟主动刷新 + 运行时 401 自动重试 |
+SSH 登录路由器（`ssh root@<router-ip>`），执行：
 
-### 变更记录
+```bash
+chmod +x /data/mini-cloud/mini-cloud-arm64-upx
+/data/mini-cloud/mini-cloud-arm64-upx -config /data/mini-cloud/config/config.json >> /data/mini-cloud/mini-cloud.log 2>&1 &
+```
 
-#### v1.2.0-beta (2026-11-21)
+看到日志里有「Gateway 启动」就成功了：
+
+```bash
+tail -n 5 /data/mini-cloud/mini-cloud.log
+```
+
+### 第 5 步：验证
+
+- 浏览器打开 `http://<router-ip>:8088/`，输入 `config.json` 里设的用户名密码——能看到你的网盘列表 = 成功；
+- 电视/手机播放器：新建 WebDAV 源，地址填 `http://<router-ip>:8088/<网盘name>/`，账号密码同上（各家播放器的填法见[附录 B](#附录-b播放器怎么连)）。
+
+> **重启后自动运行（小抄）**：建一个开机自启脚本（OpenWrt 标准做法），分三步：
+
+第 1 步：用 WinSCP 新建文件 `/etc/init.d/mini-cloud`，内容如下：
+
+```sh
+#!/bin/sh /etc/rc.common
+# mini-cloud 开机自启
+START=99
+
+PROG=/data/mini-cloud/mini-cloud-arm64-upx
+CONFIG=/data/mini-cloud/config/config.json
+LOG=/data/mini-cloud/mini-cloud.log
+
+start() {
+    touch ${LOG}
+    echo "" >> ${LOG}
+    echo "===== boot $(date) =====" >> ${LOG}
+    sleep 20    # 等网络就绪（如果启动时网盘没连上，可调大到 60）
+    ${PROG} -config ${CONFIG} >> ${LOG} 2>&1 &
+}
+
+stop() {
+    kill $(pgrep -f mini-cloud-arm64) >> ${LOG} 2>&1
+}
+```
+
+第 2 步：SSH 登录路由器，执行：
+
+```bash
+chmod +x /etc/init.d/mini-cloud
+/etc/init.d/mini-cloud enable
+/etc/init.d/mini-cloud start
+```
+
+第 3 步：验证
+
+重启路由器，等 1 分钟，浏览器打开 `http://<router-ip>:8088/` 能看到网盘列表 = 自启成功。
+
+---
+
+## 日常使用
+
+### 更新移动云盘的令牌
+
+移动云盘令牌约 30 天过期。过期时页面会提示「令牌已过期，请更新令牌」——打开 `http://<router-ip>:8088/admin`，粘贴新令牌即可，免 SSH、立即生效。
+
+### 上传加密文件（可选）
+
+加密在 Windows 上做（`mcrypt.exe` 与 `vault.key` 放同一目录）：
+
+```bat
+:: 生成钥匙（只做一次！已存在会拒绝，--force 才覆盖——覆盖=旧加密文件全部解不开）
+mcrypt.exe keygen -key vault.key
+
+:: 加密一个文件夹：明文目录 → 上传目录（生成 上传目录\_mc\）
+mcrypt.exe encrypt -key vault.key -in 明文目录 -out 上传目录
+```
+
+把 `vault.key` 放到路由器的 `/data/mini-cloud/`（与 config.json 里 `key_file` 一致），然后用**网盘自己的 App** 把「上传目录」传到云盘根的 `backup/` 下。**传完等 5 分钟**（期间浏览一次该目录），加密文件自动出现，免重启。
+
+> 加密目录的结构规则：`backup/` 下只放文件夹；每个文件夹是一个独立加密单元（里面才有 `_mc`）。单元整体增删、不做内部修改。
+
+---
+
+## 常见问题（FAQ）
+
+| 现象 | 为什么 | 怎么办 |
+|---|---|---|
+| 页面提示「令牌已过期，请更新令牌」 | 移动云盘令牌 30 天过期 | 打开 `/admin` 粘贴新令牌 |
+| 下载/播放时某个请求失败（503） | 同时解密的流超过 3 路（全局上限，防路由器内存爆掉） | 关掉一路再试；这是保护不是故障 |
+| 天翼的 4K 卡顿，移动的不卡 | 天翼 CDN 对单链接限速约 50 Mbps，高码率 4K 必然卡 | 换移动云盘播 4K，或等天翼策略变化 |
+| 加密目录是空的 / 文件点开报错 | 多半是文件还没上传完（上传中间态） | 等上传完成，≤5 分钟自动恢复 |
+| 上传了加密目录却不显示 | `_mc` 放错层级（应放在 `backup/<目录名>/_mc`） | 云盘里移动 `_mc` 到正确位置；`/admin` 有对应警告 |
+| 想清日志 | 用覆盖清空 | `> /data/mini-cloud/mini-cloud.log`（别用 rm 删文件） |
+| 忘记路由器地址/账号 | 看 config.json | `listen` 是端口，`username/password` 是登录账号 |
+
+---
+
+## 已知限制
+
+- 只读：不支持上传/删除/改名（写操作一律通过网盘自己的 App）；
+- 百度网盘挂载不启用加密（只读直连）；非会员高码率可能卡顿（百度 CDN 策略）；
+- 加密播放仅支持天翼 / 移动；
+- 天翼家庭 CDN 单链接限速 ~50 Mbps（4K 高码率必然卡顿，与网关无关）；
+- 进程崩溃后需手工重启（见「升级新版本」里的启动命令）；
+- 局域网内 HTTP 明文传输（含 Basic Auth 口令）；需要更安全请自行前置 HTTPS 反向代理；
+- 仅支持单账户单用户。
+
+---
+
+## 给开发者
+
+技术文档索引（README 面向使用者，设计与实现细节都在这里）：
+
+| 文档 | 内容 |
+|---|---|
+| [docs/design.md](docs/design.md) | 功能设计（含 Vault 加密体系、Phase 2 容器方案） |
+| [docs/vault-feasibility.md](docs/vault-feasibility.md) | 可行性实测（AX6 性能、CDN Range、URL 时效数据） |
+| [docs/process.md](docs/process.md) | 开发与审核流程（角色、铁律、六道闸门） |
+| [docs/review/](docs/review/) | 历次审核报告与验收报告归档 |
+| [docs/testing-manual-v1.2.0.md](docs/testing-manual-v1.2.0.md) | 真机验收测试手册 |
+
+---
+
+## 附录 A：各云盘凭证怎么拿
+
+| 网盘 | 要什么 | 怎么拿 |
+|---|---|---|
+| 天翼个人 / 家庭 | 手机号 + 密码 | 就是云盘 App 的登录账号密码 |
+| 移动云盘 | authorization 令牌 | 电脑浏览器登录移动云盘网页 → F12 开发者工具 → 网络请求头里找 `authorization` 字段，复制整串 Base64 |
+| 百度网盘 | refresh_token 等 | OAuth 获取（详见配置模板注释；百度不支持加密播放） |
+
+## 附录 B：播放器怎么连
+
+| 播放器 | 添加方式 |
+|---|---|
+| Nova Player（电视） | 设置 → 网络 → WebDAV → 地址 `http://<router-ip>:8088/<网盘name>/` → 输入账号密码 |
+| Infuse / 网易爆米花 / Kodi | 同上：新建 WebDAV/SMB 源时选 WebDAV，填地址与账号密码 |
+| 电脑浏览器 | 直接打开 `http://<router-ip>:8088/`，点目录浏览、点文件下载 |
+
+---
+
+## 变更记录
+
+### v1.2.0-beta (2026-11-21)
 
 - **新增** 容器自动发现（加密目录即传即用）：`vault.paths` 为容器根（只放目录），子目录各自持有 `_mc` 为独立加密单元——新增/删除/整块换新 ≤5 分钟自动生效，免配置免重启；容器下非单元路径一律「未找到」（404，不认识即不管）；上传中间态自愈（不崩溃、不泄露、传完自动完整）
 - **新增** 管理页体验：全部挂载状态卡（驱动告警 + Vault 告警双通道）；移动凭证标签动态显示剩余有效期/获取指引；过期文案「令牌已过期，请更新令牌」
@@ -61,7 +239,7 @@ TV / Nova Player / 网易爆米花 / Infuse
 - **加固**（外部审核四轮 20+ 条全闭环）：keygen 默认拒绝覆盖（`--force` 原子替换）；`vault.paths` 启动严格校验 + `max_streams` 天花板 4；清单路径规范校验（防死循环）；加密实际字节数校验；清单写入尺寸校验 + 原子写；主密钥入 .gitignore；`header_sha256` fail-closed；decrypt 路径/符号链接/交接点防护；配置语义错误不触发自愈回滚；**并发额度进程级共享**（解密流默认 3 / 天花板 4 + 清单解析并发 2 + 64 MiB 软上限前移）
 - **测试** 外部审核 4 轮 + 常驻复核多轮 + 端到端 9 场景全链路 + 真机验收全通过（跨挂载并发 C1–C4、自动发现、中间态、管理页、稳定性；AX6 硬件加速 A/B 实测 50×）
 
-#### v1.1.0-beta (2026-11-19)
+### v1.1.0-beta (2026-11-19)
 
 - **新增** Vault 加密文件 WebDAV 还原播放（Phase 0+1）：MCF1 格式（AES-256-GCM 1 MiB 分块 + HKDF 密钥派生 + manifest 清单）；`cmd/mcrypt` 加密工具（Windows 版随版本交付）；虚拟目录树按原始文件名展示、`_mc` 密文对象 403 屏蔽；随机 Seek 块级按需解密（视频拖动只读 1–2 块）
 - **新增** 云盘上游取数层：签名 URL 自管（到期前 60s 主动换签 + 403 被动换签，**真机实测播放中途换签零中断**）；4 MiB 顺序读窗口缓冲；传输截断检测；客户端取消不触发重试（不白刷云盘 API）
@@ -70,7 +248,7 @@ TV / Nova Player / 网易爆米花 / Infuse
 - **已知限制**：天翼家庭 CDN 单链接限速 ~50 Mbps，4K 高码率在天翼站必然卡顿（移动站 3×4K 共 225 Mbps 实测流畅）
 - **测试** 真机验收全通过（天翼/移动双站、3×4K 并发、3×720P 15 分钟跨签名刷新、内存峰值与回落观测）；外部审核 12+ 轮全闭环；`go test -race` 全绿
 
-#### v0.10.0 (2026-11-17)
+### v0.10.0 (2026-11-17)
 
 - **新增** 凭证网页管理：浏览器访问 `/admin` 直接更新移动云盘 authorization，免 SSH。两阶段更新（联网验证 10s 超时 → 原子写配置 → 生效），任何一步失败零变化；配置文件原子写入（临时文件+落盘+改名）、写前自动备份（.bak）、写后权限 0600；剩余有效期不足 24 小时的凭证拒绝接收
 - **修复** 3 处现存转义缺陷：PROPFIND href 逐段百分号编码（中文/空格/`#`/`?` 文件名在严格客户端 404）、目录页文件名 HTML 转义（XSS）、根 PROPFIND 挂载名 XML 转义
@@ -78,7 +256,7 @@ TV / Nova Player / 网易爆米花 / Infuse
 - **新增** 部署脚本 `scripts/`：开发机一键编译+UPX+暂存（deploy-prepare.sh），路由器一键拉取+备份+重启+健康检查+失败自动回滚（deploy-router.sh，busybox ash 兼容）
 - **测试** 新增 40+ 用例（凭证两阶段更新、并发串行化、401×提交竞态、配置原子写/权限/备份/还原、转义），全部通过竞态检测；外部代码审核五轮通过
 
-#### v0.9.2 (2026-10-05)
+### v0.9.2 (2026-10-05)
 
 - **变更** 移动云盘 authorization 过期后不再返回 500，改为显示空目录 + 提示名：
   - 新增 `HealthReporter` 可选接口，驱动可向上层报告健康提示
@@ -86,257 +264,7 @@ TV / Nova Player / 网易爆米花 / Infuse
   - 根导航页与根 PROPFIND 的显示名在过期时变为「移动云盘authorization已经过期，请更新」
   - 明确移动云盘 RCS token 约 30 天硬过期、服务端不接受过期后续期，需用户手动更新 `authorization`
 
-#### v0.9.1 (2026-08-21)
-
-- **修复** 移动云盘 token 过期后无法自动恢复的问题：
-  - `Init()` 的 401 自动刷新回调之前被放在缓存恢复块之后，存在有效缓存时提前 return 导致回调**从未注册**，运行时 401 无法自救；现已前置到任何 early return 之前
-  - `refreshToken()` 之前拒绝刷新已过期 token，现已改为过期也尝试刷新（由服务端决定是否接受）
-  - 缓存恢复时新增 config 与缓存 token 的过期时间比较，选择更晚（更新）的 token，解决「用户更新 config 但旧缓存覆盖新 token」的问题
-- **增强** `TokenState.ExpiresAt` 现在存储从 Authorization 真实提取的过期时间（之前是伪造的「30 天后」值）
-- **增强** 刷新失败从静默返回 nil 改为返回明确错误，便于调用方感知
-
-#### v0.5.1 (2026-07-22)
-
-- **修复** 天翼家庭云 session 过期后无法恢复的问题：`refreshSession()` 现在同步更新个人云和家庭云 session key；API 重试上限 1 次防止无限递归
-- **增强** 天翼云 API 错误检测：新增 `FamilySessionKey`、`familySession` 等家庭云专用过期标志的检测
-- **增强** 家庭云诊断日志：配置了 `family_id` 但未获取到 familySessionKey 时输出警告
-
-## 快速开始
-
-### 配置文件
-
-```json
-{
-    "server": {
-        "listen": ":8088",
-        "username": "admin",
-        "password": "your_password"
-    },
-    "clouds": [
-        {
-            "name": "天翼个人",
-            "type": "tianyi",
-            "username": "手机号",
-            "password": "密码"
-        },
-        {
-            "name": "天翼家庭",
-            "type": "tianyi",
-            "username": "手机号",
-            "password": "密码",
-            "family_id": "家庭云ID"
-        },
-        {
-            "name": "移动云盘",
-            "type": "mobile",
-            "authorization": "Base64认证令牌"
-        },
-        {
-            "name": "百度网盘",
-            "type": "baidu",
-            "refresh_token": "从百度OAuth获取的refresh_token"
-        }
-    ]
-}
-```
-### 配置说明
-
-**`clouds` 数组非常灵活：**
-
-- **最少配 1 个，最多不限** — 按需选择云盘类型和数量，不需要全部配齐
-- **同名云盘可配多个** — 通过 `name` 区分，`name` 即 URL 路径前缀，各条目 `name` 必须唯一
-
-典型场景：
-
-```json
-// 只配一个天翼云盘
-"clouds": [
-    { "name": "天翼云", "type": "tianyi", "username": "...", "password": "..." }
-]
-
-// 天翼个人云 + 家庭云（同类型两个实例）
-"clouds": [
-    { "name": "天翼个人", "type": "tianyi", "username": "...", "password": "..." },
-    { "name": "天翼家庭", "type": "tianyi", "username": "...", "password": "...", "family_id": "..." }
-]
-
-// 混合：天翼 + 百度
-"clouds": [
-    { "name": "天翼云",  "type": "tianyi", "username": "...", "password": "..." },
-    { "name": "百度网盘", "type": "baidu",  "refresh_token": "..." }
-]
-```
-
-访问路径对应关系：
-
-| 配置 `name` | WebDAV 路径 |
-|------------|-------------|
-| `天翼个人` | `http://<IP>:8088/天翼个人/` |
-| `天翼家庭` | `http://<IP>:8088/天翼家庭/` |
-| `百度网盘` | `http://<IP>:8088/百度网盘/` |
-
-### 获取认证凭证
-
-- **天翼云盘**: 直接使用手机号+密码
-- **移动云盘**: 登录移动云盘网页后，从浏览器开发者工具获取 `authorization` 令牌（或用 alist 等第三方工具）
-- **百度网盘**: 
-  1. 访问 [百度 OAuth 授权页](https://openapi.baidu.com/oauth/2.0/authorize?response_type=code&client_id=hq9yQ9w9kR4YHj1kyYafLygVocobh7Sf&redirect_uri=oob&scope=basic,netdisk)
-  2. 登录授权后获取 code
-  3. 用 code 换取 refresh_token（内置默认 client_id/secret，也可自行配置）
-
-### 运行
-
-```bash
-# 本地开发
-./mini-cloud -config config.json
-
-# 红米AX6路由器后台运行
-    cd /data/mini-cloud
-    ./mini-cloud-arm64-upx -config /data/mini-cloud/config/config.json \
-    >> /dev/null 2>&1 &
-
-# 或使用部署脚本（推荐，v0.10.0+）：自动备份旧版本、健康检查、失败自动回滚
-# 开发机执行 ./scripts/deploy-prepare.sh；路由器执行 sh scripts/deploy-router.sh
-
-# 调试模式
-./mini-cloud -config config.json -debug
-
-# 静默模式
-./mini-cloud -config config.json -quiet
-```
-
-### 命令行参数
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `-config` | `config.json` | 配置文件路径 |
-| `-debug` | `false` | 启用调试日志 |
-| `-quiet` | `false` | 静默模式（仅错误日志） |
-
-## WebDAV 访问
-
-### 客户端连接
-
-- **地址**: `http://<路由器IP>:8088/`
-- **认证**: Basic Auth（配置中设置的 username/password）
-- **根路径** `/`: 云盘列表（浏览器打开显示导航页）
-- **云盘路径** `/<云盘名称>/`: 如 `/天翼个人/视频/`
-
-### 支持的客户端
-
-已验证的设备/播放器：
-
-- 路由器红米AX6
-- 🎬 Nova Player
-- 🍿 网易爆米花 (VidxPlayer)
-- 🖥️ Edge 浏览器
-
-### 支持的 HTTP 方法
-
-- `OPTIONS` — WebDAV 能力发现
-- `PROPFIND` — 目录浏览
-- `GET` / `HEAD` — 文件下载（含 Range 断点续传）
-
-## 编译
-
-### 前置条件
-
-- Go 1.22+
-- 标准库即可，无外部依赖
-
-### 编译命令
-
-```bash
-# 本地编译
-go build -o mini-cloud .
-
-# ARM64 交叉编译（OpenWrt 路由器）
-CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o mini-cloud-arm64 .
-
-# UPX 压缩（约 35% 压缩率）
-upx --best -o mini-cloud-arm64-upx mini-cloud-arm64
-```
-
-编译产物大小：6.5MB → UPX 压缩后 2.3MB
-
-## 项目结构
-
-```
-mini-cloud/
-├── main.go                 # 入口：路由、认证、驱动加载
-├── config.json             # 配置文件
-├── go.mod                  # Go module (go 1.22)
-├── state/                  # Token 缓存目录（自动生成）
-├── scripts/                # 部署脚本（开发机编译 + 路由器拉取/回滚）
-├── docs/                   # 设计文档、流程文档、验收清单、评审归档
-├── drivers/
-│   ├── tianyi/             # 天翼云盘驱动
-│   │   ├── driver.go       # List / Link / 路径解析
-│   │   ├── api.go          # API 客户端、签名、加密
-│   │   ├── auth.go         # 登录、session 刷新
-│   │   └── types.go        # 数据结构
-│   ├── mobile/             # 移动云盘驱动
-│   │   ├── driver.go
-│   │   ├── api.go
-│   │   ├── auth.go
-│   │   └── types.go
-│   ├── baidu/              # 百度网盘驱动
-│   │   ├── driver.go       # 代理下载 + Range 支持
-│   │   ├── api.go          # API 客户端 + 401 自动刷新
-│   │   ├── auth.go         # OAuth2 token 刷新
-│   │   └── types.go
-│   └── local/              # 本地文件驱动（开发用）
-│       └── driver.go
-└── internal/
-    ├── admin/              # 凭证管理页（/admin，v0.10.0）
-    ├── auth/watcher.go     # Token 后台维护器（仅 OAuth2 驱动）
-    ├── conf/config.go      # 配置加载与验证（原子写/备份/0600）
-    ├── driver/driver.go    # Driver 接口定义（含 CredentialUpdater）
-    ├── fs/
-    │   ├── cache.go        # 目录/链接缓存层
-    │   └── retry.go        # 失败重试层
-    ├── model/obj.go        # 数据模型
-    └── webdav/
-        ├── webdav.go       # WebDAV 协议处理
-        ├── prop.go         # PROPFIND XML 生成
-        └── xml.go          # XML 工具
-```
-
-## 设计决策
-
-### 为什么用 302 重定向而不是代理下载？
-
-天翼云盘和移动云盘的下载链接是 CDN 地址，带宽充足。302 重定向让客户端直连 CDN：
-- ✅ 不消耗路由器带宽/CPU
-- ✅ 利用 CDN 就近加速
-- ❌ 无法转发 Range 请求（CDN 自行处理）
-
-### 为什么百度网盘用代理下载？
-
-百度网盘 CDN 对非会员用户的 User-Agent 有严格校验，直接 302 会导致客户端收到限速或拒绝连接。代理下载可以：
-- 设置 `User-Agent: netdisk` 绕过限制
-- 转发客户端的 `Range` 头，支持视频拖动
-
-### 为什么不用统一的 Token 刷新？
-
-不同云盘的认证机制差异很大：
-- **百度**: OAuth2，access_token 有明确过期时间 → 适合主动刷新
-- **天翼**: Session 签名，过期不可预测 → 适合被动刷新（与 alist 一致）
-- **移动**: RCS token 约 30 天硬过期，服务端不接受过期后刷新（无法程序化续期）→ 过期后显示空目录 + 提示名，由用户手动更新 authorization
-
-## 已知限制
-
-- 百度网盘非会员用户高码率视频可能卡顿（百度 CDN 策略限制）
-- 不支持文件上传/修改（只读）
-- Vault 加密播放仅支持天翼 / 移动；百度挂载**不启用任何 Vault 行为**——加密目录按普通目录显示，`_mc` 密文对象可被直接下载（无密钥无法解密，属「加密不支持百度」规则的必然结果）
-- `vault.paths` 配置的容器根名（如 `backup`）= **加密专区**：容器列表只显示加密单元（子目录）；容器下非单元路径（普通文件 / 无 `_mc` 目录 / 放错层级的密文 / 保留名）一律「未找到」（404，不认识即不管），密文绝不裸奔；云盘上**同名普通目录**会被视为容器接管（属已拍板的边界语义，docs/design.md §5.1）
-- **加密目录上传中间态（自愈，无需干预）**：用官方客户端上传加密单元期间——目录已建而 `_mc` 未传 → 该目录不显示（未找到）；`_mc` 部分上传而清单未到 → 显示为空目录 + /admin「清单不可读」警告；清单已到而个别对象仍在传 → 文件列表完整但点播未传完的文件会短暂报错。三者均不崩溃、不泄露密文（GCM 认证保证绝不吐错数据），上传完成后 ≤5 分钟（浏览触发）自动完整；使用建议：等上传完成后再播放
-- mcrypt `decrypt` 拒绝输出路径中含符号链接/重解析点的目录（含 Windows 交接点、云盘同步占位文件等——fail-closed 语义）；输出目录**自身**为符号链接时不检查（使用者自己的目录布局，属使用者意图，PM 拍板 2026-11-20）
-- **加密目录结构（v1.2.0 起，现行）**：容器根（如 `backup`）下只放目录，每个子目录是独立加密单元（各自持 `_mc`），即传即用、免重启（≤5 分钟自动发现）；从 v1.1.0-beta 单根结构升级需一次性迁移（单组内容：云盘上把 `_mc` 移进子目录即可，零重加密；多组：逐组重加密）——详见 docs/design.md §5.1 与 docs/testing-manual-v1.2.0.md
-- 天翼家庭站 CDN 对单链接限速 ~50 Mbps（签名 URL 带 `x-amz-limitrate=51200`，上游策略）：**4K 高码率（>50 Mbps）在天翼站会必然卡顿，与网关无关**（2026-11-19 真机定性：网关空等、移动站 3×4K 同管线流畅）；能否通过 Link 请求参数提高 limitrate 留待后续调研（TODO 技术债）
-- 天翼云盘频繁密码登录可能触发验证码（建议首次登录后保持 session）
-- 进程若发生 fatal 崩溃需**手工重启**（PM 拍板 2026-11-18 不装 procd 守护：精简优先、内存占用小才是关键）；64 MiB 内存软上限（启动扫描前即设置，全程生效）已大幅降低崩溃概率——重启命令：`sh /data/mini-cloud/scripts/deploy-router.sh` 或直接重新运行二进制
-- 移动云盘 `authorization` 有效期约 30 天，过期后无法自动续期：挂载显示为空目录，根导航页显示名变为「移动云盘：令牌已过期，请更新令牌」，/admin 卡片同步告警。**v0.10.0 起**：浏览器打开 `http://<路由器IP>:8088/admin` 直接粘贴新 authorization 即可更新（免 SSH、立即生效、重启仍有效），无需手工修改 config.json
+---
 
 ## License
 
