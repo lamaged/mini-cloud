@@ -2,8 +2,8 @@
 
 | 项目 | 内容 |
 |---|---|
-| 文档编号 | DESIGN-2026-11-24-01（修订稿 v4） |
-| 状态 | 设计评审稿（闸门①：第二轮复核 RV-2026-11-24-02 有条件通过——上轮 17 条闭合，本轮 5 条按清单修订完毕，修订后放行批 1，待终核） |
+| 文档编号 | DESIGN-2026-11-24-01（修订稿 v5） |
+| 状态 | 设计评审稿（闸门①：第三轮复核 RV-2026-11-24-03 有条件通过——3 处契约收口完毕，放行批 1，待终核） |
 | 依据 | feature/file-encryption 实际代码（v1.2.0-beta，commit 2a5eae1 起） |
 | 替代 | docs/new/ 两份初稿（ISSUE-2026-11-23-01、后续完善设计方案初稿）——初稿基于公开 master v0.9.2 快照，多处与现行代码不符，本稿以实际代码核查结果为准 |
 | 目标设备 | 红米 AX6 / OpenWrt ARM64 |
@@ -53,6 +53,7 @@
 9. **批 1 范围扩大（外部审核 D2 处置，PM 拍板）**：百度凭证更新通道整体入批 1（删内置回退、client_id/secret 必填、WriteCredential 支持百度、百度 CredentialUpdater、输入框）；一键授权与刷新链路加固留批 2。
 10. **Q1 拍板（外部审核 P1 处置，PM 拍板）**：全部挂载初始化失败时**仍启动诊断首页**（无数据路由，仅状态可见）。
 11. **第二轮复核放行（外部审核 RV-2026-11-24-02，有条件通过）**：按清单修订 5 条后放行批 1——①批 1 验证改无副作用 token 交换（纯验证不碰内存，验证返回的新 refresh_token 传给提交）；②DriverHealth 增「已失效」事实字段 + 红黄映射与优先级（一次 List 成功不得覆盖已确认失效）；③凭据持久化重定稿（config 唯一真值源 + state 纯缓存 + 授权代次/轮换修订号双字段，五问作答）；④RawDriver 允许 nil（创建失败 vs 初始化失败分列）；⑤首页/管理页状态表 = 全部配置挂载（数据路由仅可用挂载）。
+12. **第三轮复核放行（外部审核 RV-2026-11-24-03，有条件通过）**：3 处契约收口——①验证结果经保留键 `__refresh_token` 传递（验证/写配置/改内存三环节同一最终值；失败不留残余；页面不回显、日志不记录）；②代次字段定存 config 百度段（新增可选元数据字段，旧配置按 0 迁移），代次比较与写回纳入同挂载互斥；③测试矩阵删除旧双写模型表述（C05/C06 改新口径，补断电恢复 C11 与验证传递 C12）。修订后放行批 1。
 
 ---
 
@@ -235,11 +236,19 @@ type HealthReporter interface {
 |---|---|
 | 管理页 | 百度卡片新增 refresh_token 输入框（与移动同交互） |
 | 百度驱动 | 实现 `CredentialUpdater`（两阶段，internal/driver/driver.go:64+ 契约；断言对原始驱动，铁律 7） |
-| 验证 | `ValidateCredential` 调用**无副作用 token 交换函数**（审核 RV-26-24-02 阻断项）：只请求并返回 access_token/refresh_token/expires_in，**不修改客户端内存**——现 auth.go `refreshToken()` 内置 `c.SetAccessToken`（先改内存）必须先拆分为纯交换函数；验证响应含新 refresh_token 时作为验证结果传给 Commit，**不丢弃** |
-| 配置写回 | `conf.WriteCredential` 扩展：支持写百度 `refresh_token`（现仅支持移动 authorization）——原子写（临时文件+落盘+改名）+ .bak + 0600 沿用现制 |
+| 验证 | `ValidateCredential` 调用**无副作用 token 交换函数**（审核 RV-26-24-02 阻断项）：只请求并返回 access_token/refresh_token/expires_in，**不修改客户端内存**——现 auth.go `refreshToken()` 内置 `c.SetAccessToken`（先改内存）必须先拆分为纯交换函数；验证响应含新 refresh_token 时经保留键传给 Commit（见下表后契约），**不丢弃** |
+| 配置写回 | `conf.WriteCredential` 扩展：支持写百度 `refresh_token`（现仅支持移动 authorization）——原子写（临时文件+落盘+改名）+ .bak + 0600 沿用现制；写入值为**验证后的最终 refresh_token**，非表单原始输入 |
 | 内存更新 | **顺序：验证 → 写配置 → 改内存**（审核 RV-26-24-02）：config 持久化成功后才提交客户端内存凭据（互斥锁 getter/setter，铁律 8）；任何一步失败 → 零变化 |
-| 失败处理 | 验证失败零变化（不写配置、不动内存、状态不变） |
+| 失败处理 | 验证失败零变化（不写配置、不动内存、状态不变、不留残余验证结果） |
 | 重启恢复 | 新凭据重启后经 Init 生效 |
+
+**验证结果传递契约（审核 RV-26-24-03 阻断项）**：现有接口 `ValidateCredential(ctx, values map[string]string) error` 无独立返回值——沿用现有保留键机制（`__req`/`__expiry` 同款）：
+
+1. 验证成功后，把**最终 refresh_token**（百度可能轮换过的新值）写入 `values` 的专用保留键 `__refresh_token`；
+2. 配置写回（PersistFunc）使用该最终值，而非表单原始输入；
+3. `CommitCredential` 用同一最终值更新内存凭据——验证、写配置、改内存三环节同一值；
+4. 验证失败不得在 `values` 中留下任何可被后续误用的残余值；
+5. `__refresh_token` 不得在管理页回显、不得写入日志。
 
 ### 6.3 批 1：更新 ≠ 恢复（审核 D1/D3 闭环）
 
@@ -276,10 +285,12 @@ type HealthReporter interface {
 | `credential_generation` | 仅用户主动提交（管理页粘贴/一键授权） | 防旧的后台轮换结果覆盖新授权 |
 | `token_revision` | 仅后台轮换成功 | 识别同一授权代次内的 token 更新 |
 
+**存储位置（审核 RV-26-24-03）**：两字段存于 config 的百度 `CloudConfig`——**新增可选元数据字段**（配置元数据，非 token 缓存，§6.8）；初始值 0；旧配置未填写按 0 迁移（向后兼容）；用户提交时 `credential_generation` +1、`token_revision` 置 1；后台轮换仅 `token_revision` +1。
+
 **写入与恢复规则**（审核五问逐一作答）：
 
 1. 用户提交：`credential_generation` +1、`token_revision` 置 1，原子写 config；成功后改内存；state 缓存随之作废（下次 Init 重新兑换）。
-2. 后台轮换：`token_revision` +1，**先原子写 config**（新 refresh_token），再更新 state 缓存；`credential_generation` 较小的迟到轮换结果**不得**写回 config（防旧刷新覆盖新授权）。
+2. 后台轮换：`token_revision` +1，**先原子写 config**（新 refresh_token），再更新 state 缓存；`credential_generation` 较小的迟到轮换结果**不得**写回 config（防旧刷新覆盖新授权）；**「比较代次 → 写回 config」必须在同挂载刷新/凭据更新互斥范围内完成**，防并发打断（审核 RV-26-24-03）。
 3. 断电恢复：config 与 state 内容不一致 → **以 config 为准**（唯一真值源）；state 缓存的 access_token 过期/不一致 → 重新兑换，无数据丢失。
 4. 同代次内容不同：不可能出现（config 唯一真值源，state 只镜像）；若检测到（文件损坏迹象）→ 按 config 为准 + 记告警。
 5. 写失败：内存不提交新值，按旧值续用；状态黄/红（持久化失败）+ 日志 Error。
@@ -303,7 +314,7 @@ type HealthReporter interface {
 
 ### 6.8 配置与迁移
 
-- config 结构字段不变（client_id/client_secret/refresh_token 已存在），语义变更：前两者必填、refresh_token 可空（批 1 生效）。
+- config 百度段：`client_id`/`client_secret`/`refresh_token` 字段不变，语义变更——前两者必填、refresh_token 可空（批 1 生效）；**新增两个可选元数据字段** `credential_generation`/`token_revision`（配置元数据而非 token 缓存，§6.5；旧配置未填写按 0 迁移，向后兼容）。
 - config.example.json 与 README 附录 A 百度行重写（申请入口：百度网盘开放平台 pan.baidu.com/union；字段对应：AppKey→client_id、SecretKey→client_secret、AppID/SignKey 不使用）。
 - 状态文件格式不变（state/<挂载名>_token.json），新增字段向后兼容。
 
@@ -332,12 +343,14 @@ type HealthReporter interface {
 2. 配置自有应用 + 贴 refresh_token → 验证通过、原子落盘、重启后恢复。
 3. 验证失败 → 配置、内存、状态零变化。
 4. access token 到期前主动刷新成功（现有 watcher 机制延续）。
-5. 模拟百度返回新 refresh_token → 代次 +1、双写 config/state、重启后使用新值。
-6. 模拟旧缓存 vs 新配置冲突 → 代次较高者胜，新提交不被旧缓存覆盖。
+5. 模拟百度返回新 refresh_token → 新 refresh_token 原子写 config（`token_revision` +1）、state 仅更新 access_token 缓存、重启后使用新值。
+6. 模拟迟到的旧代次刷新结果（`credential_generation` 较小）→ 不得写回 config，新授权不被覆盖。
 7. 模拟 refresh_token 失效 → 红色 + 重新授权入口，其他云盘不受影响。
 8. 模拟 token 文件不可写 → 三条路径（Init/watcher/401）均报持久化错误，状态准确。
 9. 并发请求同时触发失效 → 同挂载仅一次有效刷新，无刷新风暴。
 10. 一键授权全流程（state 校验/兑换/落盘/恢复）——PM 百度应用真机走一遍（不可用则执行降级路径并记录）。
+11. 验证返回新 refresh_token → 写配置与内存更新使用同一最终值（保留键 `__refresh_token` 传递），页面不回显、日志不记录。
+12. 断电 / state 缓存缺失或不匹配 → config 保留最新 refresh_token；state 缓存丢弃重新兑换，数据不丢。
 
 ---
 
@@ -387,12 +400,14 @@ type HealthReporter interface {
 | C02 | 贴 refresh_token（自有应用） | 验证通过、原子落盘、重启恢复（批 1） |
 | C03 | 贴 refresh_token 但验证失败 | 配置/内存/状态零变化（批 1） |
 | C04 | access token 临近过期 | 主动刷新成功 |
-| C05 | 刷新返回新 refresh_token | 代次 +1、双写 config/state、重启后使用新值 |
-| C06 | 旧缓存 vs 新配置冲突 | 代次较高者胜，新提交不被旧缓存覆盖 |
+| C05 | 刷新返回新 refresh_token | 新 refresh_token 原子写 config、`token_revision` +1、state 仅更新 access_token 缓存、重启后使用新值 |
+| C06 | 迟到的旧代次刷新结果 | `credential_generation` 较小者不得写回 config，新授权不被覆盖 |
 | C07 | refresh_token 已失效 | 红色 + 重新授权入口，不拖垮服务 |
 | C08 | token 文件损坏/不可写 | 三条路径（Init/watcher/401）均报错，其他挂载正常 |
 | C09 | 并发触发失效 | 同挂载单飞刷新，无风暴 |
 | C10 | 一键授权全流程 | state 校验/兑换/落盘/状态恢复（真机，PM 应用；不可用则执行降级路径并记录） |
+| C11 | 断电 / state 缓存缺失或不匹配 | config 保留最新 refresh_token；state 缓存丢弃重新兑换，数据不丢 |
+| C12 | 验证返回新 refresh_token 的传递 | 写配置与内存更新用同一最终值（保留键 `__refresh_token`），页面不回显、日志不记录 |
 
 ## 11. 待确认事项
 
