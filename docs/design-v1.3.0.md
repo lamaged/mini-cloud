@@ -2,8 +2,8 @@
 
 | 项目 | 内容 |
 |---|---|
-| 文档编号 | DESIGN-2026-11-24-01（修订稿 v3） |
-| 状态 | 设计评审稿（闸门①：外部文档评审第一轮 RV-2026-11-24-01 有条件通过，D1–D3/I1–I6/P 级按清单修订完毕，待复核） |
+| 文档编号 | DESIGN-2026-11-24-01（修订稿 v4） |
+| 状态 | 设计评审稿（闸门①：第二轮复核 RV-2026-11-24-02 有条件通过——上轮 17 条闭合，本轮 5 条按清单修订完毕，修订后放行批 1，待终核） |
 | 依据 | feature/file-encryption 实际代码（v1.2.0-beta，commit 2a5eae1 起） |
 | 替代 | docs/new/ 两份初稿（ISSUE-2026-11-23-01、后续完善设计方案初稿）——初稿基于公开 master v0.9.2 快照，多处与现行代码不符，本稿以实际代码核查结果为准 |
 | 目标设备 | 红米 AX6 / OpenWrt ARM64 |
@@ -52,6 +52,7 @@
 8. **节奏**：A+B 合一批、C 单独一批，各自独立走六道闸门。
 9. **批 1 范围扩大（外部审核 D2 处置，PM 拍板）**：百度凭证更新通道整体入批 1（删内置回退、client_id/secret 必填、WriteCredential 支持百度、百度 CredentialUpdater、输入框）；一键授权与刷新链路加固留批 2。
 10. **Q1 拍板（外部审核 P1 处置，PM 拍板）**：全部挂载初始化失败时**仍启动诊断首页**（无数据路由，仅状态可见）。
+11. **第二轮复核放行（外部审核 RV-2026-11-24-02，有条件通过）**：按清单修订 5 条后放行批 1——①批 1 验证改无副作用 token 交换（纯验证不碰内存，验证返回的新 refresh_token 传给提交）；②DriverHealth 增「已失效」事实字段 + 红黄映射与优先级（一次 List 成功不得覆盖已确认失效）；③凭据持久化重定稿（config 唯一真值源 + state 纯缓存 + 授权代次/轮换修订号双字段，五问作答）；④RawDriver 允许 nil（创建失败 vs 初始化失败分列）；⑤首页/管理页状态表 = 全部配置挂载（数据路由仅可用挂载）。
 
 ---
 
@@ -81,8 +82,8 @@ type MountRuntime struct {
     Config     CloudConfig
     Name       string
     Prefix     string
-    RawDriver  driver.Driver // 创建成功即保留；Init 失败也保留（/admin 凭证更新入口，审核 D1）
-    InitError  error         // Init 失败原因（脱敏后入 LastError）
+    RawDriver  driver.Driver // 创建成功即保留；Init 失败也保留（/admin 凭证更新入口，审核 D1）；创建失败为 nil（无更新入口，审核 RV-26-24-02）
+    InitError  error         // 创建或初始化失败原因（脱敏后入 LastError；RawDriver == nil 即创建失败）
     Available  bool          // Init 成功且 WebDAV 路由已注册
 
     mu            sync.RWMutex // 审核 I3：以下状态字段并发保护（探测 goroutine 写、HTTP 页读）
@@ -95,6 +96,8 @@ type MountRuntime struct {
 ```
 
 - 断言一律对 `RawDriver`（原始驱动，铁律 7）；`Init` 失败时不注册数据路由，但保留 `/admin` 状态卡与凭证更新入口。
+- **两个集合**（审核 RV-26-24-02）：**状态表 = 全部配置挂载**（无论创建/初始化成功与否）——首页与 /admin 只渲染它；**数据路由 = 仅 `Available == true` 的挂载**注册（WebDAV 数据路径只走这里）。诊断首页（Q1 已拍板）同样基于状态表，全失败时能看到每个挂载的红色状态，而不是「0 个云盘」。
+- 凭证更新表单仅对「创建成功（RawDriver 非 nil）且实现 CredentialUpdater」的挂载提供；创建失败的挂载只显示配置/错误诊断，不给更新入口。
 - 状态为运行期数据，与配置分离；敏感凭据永不进入状态输出。
 - 并发（审核 I3）：探测完成后以**完整快照一次性替换**状态字段，HTTP 页面只读快照，不逐字段读正在变化的值；`go test -race` 必过。
 
@@ -108,11 +111,16 @@ type MountRuntime struct {
         |   不为 `.` 或 `..`、长度 ≤64；中文合法（现有挂载名均为中文）
         |   （违例 → 全局错误 fail-fast，与 vault.paths 校验同口径）
         v
-逐个处理 clouds：创建失败 / Init 失败 → 该挂载 StatusUnavailable + LastError，
-        |         驱动实例保留（RawDriver 非 nil），继续
-        |         Init 成功 → 注册 WebDAV 路由 + 启动 Token Watcher
+逐个处理 clouds：创建失败 → StatusUnavailable + LastError，RawDriver 为 nil，继续
+        |         Init 失败 → StatusUnavailable + LastError，RawDriver 保留，继续
+        |         Init 成功 → Available=true，注册 WebDAV 路由 + 启动 Token Watcher
         v
 启动 HTTP Server（至少一个成功 → 正常服务；零成功 → 诊断首页，Q1 已拍板：起）
+        |
+        v
+首页与 /admin 基于「全部配置挂载」的状态表渲染（审核 RV-26-24-02：不是成功列表——
+        全失败时首页也能看到每个挂载的红色状态，而不是「0 个云盘」）；
+        WebDAV 数据路由仅注册 Available == true 的挂载
 ```
 
 | 错误类型 | 处理方式 | 阻止进程 |
@@ -128,10 +136,11 @@ type MountRuntime struct {
 1. 百度 refresh_token 故意失效 → 天翼/移动仍可正常访问。
 2. 任一挂载 `Init()` 返回错误 → 其他挂载仍注册路由。
 3. 多挂载同时失败 → 日志逐个指明挂载名、类型、错误原因。
-4. 全部挂载失败 → 诊断首页仍可访问（Q1 已拍板：起；无数据路由，仅状态可见）。
+4. 全部挂载失败 → 诊断首页仍可访问，且显示**全部配置挂载**的红色状态（非「0 个云盘」；Q1 已拍板 + 审核 RV-26-24-02）。
 5. 单挂载失败不造成进程退出、端口不监听或其他挂载缓存被关闭。
 6. 失败挂载在 /admin 可见；支持 CredentialUpdater 者可更新凭据，更新后提示「已保存，重启后生效」，状态保持红色直至重启成功。
 7. `go test -race` 全绿（状态并发安全，审核 I3）。
+8. 创建失败的挂载（RawDriver 为 nil）进入状态表显示红色诊断，但不显示凭证更新表单（审核 RV-26-24-02）。
 
 ---
 
@@ -150,11 +159,12 @@ type MountRuntime struct {
 ### 5.2 结构化健康模型
 
 ```go
-// 审核 I1：职责拆分——驱动只报「事实」（凭据到期时间、警告文本），
+// 审核 I1：职责拆分——驱动只报「事实」（凭据到期时间、是否已失效、警告文本），
 // 不报最终健康结论；红黄黑由应用层统一合成（全项目唯一判定规则）。
 type DriverHealth struct {
-    Warning   string     // 空 = 无警告
-    ExpiresAt *time.Time // 凭据到期时间（驱动能可靠解析时提供）
+    Warning     string     // 空 = 无警告；人读文案（如「刷新失败，会话暂可用」）
+    ExpiresAt   *time.Time // 凭据到期时间（驱动能可靠解析时提供）
+    AuthExpired bool       // 审核 RV-26-24-02：凭据已失效/不可恢复（区别于「临近到期」）
 }
 
 // HealthReporter 升级（原 HealthWarning() string 废弃，移动迁移至此）：
@@ -166,19 +176,29 @@ type HealthReporter interface {
 
 - 迁移面：仅移动实现 + main.go 两处消费点，面小；升级不保留双接口。
 - **状态合成规则全项目唯一**（应用层）：挂载状态 = f(初始化结果, 探测结果, DriverHealth)；驱动与首页不得各自判断颜色。
+- 事实 → 状态映射（审核 RV-26-24-02，不用文字关键词判色）：
+
+| 驱动事实 | 状态 |
+|---|---|
+| `AuthExpired == true`（已过期 / 不可恢复失效） | 红（UNAVAILABLE） |
+| 临近到期（如剩 <7 天） | 黄（WARNING） |
+| 刷新失败但当前会话暂可用 / 受限模式 | 黄（WARNING） |
+| 无任何警告事实 | 由探测结果决定黑/红 |
+
 - 合成规则：
   - 初始化失败 → UNAVAILABLE（立即红，不等探测）；
+  - **`AuthExpired` → UNAVAILABLE，优先级最高：一次 List 成功不得覆盖已确认的凭据失效**（审核 RV-26-24-02）；
   - 探测连续 2 次失败（连接/认证/上游类）→ UNAVAILABLE；单次失败不转红；
-  - `DriverHealth.Warning` 非空（移动 authorization 剩 <7 天、移动受限模式、百度刷新失败但会话暂可用等）→ WARNING；
+  - `DriverHealth.Warning` 非空且未失效（临近到期、受限模式、刷新失败但会话可用等）→ WARNING；
   - **探测「成功」不足以判 HEALTHY**（审核 I2）：移动在 authorization 过期/受限模式下 `List` 返回 `(nil, nil)` 无错误（drivers/mobile/driver.go:206-209）——探测判据必须同时检查 `DriverHealth`，有警告/失效事实时不得因 List 无错判正常；
-  - 最近探测成功且无警告 → HEALTHY；一次成功探测即可从红/黄恢复；
+  - 最近探测成功且无警告 → HEALTHY；一次成功探测即可从黄恢复（红仅当失效事实消失或重启初始化成功）；
   - 首次探测完成前 → 按 HEALTHY 显示（无灰色档，StatusUnknown 仅内部存在）。
 
 ### 5.3 健康探测
 
 - 每挂载独立，默认每 5 分钟（启动后立即一次）；独立 ctx 超时 ≤10s；同一挂载同一时刻最多一个探测（单飞）。
 - 探测内容：`List` 根目录（raw 驱动直调，**绕过 CachedReader 缓存**，避免旧缓存掩盖上游状态）；不下载文件、不遍历目录。
-- **探测判据（审核 I2）**：`err != nil` → 计失败；`err == nil` 但 `DriverHealth.Warning` 非空 → 不得判健康，按警告/失效规则处理；探测结果不更新缓存、不刷新 `LastCheckAt` 的缓存命中口径。
+- **探测判据（审核 I2 + RV-26-24-02）**：`err != nil` → 计失败；`err == nil` 但 `DriverHealth` 有警告 → 不得判健康，按警告/失效规则处理；`AuthExpired` → 直接 UNAVAILABLE，探测结果不得覆盖；探测结果不更新缓存、不刷新 `LastCheckAt` 的缓存命中口径。
 - 并发（审核 I3）：探测 goroutine 写、HTTP 页读——每挂载状态对象持 `sync.RWMutex`，探测完成后快照一次性替换（§4.2）；`go test -race` 必过。
 - 本轮**不做失败退避**：5 分钟已是低频，退避逻辑省去（设计决定；真机验收观察探测开销）。
 - 上游限流（审核 P2）：探测遇 429/限流类错误计入失败并分类 `RATE_LIMITED`，不误判正常（测试矩阵 A12）。
@@ -215,9 +235,9 @@ type HealthReporter interface {
 |---|---|
 | 管理页 | 百度卡片新增 refresh_token 输入框（与移动同交互） |
 | 百度驱动 | 实现 `CredentialUpdater`（两阶段，internal/driver/driver.go:64+ 契约；断言对原始驱动，铁律 7） |
-| 验证 | `ValidateCredential`：用 config 中 client_id/secret + 贴入的 refresh_token 调百度刷新接口验证（10s 超时，ctx 传导） |
+| 验证 | `ValidateCredential` 调用**无副作用 token 交换函数**（审核 RV-26-24-02 阻断项）：只请求并返回 access_token/refresh_token/expires_in，**不修改客户端内存**——现 auth.go `refreshToken()` 内置 `c.SetAccessToken`（先改内存）必须先拆分为纯交换函数；验证响应含新 refresh_token 时作为验证结果传给 Commit，**不丢弃** |
 | 配置写回 | `conf.WriteCredential` 扩展：支持写百度 `refresh_token`（现仅支持移动 authorization）——原子写（临时文件+落盘+改名）+ .bak + 0600 沿用现制 |
-| 内存更新 | Commit 成功后更新驱动内存凭据（互斥锁 getter/setter，铁律 8） |
+| 内存更新 | **顺序：验证 → 写配置 → 改内存**（审核 RV-26-24-02）：config 持久化成功后才提交客户端内存凭据（互斥锁 getter/setter，铁律 8）；任何一步失败 → 零变化 |
 | 失败处理 | 验证失败零变化（不写配置、不动内存、状态不变） |
 | 重启恢复 | 新凭据重启后经 Init 生效 |
 
@@ -245,15 +265,24 @@ type HealthReporter interface {
 - 命名暂称「授权码手工回填流程」（不预设 OOB 支持）；百度开放平台实际回调方式待 PM 应用实测（Q2），不支持手工回填则降级为管理页指引「自行获取 refresh_token 贴入」（批 1 输入框兜底）。
 - 不自动覆盖其他百度挂载的 token（状态文件按挂载名隔离，现制已满足）。
 
-### 6.5 批 2：token 优先级（审核 I6，凭据代次）
+### 6.5 批 2：token 优先级与持久化模型（审核 I6 + RV-26-24-02 重定稿）
 
-冲突场景：用户经管理页提交新 refresh_token（写 config）vs 后台刷新轮换新 refresh_token（写 state）vs 旧缓存。规则（设计期定死，不留给实现现想）：
+**模型**：`config.json` = `refresh_token` 的**唯一真值源**（原子写）；`state/<挂载名>_token.json` 降级为**纯缓存**（access_token/expires_at，可随时丢弃重建——重新兑换即可，无需恢复协议）。
 
-1. 引入**凭据代次**（单调递增，每次凭据提交/轮换 +1，持久化于 config 与 state 文件）；
-2. 用户提交（管理页粘贴/一键授权）代次 > 一切后台轮换代次——**旧缓存不得覆盖新授权**；
-3. 后台轮换成功后：新 refresh_token 按同代次**同时原子写回 config 与 state**——重启时不会被旧 config 覆盖；
-4. 加载（Init）时按代次较高者为准（延续铁律 8「取较新者」精神，把「较新」显式化为代次）；
-5. 同一挂载多个刷新操作并发 → 互斥（§6.6.1），旧结果不得覆盖新结果。
+**两个代次字段**（消除原稿「提交/轮换同 +1」矛盾）：
+
+| 字段 | 何时 +1 | 作用 |
+|---|---|---|
+| `credential_generation` | 仅用户主动提交（管理页粘贴/一键授权） | 防旧的后台轮换结果覆盖新授权 |
+| `token_revision` | 仅后台轮换成功 | 识别同一授权代次内的 token 更新 |
+
+**写入与恢复规则**（审核五问逐一作答）：
+
+1. 用户提交：`credential_generation` +1、`token_revision` 置 1，原子写 config；成功后改内存；state 缓存随之作废（下次 Init 重新兑换）。
+2. 后台轮换：`token_revision` +1，**先原子写 config**（新 refresh_token），再更新 state 缓存；`credential_generation` 较小的迟到轮换结果**不得**写回 config（防旧刷新覆盖新授权）。
+3. 断电恢复：config 与 state 内容不一致 → **以 config 为准**（唯一真值源）；state 缓存的 access_token 过期/不一致 → 重新兑换，无数据丢失。
+4. 同代次内容不同：不可能出现（config 唯一真值源，state 只镜像）；若检测到（文件损坏迹象）→ 按 config 为准 + 记告警。
+5. 写失败：内存不提交新值，按旧值续用；状态黄/红（持久化失败）+ 日志 Error。
 
 ### 6.6 批 2：Token 持久化与刷新规则（初稿 §4.5 采纳 + 审核 P2 加固）
 
@@ -269,7 +298,7 @@ type HealthReporter interface {
 ### 6.7 批 2：实现层重构要求（审核 P2）
 
 - `RefreshToken(ctx)` 必须真正使用传入 ctx（超时/取消可传导），不能只在调用方设置超时。
-- 重构 `auth.go` 刷新函数职责：现 `refreshToken()` 直接调 `c.SetAccessToken()`（先改内存）、`SaveToken()` 为 `os.WriteFile` 非原子——改为「先原子落盘成功 → 再提交内存新值」，不得靠外层事后补存。
+- 重构 `auth.go` 刷新函数职责（审核 P2 + RV-26-24-02）：现 `refreshToken()` 直接调 `c.SetAccessToken()`（先改内存）、`SaveToken()` 为 `os.WriteFile` 非原子——拆分为「**纯 token 交换函数（无副作用，批 1 验证也用它）→ 原子落盘（先 config 后 state）→ 提交内存**」三步；state 文件仅存 access_token 缓存（§6.5 模型），refresh_token 唯一真值源为 config。
 - token 状态文件新增格式版本字段（向后兼容）。
 
 ### 6.8 配置与迁移
@@ -353,6 +382,7 @@ type HealthReporter interface {
 | A11 | 正常云盘根目录确实为空 | 判正常（与 A09/A10 区分）——审核 I2 |
 | A12 | 探测遇上游 429 限流 | 计入失败、分类 RATE_LIMITED，不误判正常——审核 P2 |
 | A13 | 挂载名非法（含 `/`、控制字符、`.`、`..`、重复） | 启动前全局报错 fail-fast——审核 P1 |
+| A14 | 凭据已确认失效（AuthExpired）后探测成功 | 状态保持红色，不因一次 List 成功恢复——审核 RV-26-24-02 |
 | C01 | 不配置 client_id/secret | 百度挂载红，其他云盘正常启动（批 1） |
 | C02 | 贴 refresh_token（自有应用） | 验证通过、原子落盘、重启恢复（批 1） |
 | C03 | 贴 refresh_token 但验证失败 | 配置/内存/状态零变化（批 1） |
