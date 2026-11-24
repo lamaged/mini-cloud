@@ -8,9 +8,9 @@ Mini Cloud WebDAV 网关 —— 一个只读 WebDAV 桥接服务，将国内云�
 
 **开发环境是 x86 Ubuntu 虚机，真实运行设备是红米 AX6（OpenWrt ARM64）**：性能数据（AES-GCM、代理吞吐）必须以 AX6 实测为准；发版/真机验收必须用静态交叉编译（CGO_ENABLED=0）。
 
-**进行中的路线**（详见 [docs/design.md](docs/design.md)）：
-- v0.10.0：凭证网页管理 —— 浏览器页面直接更新移动云盘 authorization，免 SSH（解决移动 token 约 30 天硬过期痛点）；附带独立修复 3 处现存转义缺陷（href 编码、目录页 HTML 转义、根 PROPFIND XML 转义）。
-- v1.0+：Vault 加密文件 WebDAV 还原播放（可行性实测见 [docs/vault-feasibility.md](docs/vault-feasibility.md)）。
+**进行中的路线**（详见 [docs/design.md](docs/design.md) 与 [docs/design-v1.3.0.md](docs/design-v1.3.0.md)）：
+- v1.2.0-beta：已真机验收，≥1 个月观察期（起点 2026-11-19）后升正式版；master 已按 PM 拍板回退冻结，开发继续在 feature 分支。
+- v1.3.0 批 1（开发中，闸门① 已过）：单挂载启动隔离 + 首页状态红绿灯 + 百度凭证更新通道（删内置 OAuth 凭据、client_id/secret 必填、管理页贴 refresh_token）；批 2 = 百度一键授权 + 刷新链路加固；百度加密（D）单列后议。
 
 开发与审核流程见 [docs/process.md](docs/process.md)：角色分工（PM 非程序员，对话用交易语言）、10 条铁律、沟通协议、审核闭环（外部审核员每功能审一次）、6 道闸门、回滚策略。每个功能必须先过设计评审再写代码；进度与审核意见留痕在 PROGRESS.md / TODO.md。
 
@@ -58,8 +58,8 @@ main.go（Basic Auth、路由、根索引页）
   - `Reader != nil` → handler 在服务端代理数据流，通过 `http.ServeContent` 支持 Range（百度，必须设置 `User-Agent: netdisk`）。`Link.StatusCode` 仅用于非 seekable 数据流（`streamReader`）；seekable Reader 的 200/206/416 由 `http.ServeContent` 依据 Range 自行计算。
 - 可选能力接口（全部通过类型断言检测，**断言对象必须是原始驱动，不是包装层**）：
   - `TokenManager`（`NeedRefresh`/`RefreshToken` —— 仅百度实现；[internal/auth/watcher.go](internal/auth/watcher.go) 的后台维护器每 5 分钟轮询一次）。
-  - `HealthReporter`（`HealthWarning` —— 移动云盘上报 authorization 过期；挂载显示空目录 + 提示性显示名）。
-  - `CredentialUpdater`（规划中，v0.10.0）—— 支持运行时更新凭证，服务 `/admin` 管理页；main 负责把新凭证持久化回 config.json（原子写 + .bak 备份）。
+  - `HealthReporter`（`Health() driver.DriverHealth`：Warning/ExpiresAt/AuthExpired 健康事实——移动云盘上报 authorization 过期/受限；**驱动只报事实，红黄黑由 main 的 MountRuntime 统一合成**，v1.3.0）。
+  - `CredentialUpdater` —— 运行时更新凭证（移动 authorization、百度 refresh_token），服务 `/admin` 管理页；main 负责把新凭证持久化回 config.json（原子写 + .bak 备份）。百度（v1.3.0 批 1）：验证用无副作用 token 交换（不得碰客户端内存），最终 refresh_token 经保留键 `__refresh_token` 传递（config 写回与内存提交用同一最终值）；提交随代次 `credential_generation` +1。
 - 中间件链，在 main.go 中为每个挂载构建：`fs.CachedReader`（[internal/fs/cache.go](internal/fs/cache.go)）目录缓存 TTL 30 秒、链接缓存 TTL 10 分钟，容量上限硬性约束（500 个目录 / 1000 个链接，淘汰最久未访问条目），5 分钟一次的清理 goroutine（通过 `Handler.Close()` 停止）；`fs.RetryReader`（[internal/fs/retry.go](internal/fs/retry.go)）最多重试 3 次、间隔 500ms，对包含 "not found"/"no such file"/"does not exist"/"cannot find" 的错误绝不重试。
 - 挂载：`clouds` 配置数组的每一项对应一个挂载，路径为 `/<name>/`。`name` 同时是 URL 前缀，必须唯一；同一驱动类型配置多个实例是常态（如 天翼个人 + 天翼家庭）。根路径 `/` 的索引（HTML 页面 + PROPFIND）在 main.go 中合成，不属于 webdav 包。
 - 云盘路径解析：逐级对照目录列表将路径解析为云盘原生 ID，每个驱动内部有 `path→ID` 内存缓存（见天翼/移动驱动的 `resolveFolderID`）。
@@ -101,7 +101,7 @@ main.go（Basic Auth、路由、根索引页）
    - **路径**：本机目录与用户名 → `~/`、`<user>`（如 GOROOT/GOPATH 写 `~/go`）；
    - **云盘内容**：真实目录与文件名 → `<dir>/<file>.mkv`（实测记录加注「测试环境内容，非产品配置」）；
    - **身份与设备**：手机号（`13800000000` 这类明显伪造的测试值除外）、设备型号（产品目标设备「红米 AX6」除外）；
-   - **凭据**：token / secret / key / cookie / 口令不得以明文入库（代码内内置 OAuth 默认凭据不在此列，删改须经 PM 确认）。
+   - **凭据**：token / secret / key / cookie / 口令不得以明文入库。
 2. **非必需的信息不推送**——真实值清单、真机日志、测试截图等留在本地 `.private/`（不入库），仓库里干脆没有。
 
 例外（PM 拍板 2026-11-22）：部署脚本中的功能默认值（`DEV_HOST`/`DEV_USER`，私有网段、功能性配置）；docs/review/ 历史审核档案不改动（保真）。

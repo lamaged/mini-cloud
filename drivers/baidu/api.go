@@ -20,12 +20,14 @@ type Client struct {
 	mu           sync.RWMutex // 保护 accessToken
 	accessToken  string
 	onAuthFailed func() error // 401 回调：刷新 token 并更新状态
+	tokenURL     string       // token 交换端点（测试可注入 httptest；构造后不再修改）
 }
 
 // NewClient 创建客户端
 func NewClient() *Client {
 	return &Client{
 		httpClient: &http.Client{Timeout: 30 * time.Second},
+		tokenURL:   "https://openapi.baidu.com/oauth/2.0/token",
 	}
 }
 

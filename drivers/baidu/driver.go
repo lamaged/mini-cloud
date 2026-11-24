@@ -1,6 +1,7 @@
-// Package baidu 百度网盘驱动（legacy）。
-// 自 2026-11-17 起不再作为支持目标（铁律 2）：仅保留兼容存量使用（未加密播放），
-// 不做任何新开发、不做 Vault 适配、不新增测试；勿误改。
+// Package baidu 百度网盘驱动。
+// 2026-11-24 起（铁律 2 修订，PM 拍板）重新纳入支持范围：OAuth 凭据体系正式维护——
+// 用户自有百度开放平台应用凭据必填（client_id/client_secret），管理页可更新 refresh_token；
+// 加密（Vault）仍不支持百度（铁律 2 保留条款）。
 package baidu
 
 import (
@@ -27,16 +28,15 @@ type Driver struct {
 	stateDir     string
 
 	client *Client
+
+	// 待提交凭证（CredentialUpdater 两阶段：Validate 暂存、Commit 生效；按 __req 隔离并发更新）
+	pendingMu sync.Mutex
+	pending   map[string]*pendingCred
 }
 
-// New 创建百度网盘驱动
+// New 创建百度网盘驱动（client_id/client_secret 必填，无内置默认值——
+// 内置公共凭据已按 PM 拍板删除，DESIGN-2026-11-24-01 §6.1）
 func New(name, refreshToken, clientID, clientSecret, stateDir string) *Driver {
-	if clientID == "" {
-		clientID = DefaultClientID
-	}
-	if clientSecret == "" {
-		clientSecret = DefaultClientSecret
-	}
 	return &Driver{
 		name:         name,
 		refreshToken: refreshToken,
@@ -44,6 +44,7 @@ func New(name, refreshToken, clientID, clientSecret, stateDir string) *Driver {
 		clientSecret: clientSecret,
 		stateDir:     stateDir,
 		client:       NewClient(),
+		pending:      make(map[string]*pendingCred),
 	}
 }
 
@@ -65,13 +66,12 @@ func (d *Driver) setRefreshToken(t string) {
 	d.mu.Unlock()
 }
 
-// Init 初始化：刷新 token 或从缓存恢复
+// Init 初始化：校验 OAuth 应用凭据与 refresh_token，刷新或从缓存恢复会话。
+// config 为 refresh_token 唯一真值源（DESIGN-2026-11-24-01 §6.5）：state 缓存仅当
+// 其 refresh_token 与 config 一致时才复用 access_token——防旧缓存覆盖新授权
+// （否则管理页更新后重启会被旧缓存吞掉，D2 重启恢复验收）。
 func (d *Driver) Init(ctx context.Context) error {
-	if d.getRefreshToken() == "" {
-		return fmt.Errorf("百度网盘需要配置 refresh_token")
-	}
-
-	// 设置 401 自动刷新回调（运行时安全网）
+	// 设置 401 自动刷新回调（运行时安全网——必须在任何 early return 之前注册）
 	d.client.SetAuthRefreshCallback(func() error {
 		slog.Info("百度网盘 token 过期，自动刷新")
 		rt := d.getRefreshToken()
@@ -92,10 +92,16 @@ func (d *Driver) Init(ctx context.Context) error {
 		return nil
 	})
 
+	if d.clientID == "" || d.clientSecret == "" {
+		return fmt.Errorf("百度网盘 OAuth 应用凭据未配置（config.json 需填写 client_id 与 client_secret，来自百度网盘开放平台应用）")
+	}
+	if d.getRefreshToken() == "" {
+		return fmt.Errorf("百度网盘尚未授权（请在管理页粘贴 refresh_token 更新）")
+	}
+
 	token, err := LoadToken(d.name, d.stateDir)
-	if err == nil && token != nil {
+	if err == nil && token != nil && token.RefreshToken == d.getRefreshToken() {
 		d.client.SetAccessToken(token.AccessToken)
-		d.setRefreshToken(token.RefreshToken)
 		errno, _ := d.client.apiGetWithErrno("/nas", map[string]string{"method": "uinfo"}, nil)
 		if errno == 0 {
 			slog.Info("从缓存恢复百度网盘会话")
@@ -111,6 +117,8 @@ func (d *Driver) Init(ctx context.Context) error {
 
 	d.client.SetAccessToken(accessToken)
 	if newRefresh != "" {
+		// 批 1：轮换的新 refresh_token 只进内存与 state 缓存；
+		// 批 2（§6.5/§6.6）实现 token_revision +1 原子写回 config。
 		d.setRefreshToken(newRefresh)
 	}
 

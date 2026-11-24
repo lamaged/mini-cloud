@@ -1,15 +1,16 @@
 package conf
 
 import (
-	"errors"
-	"strings"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
+	"unicode"
 )
 
 // Config 应用配置
@@ -38,14 +39,18 @@ type ServerConfig struct {
 // CloudConfig 云盘配置
 type CloudConfig struct {
 	Name          string `json:"name"`           // 挂载名称（URL 前缀），不填则用 type
-	Type          string `json:"type"`           // 驱动类型："local" / "tianyi" / "mobile"
+	Type          string `json:"type"`           // 驱动类型："local" / "tianyi" / "mobile" / "baidu"
 	Username      string `json:"username"`       // 云盘账号（tianyi/mobile 需要）
 	Password      string `json:"password"`       // 云盘密码（tianyi/mobile 需要）
-	RefreshToken  string `json:"refresh_token"`  // 云盘 refresh_token（可选，优先于账号密码）
+	RefreshToken  string `json:"refresh_token"`  // 百度网盘 refresh_token（可空 = 尚未授权；管理页可更新）
 	Authorization string `json:"authorization"`  // 移动云盘认证令牌（Base64）
 	FamilyID      string `json:"family_id"`      // 天翼家庭云 ID（可选）
-	ClientID      string `json:"client_id"`      // 百度网盘 client_id（可选，有默认值）
-	ClientSecret  string `json:"client_secret"`  // 百度网盘 client_secret（可选，有默认值）
+	ClientID      string `json:"client_id"`      // 百度网盘 client_id（必填，无默认值——内置公共凭据已按 PM 拍板删除）
+	ClientSecret  string `json:"client_secret"`  // 百度网盘 client_secret（必填，无默认值）
+	// 凭据代次元数据（DESIGN-2026-11-24-01 §6.5；配置元数据而非 token 缓存，
+	// 旧配置未填写按 0 迁移，向后兼容）
+	CredentialGeneration int `json:"credential_generation,omitempty"` // 授权代次：仅用户提交 +1
+	TokenRevision        int `json:"token_revision,omitempty"`        // 轮换修订号：仅后台轮换 +1
 }
 
 // MountName 返回挂载名称（优先用 name，否则用 type）
@@ -192,6 +197,9 @@ func LoadStrict(path string) (*Config, error) {
 	if err := validateVault(cfg.Vault); err != nil {
 		return nil, err
 	}
+	if err := validateMounts(cfg); err != nil {
+		return nil, err
+	}
 	// 存量文件收紧权限（旧版 Save 写 0644；升级后启动即改为 0600）。
 	// 只读文件系统等场景下失败可忽略：下次 Save 会再次尝试。
 	os.Chmod(path, 0600)
@@ -241,6 +249,41 @@ func validateVault(v *VaultConfig) error {
 		return &semanticError{msg: fmt.Sprintf("vault.max_streams 超上限：%d > 4（PM 拍板天花板，防止误配拖垮路由器）", v.MaxStreams)}
 	}
 	return nil
+}
+
+// validateMounts 挂载名结构校验（v1.3.0 批 1，DESIGN-2026-11-24-01 §4.3）：
+// 全局 fail-fast（与 vault.paths 校验同口径）。中文合法（现有挂载名均为中文）。
+func validateMounts(cfg *Config) error {
+	seen := map[string]bool{}
+	for i := range cfg.Clouds {
+		name := cfg.Clouds[i].MountName()
+		switch {
+		case name == "":
+			return &semanticError{msg: fmt.Sprintf("clouds[%d] 挂载名称为空（name 与 type 均未填）", i)}
+		case len(name) > 64:
+			return &semanticError{msg: fmt.Sprintf("挂载名超长（≤64 字节）：%q", name)}
+		case strings.ContainsAny(name, "/\\"):
+			return &semanticError{msg: fmt.Sprintf("挂载名不允许路径分隔符：%q", name)}
+		case name == "." || name == "..":
+			return &semanticError{msg: fmt.Sprintf("挂载名不允许 . 或 ..：%q", name)}
+		case containsControl(name):
+			return &semanticError{msg: fmt.Sprintf("挂载名不允许控制字符：%q", name)}
+		case seen[name]:
+			return &semanticError{msg: fmt.Sprintf("挂载名重复：%q", name)}
+		}
+		seen[name] = true
+	}
+	return nil
+}
+
+// containsControl 是否包含控制字符
+func containsControl(s string) bool {
+	for _, r := range s {
+		if unicode.IsControl(r) {
+			return true
+		}
+	}
+	return false
 }
 
 // normalize 向后兼容：如果用了旧的 cloud 字段，包装为 clouds 数组；
@@ -353,8 +396,22 @@ func WriteCredential(path, mountName string, values map[string]string) (*Config,
 	found := false
 	for i := range cfg.Clouds {
 		if cfg.Clouds[i].MountName() == mountName {
-			// 目前仅移动云盘实现：字段固定为 authorization；后续驱动扩展时按字段映射
-			cfg.Clouds[i].Authorization = values["authorization"]
+			switch cfg.Clouds[i].Type {
+			case "baidu":
+				// 百度：写「验证后的最终 refresh_token」（保留键 __refresh_token，
+				// DESIGN-2026-11-24-01 §6.2——上游轮换过的新值不得丢弃）；
+				// 用户提交 = 新授权代次（credential_generation+1、token_revision 置 1，§6.5）
+				rt := values["__refresh_token"]
+				if rt == "" {
+					rt = values["refresh_token"]
+				}
+				cfg.Clouds[i].RefreshToken = rt
+				cfg.Clouds[i].CredentialGeneration++
+				cfg.Clouds[i].TokenRevision = 1
+			default:
+				// 移动云盘：字段固定为 authorization
+				cfg.Clouds[i].Authorization = values["authorization"]
+			}
 			found = true
 			break
 		}

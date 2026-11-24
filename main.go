@@ -15,6 +15,7 @@ import (
 	rtdebug "runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -33,12 +34,125 @@ import (
 
 const version = "v1.2.0-beta" // Phase 2 完成（真机验收全部通过并合入 master；≥1 个月观察后升正式版 v1.2.0）
 
-// mountedDriver 已挂载的云盘驱动信息
-type mountedDriver struct {
-	Name   string        // 驱动名称（类型名，如 "mobile"）
-	Prefix string        // URL 前缀，如 "/mobile"
-	Drv    driver.Driver // 驱动实例（原始驱动）
+// MountRuntime 挂载运行时状态（DESIGN-2026-11-24-01 §4.2）：
+// 状态表 = 全部配置挂载（首页/管理页渲染源）；数据路由仅注册 Available 挂载。
+type MountRuntime struct {
+	Config    conf.CloudConfig
+	Name      string // 挂载名（URL 前缀）
+	Prefix    string // URL 前缀，如 "/<name>"
+	RawDriver driver.Driver // 创建成功即保留；Init 失败也保留（/admin 凭证更新入口）；创建失败为 nil
+	InitError error         // 创建或初始化失败原因（RawDriver == nil 即创建失败）
+	Available bool          // Init 成功且 WebDAV 路由已注册
 
+	mu            sync.RWMutex // 以下状态字段并发保护（探测 goroutine 写、HTTP 页读）
+	status        mountStatus
+	statusMsg     string
+	probeFails    int
+	probeMsg      string
+	lastCheckAt   time.Time
+	lastSuccessAt time.Time
+	updatedAt     time.Time
+
+	probing atomic.Bool // 同挂载单飞（探测进行中标记）
+}
+
+// mountStatus 挂载状态（应用层统一合成；DESIGN-2026-11-24-01 §5.2）
+type mountStatus string
+
+const (
+	statusHealthy     mountStatus = "healthy"     // 正常（黑）
+	statusWarning     mountStatus = "warning"     // 警告（黄）
+	statusUnavailable mountStatus = "unavailable" // 失效（红）
+)
+
+// synthesizeStatus 状态合成唯一规则（§5.2）：初始化结果 + 探测结果 + 驱动健康事实。
+// AuthExpired 优先级最高——一次 List 成功不得覆盖已确认失效。
+func synthesizeStatus(initErr error, dh driver.DriverHealth, probeFails int, probeMsg string) (mountStatus, string) {
+	if initErr != nil {
+		return statusUnavailable, sanitizeErr(initErr.Error())
+	}
+	if dh.AuthExpired {
+		msg := dh.Warning
+		if msg == "" {
+			msg = "凭据已失效"
+		}
+		return statusUnavailable, msg
+	}
+	if probeFails >= 2 {
+		msg := probeMsg
+		if msg == "" {
+			msg = "健康检查连续失败"
+		}
+		return statusUnavailable, msg
+	}
+	if dh.Warning != "" {
+		return statusWarning, dh.Warning
+	}
+	return statusHealthy, ""
+}
+
+// sanitizeErr 错误信息脱敏限长（≤200 字符）
+func sanitizeErr(s string) string {
+	if len(s) > 200 {
+		s = s[:200] + "…"
+	}
+	return s
+}
+
+// health 读取驱动健康事实（断言原始驱动，铁律 7）
+func (m *MountRuntime) health() driver.DriverHealth {
+	if m.RawDriver == nil {
+		return driver.DriverHealth{}
+	}
+	if hr, ok := m.RawDriver.(driver.HealthReporter); ok {
+		return hr.Health()
+	}
+	return driver.DriverHealth{}
+}
+
+// applyInitResult 初始化后按统一合成规则写入状态快照
+func (m *MountRuntime) applyInitResult(initErr error) {
+	m.InitError = initErr
+	m.mu.Lock()
+	st, msg := synthesizeStatus(initErr, m.health(), 0, "")
+	m.status = st
+	m.statusMsg = msg
+	m.updatedAt = time.Now()
+	m.mu.Unlock()
+}
+
+// applyProbeResult 探测完成后一次性替换快照（探测判据 §5.3：
+// err==nil 但驱动有失效事实时合成规则仍判红/黄，不得因 List 无错判健康）
+func (m *MountRuntime) applyProbeResult(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.lastCheckAt = time.Now()
+	if err != nil {
+		m.probeFails++
+		m.probeMsg = err.Error()
+	} else {
+		m.probeFails = 0
+		m.probeMsg = ""
+		m.lastSuccessAt = time.Now()
+	}
+	st, msg := synthesizeStatus(m.InitError, m.health(), m.probeFails, m.probeMsg)
+	m.status = st
+	m.statusMsg = msg
+	m.updatedAt = time.Now()
+}
+
+// snapshot 读取当前状态快照（HTTP 页只读）
+func (m *MountRuntime) snapshot() (mountStatus, string) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.status, m.statusMsg
+}
+
+// checkInfo 读取最近检查/成功时间（管理页展示）
+func (m *MountRuntime) checkInfo() (lastCheckAt, lastSuccessAt time.Time) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.lastCheckAt, m.lastSuccessAt
 }
 
 func main() {
@@ -79,41 +193,50 @@ func main() {
 	// 服务端认证信息固定快照：管理页写回只改 clouds 段，认证信息不参与运行时共享可变状态
 	serverUser, serverPass := cfg.Server.Username, cfg.Server.Password
 
-	// 创建所有驱动
+	// 创建所有驱动（单挂载故障隔离：失败只记录状态，不再整体退出）
 	ctx := context.Background()
-	mounts, err := createAllDrivers(ctx, cfg)
-	if err != nil {
-		slog.Error("创建驱动失败", "err", err)
-		os.Exit(1)
-	}
+	mounts := createAllDrivers(ctx, cfg)
 
-	// 管理页：收集支持 CredentialUpdater 的挂载（断言原始驱动，不是包装层）
-	// 挂载告警双通道（design §5.2 + 铁律 7）：驱动告警（HealthReporter 对原始驱动断言）
-	// + Vault 告警（具体方法 Warning()，在装配循环里注入）——两者合并展示。
-	// 全部挂载都入管理页：凭证挂载带更新表单，其余为「状态观察」卡（无表单）。
-	// （真机发现：天翼无 CredentialUpdater 曾导致其 vault 告警无处显示）
+	// 健康探测（v1.3.0 批 1）：每挂载 5 分钟，绕过缓存直调 raw.List("/")
+	go startHealthProbe(ctx, mounts)
+
+	// 管理页：收集全部配置挂载（含失败挂载的状态卡；凭证更新入口仅对
+	// 「创建成功且实现 CredentialUpdater」的挂载提供，D1）。断言一律对原始驱动（铁律 7）。
+	// 状态经统一合成规则渲染（红黄黑 + 原因 + 最近检查时间）；Vault 告警随渲染时合并。
 	vaultWarn := make(map[string]func() string)
-	var adminMounts []admin.Mount
-	for i := range mounts {
-		m := &mounts[i]
-		am := admin.Mount{Name: m.Name, Prefix: m.Prefix}
-		if up, ok := m.Drv.(driver.CredentialUpdater); ok {
-			am.FieldsFunc = up.CredentialFields // 动态标签（剩余有效期/获取指引），渲染时现取
-			am.Update = up
+	adminMounts := make([]admin.Mount, 0, len(mounts))
+	for _, m := range mounts {
+		am := admin.Mount{Name: m.Name, Prefix: m.Prefix, Available: m.Available}
+		if m.RawDriver != nil {
+			if up, ok := m.RawDriver.(driver.CredentialUpdater); ok {
+				am.FieldsFunc = up.CredentialFields // 动态标签（剩余有效期/获取指引），渲染时现取
+				am.Update = up
+			}
 		}
-		am.Warning = func() string {
-			var parts []string
-			if hr, ok := m.Drv.(driver.HealthReporter); ok {
-				if w := hr.HealthWarning(); w != "" {
-					parts = append(parts, w)
-				}
+		am.Status = func() admin.MountStatus {
+			st, msg := m.snapshot()
+			v := admin.MountStatus{Label: "正常", Color: "ok", Detail: msg}
+			switch st {
+			case statusWarning:
+				v.Label, v.Color = "警告", "warning"
+			case statusUnavailable:
+				v.Label, v.Color = "不可用", "error"
 			}
 			if vw, ok := vaultWarn[m.Name]; ok {
 				if w := vw(); w != "" {
-					parts = append(parts, w)
+					if v.Detail != "" {
+						v.Detail += "；"
+					}
+					v.Detail += w
 				}
 			}
-			return strings.Join(parts, "；")
+			if lc, ls := m.checkInfo(); !lc.IsZero() {
+				v.LastCheckAt = lc.Format("2006-01-02 15:04:05")
+				if !ls.IsZero() {
+					v.LastCheckAt += "（成功）"
+				}
+			}
+			return v
 		}
 		adminMounts = append(adminMounts, am)
 	}
@@ -188,7 +311,7 @@ func main() {
 			w.WriteHeader(http.StatusOK)
 			return
 		}
-		// GET → 浏览器导航页
+		// GET → 浏览器导航页（状态表 = 全部配置挂载）
 		if r.Method == "GET" || r.Method == "HEAD" {
 			serveRootIndex(w, mounts, len(adminMounts) > 0)
 			return
@@ -224,14 +347,16 @@ func main() {
 		vault.SetGlobalStreamLimit(cfg.Vault.MaxStreams)
 	}
 
-	// 每个云盘注册到 /<prefix>/
-	var davHandlers []*webdav.Handler
-	for i := range mounts {
-		m := &mounts[i]
-		cached := fs.NewCachedReader(fs.NewRetryReader(m.Drv))
+	// 每个可用云盘注册到 /<prefix>/（数据路由仅注册 Available 挂载，§4.2）
+	davHandlers := make(map[string]*webdav.Handler)
+	for _, m := range mounts {
+		if !m.Available || m.RawDriver == nil {
+			continue
+		}
+		cached := fs.NewCachedReader(fs.NewRetryReader(m.RawDriver))
 		var drv webdav.Reader = cached
-		if vaultCfg != nil && vaultSupported(m.Drv) {
-			v := vault.New(cached, m.Drv, vaultKey, *vaultCfg)
+		if vaultCfg != nil && vaultSupported(m.RawDriver) {
+			v := vault.New(cached, m.RawDriver, vaultKey, *vaultCfg)
 			vaultWarn[m.Name] = v.Warning // 双通道：vault 告警注入管理页（§5.2）
 			if err := v.Init(ctx); err != nil {
 				slog.Warn("vault 初始化失败，该挂载按普通模式工作", "mount", m.Name, "err", err)
@@ -243,7 +368,7 @@ func main() {
 			Driver: drv,
 			Prefix: m.Prefix,
 		}
-		davHandlers = append(davHandlers, davHandler)
+		davHandlers[m.Name] = davHandler
 		// 注册 /<prefix>/ 及其子路径
 		mux.HandleFunc(m.Prefix+"/", func(w http.ResponseWriter, r *http.Request) {
 			if !checkAuth(r, serverUser, serverPass) {
@@ -258,14 +383,10 @@ func main() {
 
 	// 凭证生效后：清空该挂载的目录/链接缓存，避免旧账号数据残留（30s 目录 / 10min 链接）
 	adminHandler.OnCommitted = func(mountName string) {
-		for i := range mounts {
-			if mounts[i].Name != mountName {
-				continue
-			}
-			if inv, ok := davHandlers[i].Driver.(interface{ InvalidateAll() }); ok {
+		if h, ok := davHandlers[mountName]; ok {
+			if inv, ok := h.Driver.(interface{ InvalidateAll() }); ok {
 				inv.InvalidateAll()
 			}
-			return
 		}
 	}
 
@@ -302,32 +423,52 @@ func main() {
 // 驱动创建
 // ============================================================
 
-// createAllDrivers 根据配置创建所有云盘驱动
-func createAllDrivers(ctx context.Context, cfg *conf.Config) ([]mountedDriver, error) {
-	var mounts []mountedDriver
-
-	for _, cc := range cfg.Clouds {
-		drv, err := createDriver(&cc)
-		if err != nil {
-			return nil, fmt.Errorf("创建 %s 驱动失败: %w", cc.MountName(), err)
+// createAllDrivers 根据配置创建所有云盘驱动（v1.3.0 批 1：单挂载故障隔离）——
+// 创建/初始化失败只记录该挂载状态，不再整体返回错误；至少一个成功即启动服务；
+// 全部失败仍启动诊断首页（Q1 拍板）。失败挂载保留 RawDriver（创建成功时）进 /admin。
+func createAllDrivers(ctx context.Context, cfg *conf.Config) []*MountRuntime {
+	mounts := make([]*MountRuntime, 0, len(cfg.Clouds))
+	for i := range cfg.Clouds {
+		cc := &cfg.Clouds[i]
+		m := &MountRuntime{
+			Config: *cc,
+			Name:   cc.MountName(),
+			Prefix: "/" + cc.MountName(),
 		}
+
+		drv, err := createDriver(cc)
+		if err != nil {
+			m.applyInitResult(err)
+			slog.Error("创建驱动失败", "mount", m.Name, "err", err)
+			mounts = append(mounts, m)
+			continue
+		}
+		m.RawDriver = drv
 
 		if err := drv.Init(ctx); err != nil {
-			return nil, fmt.Errorf("初始化 %s 驱动失败: %w", cc.MountName(), err)
+			m.applyInitResult(err)
+			slog.Error("初始化驱动失败", "mount", m.Name, "err", err)
+			mounts = append(mounts, m)
+			continue
 		}
-		slog.Info("驱动就绪", "name", drv.Name(), "type", cc.MountName())
+		m.Available = true
+		m.applyInitResult(nil)
+		slog.Info("驱动就绪", "name", drv.Name(), "mount", m.Name)
 
 		// 启动后台 Token Watcher
 		auth.StartWatcher(ctx, drv, 5*time.Minute)
 
-		mounts = append(mounts, mountedDriver{
-			Name:   cc.MountName(),
-			Prefix: "/" + cc.MountName(),
-			Drv:    drv,
-		})
+		mounts = append(mounts, m)
 	}
 
-	return mounts, nil
+	avail := 0
+	for _, m := range mounts {
+		if m.Available {
+			avail++
+		}
+	}
+	slog.Info("挂载初始化完成", "configured", len(mounts), "available", avail)
+	return mounts
 }
 
 // createDriver 根据单个云盘配置创建驱动
@@ -371,24 +512,18 @@ var cloudDisplayNames = map[string]string{
 	"baidu":  "百度网盘",
 }
 
-// displayName 返回云盘在导航/索引页的显示名。
-// 若驱动报告健康警告（如移动云盘 authorization 过期）或 vault 层告警
-// （manifest 缺失/损坏），则用警告文本覆盖显示名。
-func displayName(m mountedDriver) string {
+// displayName 返回云盘在导航/索引页的显示名（纯挂载名，PM 拍板 2026-11-24：
+// 首页与根 PROPFIND 一律不再拼接告警文本，状态只经首页颜色 + /admin 表达）
+func displayName(m *MountRuntime) string {
 	label := cloudDisplayNames[m.Name]
 	if label == "" {
 		label = m.Name
-	}
-	if hr, ok := m.Drv.(driver.HealthReporter); ok {
-		if w := hr.HealthWarning(); w != "" {
-			return label + "：" + w // 挂载名 + 告警（如「移动云盘：令牌已过期，请更新令牌」）
-		}
 	}
 	return label
 }
 
 // serveRootPropfind 为根路径生成 WebDAV PROPFIND 响应（列出所有云盘作为虚拟目录）
-func serveRootPropfind(w http.ResponseWriter, r *http.Request, mounts []mountedDriver) {
+func serveRootPropfind(w http.ResponseWriter, r *http.Request, mounts []*MountRuntime) {
 	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
 	w.WriteHeader(http.StatusMultiStatus)
 
@@ -431,7 +566,7 @@ func xmlText(s string) string {
 	return b.String()
 }
 
-func serveRootIndex(w http.ResponseWriter, mounts []mountedDriver, hasAdmin bool) {
+func serveRootIndex(w http.ResponseWriter, mounts []*MountRuntime, hasAdmin bool) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprintf(w, `<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>Mini Cloud WebDAV</title>
@@ -441,27 +576,80 @@ h1{font-size:22px;border-bottom:2px solid #0366d6;padding-bottom:10px}
 .card{display:block;padding:16px 20px;margin:12px 0;border:1px solid #ddd;border-radius:8px;text-decoration:none;color:#333}
 .card:hover{background:#f6f8fa;border-color:#0366d6}
 .card .name{font-size:18px;font-weight:bold}
+.card .name.ok{color:#333}
+.card .name.warning{color:#b26a00}
+.card .name.error{color:#b00020}
 .card .desc{color:#666;margin-top:4px;font-size:14px}
 .admin{display:inline-block;margin-top:8px}
 </style></head><body>
 <h1>☁️ Mini Cloud WebDAV</h1>
-<p>已挂载 %d 个云盘：</p>
+<p>已配置 %d 个云盘：</p>
 `, len(mounts))
 
+	hasProblem := false
 	for _, m := range mounts {
+		st, _ := m.snapshot()
+		if st != statusHealthy {
+			hasProblem = true
+		}
+		color := "ok"
+		switch st {
+		case statusWarning:
+			color = "warning"
+		case statusUnavailable:
+			color = "error"
+		}
 		label := displayName(m)
 		href := webdav.EncodePathSegments(m.Prefix) + "/"
 		fmt.Fprintf(w, `<a class="card" href="%s">
-<div class="name">%s</div>
+<div class="name %s">%s</div>
 <div class="desc">%s</div>
-</a>`, html.EscapeString(href), html.EscapeString(label), html.EscapeString(href))
+</a>`, html.EscapeString(href), color, html.EscapeString(label), html.EscapeString(href))
 	}
 
-	if hasAdmin {
+	// PM 拍板 2026-11-24：全部正常时首页不显示「管理」链接，只有出问题时才显示
+	if hasAdmin && hasProblem {
 		fmt.Fprint(w, `<p><a class="admin" href="/admin">管理</a></p>`)
 	}
 
 	fmt.Fprint(w, "</body></html>")
+}
+
+// ============================================================
+// 健康探测（v1.3.0 批 1，DESIGN-2026-11-24-01 §5.3）
+// ============================================================
+
+// startHealthProbe 每挂载独立健康探测：启动后立即一次 + 每 5 分钟；
+// 绕过 CachedReader 直调 raw.List("/")（探测结果不更新缓存）；
+// 同挂载单飞、独立 10s 超时；Init 失败的挂载不探测（状态由 InitError 决定，重启恢复）。
+func startHealthProbe(ctx context.Context, mounts []*MountRuntime) {
+	probeOne := func(m *MountRuntime) {
+		if m.RawDriver == nil || m.InitError != nil || !m.probing.CompareAndSwap(false, true) {
+			return
+		}
+		defer m.probing.Store(false)
+		pctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		_, err := m.RawDriver.List(pctx, "/")
+		m.applyProbeResult(err)
+	}
+
+	for _, m := range mounts {
+		probeOne(m) // 启动后立即一次
+	}
+
+	t := time.NewTicker(5 * time.Minute)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			for _, m := range mounts {
+				go probeOne(m)
+			}
+		}
+	}
 }
 
 // ============================================================

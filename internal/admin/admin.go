@@ -23,10 +23,19 @@ import (
 type Mount struct {
 	Name       string                   // 挂载名（与配置 name 一致）
 	Prefix     string                   // URL 前缀
+	Available  bool                     // 挂载当前是否可用（不可用时更新成功提示「重启后生效」）
 	Fields     []driver.CredentialField // 凭证字段（静态；FieldsFunc 优先）
 	FieldsFunc func() []driver.CredentialField // 渲染时现取（动态标签，如剩余有效期，PM 拍板 2026-11-19）
-	Warning    func() string            // 当前健康提示（可为 nil）
+	Status     func() MountStatus       // 结构化状态（红黄黑 + 原因 + 最近检查时间；v1.3.0 批 1）
 	Update     driver.CredentialUpdater // 更新实现
+}
+
+// MountStatus 挂载状态展示信息（应用层统一合成后注入，admin 只负责渲染）
+type MountStatus struct {
+	Label       string // 正常 / 警告 / 不可用
+	Color       string // ok / warning / error
+	Detail      string // 原因（可为空）
+	LastCheckAt string // 最近检查时间（可为空）
 }
 
 // fieldList 取当前凭证字段（FieldsFunc 优先，渲染/提交同一来源）
@@ -168,6 +177,10 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 		if exp, ok := values["__expiry"]; ok && exp != "" {
 			msg = fmt.Sprintf("更新成功，新凭证有效期至 %s", exp)
 		}
+		// 更新 ≠ 恢复（D3）：挂载当前不可用时保持红色，提示重启后生效
+		if !m.Available {
+			msg += "；该挂载当前不可用，重启后生效"
+		}
 		h.render(w, http.StatusOK, msg, "")
 		return
 	}
@@ -192,7 +205,7 @@ func (h *Handler) render(w http.ResponseWriter, status int, message, errMsg stri
 	type formMount struct {
 		Name   string
 		Prefix string
-		Warn   string
+		Status MountStatus
 		Fields []driver.CredentialField
 		CSRF   string
 	}
@@ -209,8 +222,10 @@ func (h *Handler) render(w http.ResponseWriter, status int, message, errMsg stri
 		if len(fields) > 0 {
 			fm.CSRF = h.newToken() // 仅凭证挂载需要 CSRF（无表单的状态卡不产生提交）
 		}
-		if m.Warning != nil {
-			fm.Warn = m.Warning()
+		if m.Status != nil {
+			fm.Status = m.Status()
+		} else {
+			fm.Status = MountStatus{Label: "正常", Color: "ok"}
 		}
 		data.Mounts = append(data.Mounts, fm)
 	}
@@ -235,6 +250,9 @@ h1{font-size:20px;border-bottom:2px solid #0366d6;padding-bottom:10px}
 .err{color:#b00020;background:#fdecea;padding:10px;border-radius:6px}
 .ok{color:#1b5e20;background:#e8f5e9;padding:10px;border-radius:6px}
 .warn{color:#b26a00;background:#fff3e0;padding:8px;border-radius:6px;font-size:14px}
+.st-ok{color:#1b5e20;font-size:14px;margin:8px 0 2px}
+.st-warning{color:#b26a00;font-size:14px;margin:8px 0 2px}
+.st-error{color:#b00020;font-size:14px;margin:8px 0 2px}
 .card{border:1px solid #ddd;border-radius:8px;padding:16px 20px;margin:14px 0}
 .card h2{margin:0 0 6px;font-size:17px}
 .path{color:#666;font-weight:normal;font-size:13px}
@@ -248,8 +266,10 @@ a{color:#0366d6}
 {{if .Message}}<p class="ok">{{.Message}}</p>{{end}}
 {{range .Mounts}}
 <div class="card">
-<h2>{{.Name}}</h2>
-{{if .Warn}}<p class="warn">当前状态：{{.Warn}}</p>{{else}}<p class="warn" style="color:#1b5e20;background:#e8f5e9">当前状态：正常</p>{{end}}
+<h2>{{.Name}} <span class="path">{{.Prefix}}</span></h2>
+<p class="st-{{.Status.Color}}">● {{.Status.Label}}</p>
+{{if .Status.Detail}}<p class="warn">{{.Status.Detail}}</p>{{end}}
+{{if .Status.LastCheckAt}}<p class="path">最近检查：{{.Status.LastCheckAt}}</p>{{end}}
 {{if .Fields}}
 <form method="POST" action="/admin/update">
 <input type="hidden" name="csrf" value="{{.CSRF}}">

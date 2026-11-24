@@ -67,16 +67,28 @@ func (d *Driver) Name() string {
 	return "mobile"
 }
 
-// HealthWarning 返回健康提示：authorization 过期时提示用户更新（文案 PM 拍板 2026-11-19）；
-// 未过期但启动期云主机发现失败时提示服务受限（§5.3，接 /admin 展示 §5.2）
-func (d *Driver) HealthWarning() string {
+// Health 返回健康事实（v1.3.0 批 1，DESIGN-2026-11-24-01 §5.2）：
+// authorization 已过期 → AuthExpired（红）；启动期云主机发现失败 → Warning（受限，黄）；
+// 未过期时提供真实到期时间（供应用层「临近到期」判定）。
+func (d *Driver) Health() driver.DriverHealth {
+	h := driver.DriverHealth{}
 	if d.client.isExpired() {
-		return "令牌已过期，请更新令牌"
+		h.AuthExpired = true
+		h.Warning = "令牌已过期，请更新令牌"
+	} else if _, _, _, expiration, err := d.client.parseAuthorization(); err == nil {
+		exp := time.UnixMilli(expiration)
+		h.ExpiresAt = &exp
 	}
 	d.commitMu.Lock()
 	w := d.hostWarn
 	d.commitMu.Unlock()
-	return w
+	if w != "" {
+		if h.Warning != "" {
+			h.Warning += "；"
+		}
+		h.Warning += w
+	}
+	return h
 }
 
 // Init 初始化：设置认证、发现主机、刷新 Token
@@ -136,7 +148,7 @@ func (d *Driver) Init(ctx context.Context) error {
 
 	// 发现云主机（§5.3 启动健壮性：短超时 ≤10s；失败不阻断启动、不重试——
 	// 无 host 时 List/Link 已按「过期语义」返回空目录/明确错误，
-	// HealthWarning 提示用户去 /admin 更新；云主机可从缓存恢复或随凭证更新获得）
+	// Health() 上报受限警告，提示用户去 /admin 更新；云主机可从缓存恢复或随凭证更新获得）
 	dctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	err = d.client.discoverCloudHost(dctx)
 	cancel()
@@ -205,7 +217,7 @@ func (d *Driver) saveTokenState() error {
 func (d *Driver) List(ctx context.Context, reqPath string) ([]model.Obj, error) {
 	if d.client.isExpired() || d.client.getCloudHost() == "" {
 		// authorization 已过期或云主机不可用（启动期发现失败，P4）：返回空目录，
-		// 避免 500，由 HealthWarning 提示用户
+		// 避免 500，由 Health() 事实经应用层合成状态提示用户
 		return nil, nil
 	}
 

@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"errors"
+	"time"
 
 	"mini-cloud/internal/model"
 )
@@ -35,10 +36,18 @@ type TokenManager interface {
 	RefreshToken(ctx context.Context) error
 }
 
-// HealthReporter 健康报告（可选接口，云盘驱动可实现此接口向上层展示异常提示）
+// DriverHealth 驱动健康事实（v1.3.0 批 1，DESIGN-2026-11-24-01 §5.2）。
+// 驱动只报事实、不报最终健康结论——红黄黑由应用层统一合成（全项目唯一判定规则）。
+type DriverHealth struct {
+	Warning     string     // 人读警告文案（如「刷新失败，会话暂可用」）；空 = 无警告
+	ExpiresAt   *time.Time // 凭据到期时间（驱动能可靠解析时提供）
+	AuthExpired bool       // 凭据已失效/不可恢复（区别于「临近到期」；优先级最高，探测成功不得覆盖）
+}
+
+// HealthReporter 健康报告（可选接口，云盘驱动可实现此接口向应用层上报健康事实）
 type HealthReporter interface {
-	// HealthWarning 返回需要展示给用户的提示信息；空字符串表示正常
-	HealthWarning() string
+	// Health 返回驱动健康事实（凭据到期、是否已失效、警告文案）
+	Health() DriverHealth
 }
 
 // CredentialField 凭证字段描述（供管理页渲染表单）
@@ -66,6 +75,11 @@ var ErrUpstream = errors.New("upstream failure")
 // values 中的保留键：调用方在 ValidateCredential 前写入 "__req"（本次更新请求的唯一标识，
 // 驱动按它关联 Validate 与 Commit，隔离并发更新）；驱动可回填 "__expiry"（显示用，
 // 格式 2006-01-02 15:04）。其余键为 CredentialField.Key。
+//
+// 新增保留键 "__refresh_token"（v1.3.0 批 1，DESIGN-2026-11-24-01 §6.2）：验证成功后，
+// 驱动把「最终 refresh_token」（上游可能轮换过的新值）写入该键——配置写回与内存提交
+// 必须使用该最终值而非表单原始输入；验证失败不得留下任何残余值；该值不得在管理页
+// 回显、不得写入日志。
 type CredentialUpdater interface {
 	// CredentialFields 返回可更新的凭证字段（供管理页渲染表单）
 	CredentialFields() []CredentialField

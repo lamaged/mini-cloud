@@ -48,11 +48,12 @@ func newTestHandler(u *fakeUpdater, persistErr error) (*Handler, *fakeUpdater, *
 	calls := &[]string{}
 	h := New([]Mount{
 		{
-			Name:    "移动云盘",
-			Prefix:  "/移动云盘",
-			Fields:  []driver.CredentialField{{Key: "authorization", Label: "authorization", Kind: "password"}},
-			Warning: func() string { return "" },
-			Update:  u,
+			Name:      "移动云盘",
+			Prefix:    "/移动云盘",
+			Available: true,
+			Fields:    []driver.CredentialField{{Key: "authorization", Label: "authorization", Kind: "password"}},
+			Status:    func() MountStatus { return MountStatus{Label: "正常", Color: "ok"} },
+			Update:    u,
 		},
 	}, func(ctx context.Context, mount string, values map[string]string) (func() error, error) {
 		*calls = append(*calls, "persist:"+mount+":"+values["authorization"])
@@ -99,8 +100,8 @@ func TestPageRendersAndEscapes(t *testing.T) {
 			Name:   `移动<script>alert(1)</script>`,
 			Prefix: "/x",
 			Fields: []driver.CredentialField{{Key: "authorization", Label: `a"b`, Kind: "password"}},
-			Warning: func() string { return `过期<script>提示</script>` },
-			Update:  &fakeUpdater{},
+			Status: func() MountStatus { return MountStatus{Label: "警告", Color: "warning", Detail: `过期<script>提示</script>`} },
+			Update: &fakeUpdater{},
 		},
 	}, func(ctx context.Context, mount string, values map[string]string) (func() error, error) { return func() error { return nil }, nil })
 
@@ -359,5 +360,26 @@ func TestOnCommittedCalled(t *testing.T) {
 	}
 	if committed != "移动云盘" {
 		t.Errorf("OnCommitted = %q, want 移动云盘", committed)
+	}
+}
+
+// TestUpdateUnavailableShowsRestartPrompt D3（DESIGN-2026-11-24-01 §6.3）：
+// 更新成功 ≠ 恢复——挂载当前不可用时，成功消息必须提示「重启后生效」。
+func TestUpdateUnavailableShowsRestartPrompt(t *testing.T) {
+	u := &fakeUpdater{fields: []driver.CredentialField{{Key: "authorization", Kind: "password"}}}
+	h := New([]Mount{
+		{Name: "移动云盘", Prefix: "/移动云盘", Available: false, Fields: u.CredentialFields(), Update: u},
+	}, func(ctx context.Context, mount string, values map[string]string) (func() error, error) {
+		return func() error { return nil }, nil
+	})
+	csrf := fetchCSRF(t, h)
+
+	rec := postUpdate(h, csrf, "移动云盘", "new-auth-token")
+	body := rec.Body.String()
+	if !strings.Contains(body, "更新成功") {
+		t.Fatalf("update should succeed: %s", body)
+	}
+	if !strings.Contains(body, "重启后生效") {
+		t.Errorf("unavailable mount success message must prompt restart, got: %s", body)
 	}
 }

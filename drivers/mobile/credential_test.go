@@ -132,9 +132,9 @@ func TestCommitCredentialAppliesAndPersists(t *testing.T) {
 		t.Fatal("second CommitCredential should fail")
 	}
 
-	// HealthWarning 应消失（新凭证未过期）
-	if w := d.HealthWarning(); w != "" {
-		t.Errorf("HealthWarning should be empty after commit, got %q", w)
+	// Health 事实应消失（新凭证未过期）
+	if h := d.Health(); h.AuthExpired || h.Warning != "" {
+		t.Errorf("Health should be clean after commit, got %+v", h)
 	}
 }
 
@@ -293,7 +293,7 @@ func TestInitDegradedNoFatal(t *testing.T) {
 	if err := d.Init(context.Background()); err != nil {
 		t.Fatalf("Init 不得因云主机发现失败而报错（§5.3）: %v", err)
 	}
-	if w := d.HealthWarning(); w == "" {
+	if h := d.Health(); h.Warning == "" {
 		t.Error("受限模式应有健康提示")
 	}
 	if objs, err := d.List(context.Background(), "/"); err != nil || len(objs) != 0 {
@@ -321,8 +321,8 @@ func TestInitRestoreFromCache(t *testing.T) {
 	if err := d.Init(context.Background()); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
-	if w := d.HealthWarning(); w != "" {
-		t.Errorf("有效缓存不应有提示，got %q", w)
+	if h := d.Health(); h.Warning != "" {
+		t.Errorf("有效缓存不应有提示，got %q", h.Warning)
 	}
 }
 
@@ -340,8 +340,8 @@ func TestHostWarnClearedOnCommit(t *testing.T) {
 	if err := d.CommitCredential(map[string]string{"__req": "req-1", "authorization": newAuth}); err != nil {
 		t.Fatalf("CommitCredential: %v", err)
 	}
-	if w := d.HealthWarning(); w != "" {
-		t.Errorf("提交成功后应清除发现失败提示，got %q", w)
+	if h := d.Health(); h.Warning != "" {
+		t.Errorf("提交成功后应清除发现失败提示，got %q", h.Warning)
 	}
 }
 
@@ -384,9 +384,10 @@ func TestCredentialFieldsDynamic(t *testing.T) {
 	if !strings.Contains(f3.Label, "不足 1 天") {
 		t.Errorf("12 小时标签不符: %q", f3.Label)
 	}
-	// 过期文案（HealthWarning）
-	if w := d.HealthWarning(); w != "令牌已过期，请更新令牌" {
-		t.Errorf("过期提示文案不符: %q", w)
+	// 过期事实（Health）：AuthExpired 标记 + 文案
+	h := d.Health()
+	if !h.AuthExpired || h.Warning != "令牌已过期，请更新令牌" {
+		t.Errorf("过期事实不符: %+v", h)
 	}
 }
 

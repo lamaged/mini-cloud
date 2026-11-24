@@ -26,9 +26,9 @@
         {
             "name": "百度网盘",
             "type": "baidu",
-            "refresh_token": "从百度OAuth获取的refresh_token",
-            "client_id": "（可选）百度OAuth client_id，不填使用内置默认值",
-            "client_secret": "（可选）百度OAuth client_secret，不填使用内置默认值"
+            "refresh_token": "百度OAuth授权票据（可留空=尚未授权，之后到 /admin 管理页粘贴更新）",
+            "client_id": "（必填）百度网盘开放平台应用 AppKey（pan.baidu.com/union 控制台）",
+            "client_secret": "（必填）百度网盘开放平台应用 SecretKey（同上；缺这两项百度挂载启动即红色提示）"
         }
     ],
     "vault": {

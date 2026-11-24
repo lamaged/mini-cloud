@@ -4,13 +4,25 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"mini-cloud/drivers/baidu"
 	"mini-cloud/drivers/local"
 	"mini-cloud/drivers/mobile"
 	"mini-cloud/drivers/tianyi"
+	"mini-cloud/internal/conf"
 	"mini-cloud/internal/driver"
 )
+
+// mkMount 构造测试挂载并写入初始状态
+func mkMount(name, prefix string, st mountStatus) *MountRuntime {
+	m := &MountRuntime{Name: name, Prefix: prefix}
+	m.applyInitResult(nil)
+	m.mu.Lock()
+	m.status = st
+	m.mu.Unlock()
+	return m
+}
 
 func TestXMLTextEscapes(t *testing.T) {
 	got := xmlText(`a&b<c>"d"`)
@@ -21,7 +33,7 @@ func TestXMLTextEscapes(t *testing.T) {
 }
 
 func TestServeRootPropfindEscapesXML(t *testing.T) {
-	mounts := []mountedDriver{{Name: "mobile", Prefix: "/移&动", Drv: nil}}
+	mounts := []*MountRuntime{mkMount("mobile", "/移&动", statusHealthy)}
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest("PROPFIND", "/", nil)
 	serveRootPropfind(rec, req, mounts)
@@ -36,8 +48,10 @@ func TestServeRootPropfindEscapesXML(t *testing.T) {
 	}
 }
 
+// TestServeRootIndexEscapesHTML：挂载名/前缀转义 + 全正常时（PM 拍板 2026-11-24）
+// 首页不显示「管理」链接。
 func TestServeRootIndexEscapesHTML(t *testing.T) {
-	mounts := []mountedDriver{{Name: "mobile", Prefix: "/<script>", Drv: nil}}
+	mounts := []*MountRuntime{mkMount("mobile", "/<script>", statusHealthy)}
 	rec := httptest.NewRecorder()
 	serveRootIndex(rec, mounts, true)
 
@@ -49,18 +63,145 @@ func TestServeRootIndexEscapesHTML(t *testing.T) {
 	if !strings.Contains(body, "%3Cscript%3E") {
 		t.Errorf("expected percent-encoded prefix in HTML, got: %s", body)
 	}
-	if !strings.Contains(body, `href="/admin"`) {
-		t.Errorf("admin link missing when hasAdmin=true: %s", body)
+	if strings.Contains(body, `href="/admin"`) {
+		t.Errorf("admin link must be hidden when all mounts healthy: %s", body)
+	}
+}
+
+// TestServeRootIndexAdminLinkOnProblem：有异常挂载时「管理」链接出现
+func TestServeRootIndexAdminLinkOnProblem(t *testing.T) {
+	mounts := []*MountRuntime{
+		mkMount("mobile", "/mobile", statusHealthy),
+		mkMount("baidu", "/baidu", statusUnavailable),
+	}
+	rec := httptest.NewRecorder()
+	serveRootIndex(rec, mounts, true)
+	if !strings.Contains(rec.Body.String(), `href="/admin"`) {
+		t.Errorf("admin link missing when a mount has problem: %s", rec.Body.String())
 	}
 }
 
 func TestServeRootIndexNoAdminLink(t *testing.T) {
-	mounts := []mountedDriver{{Name: "mobile", Prefix: "/mobile", Drv: nil}}
+	mounts := []*MountRuntime{mkMount("mobile", "/mobile", statusUnavailable)}
 	rec := httptest.NewRecorder()
 	serveRootIndex(rec, mounts, false)
 
 	if strings.Contains(rec.Body.String(), "/admin") {
 		t.Error("admin link should be absent when hasAdmin=false")
+	}
+}
+
+// TestServeRootIndexColors 状态颜色落在挂载名文字上（黑/黄/红，无灰色档）
+func TestServeRootIndexColors(t *testing.T) {
+	mounts := []*MountRuntime{
+		mkMount("mobile", "/mobile", statusHealthy),
+		mkMount("tianyi", "/tianyi", statusWarning),
+		mkMount("baidu", "/baidu", statusUnavailable),
+	}
+	rec := httptest.NewRecorder()
+	serveRootIndex(rec, mounts, true)
+
+	body := rec.Body.String()
+	for _, want := range []string{`class="name ok"`, `class="name warning"`, `class="name error"`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("missing color class %q: %s", want, body)
+		}
+	}
+	// 全部失败（A04）也要能看到每个挂载：名字仍在页面中
+	if !strings.Contains(body, "已配置 3 个云盘") {
+		t.Errorf("expected configured count, got: %s", body)
+	}
+}
+
+// TestSynthesizeStatus 状态合成唯一规则（§5.2）：初始化失败红 > AuthExpired 红 >
+// 探测连续 2 次失败红 > 警告黄 > 正常黑；一次探测成功不得覆盖已确认失效。
+func TestSynthesizeStatus(t *testing.T) {
+	expired := driver.DriverHealth{AuthExpired: true, Warning: "令牌已过期，请更新令牌"}
+	warn := driver.DriverHealth{Warning: "云主机发现失败，服务受限"}
+
+	tests := []struct {
+		name       string
+		initErr    error
+		dh         driver.DriverHealth
+		probeFails int
+		want       mountStatus
+	}{
+		{"初始化失败", errAny, driver.DriverHealth{}, 0, statusUnavailable},
+		{"凭据已失效优先级最高", nil, expired, 0, statusUnavailable},
+		{"凭据已失效不被探测成功覆盖", nil, expired, 1, statusUnavailable},
+		{"探测连续两次失败", nil, driver.DriverHealth{}, 2, statusUnavailable},
+		{"探测单次失败不转红", nil, driver.DriverHealth{}, 1, statusHealthy},
+		{"警告", nil, warn, 0, statusWarning},
+		{"正常", nil, driver.DriverHealth{}, 0, statusHealthy},
+	}
+	for _, tt := range tests {
+		got, _ := synthesizeStatus(tt.initErr, tt.dh, tt.probeFails, "")
+		if got != tt.want {
+			t.Errorf("%s: synthesizeStatus = %q, want %q", tt.name, got, tt.want)
+		}
+	}
+}
+
+var errAny = &testErr{}
+
+type testErr struct{}
+
+func (e *testErr) Error() string { return "测试错误" }
+
+// TestCreateAllDriversIsolation A（§4）：单挂载创建/初始化失败不影响其他挂载；
+// 状态表含全部配置挂载；失败的挂载保留 RawDriver（创建成功时）。
+func TestCreateAllDriversIsolation(t *testing.T) {
+	cfg := &conf.Config{Clouds: []conf.CloudConfig{
+		{Name: "本地", Type: "local"},
+		{Name: "百度", Type: "baidu", RefreshToken: ""}, // Init 失败：尚未授权
+		{Name: "坏类型", Type: "nonexistent"},           // 创建失败
+	}}
+	mounts := createAllDrivers(t.Context(), cfg)
+
+	if len(mounts) != 3 {
+		t.Fatalf("状态表应含全部配置挂载：got %d, want 3", len(mounts))
+	}
+	var avail int
+	for _, m := range mounts {
+		if m.Available {
+			avail++
+		}
+		st, _ := m.snapshot()
+		if !m.Available && st != statusUnavailable {
+			t.Errorf("失败挂载 %s 状态 = %q, want unavailable", m.Name, st)
+		}
+		if m.InitError == nil && !m.Available {
+			t.Errorf("失败挂载 %s 应有 InitError", m.Name)
+		}
+	}
+	if avail != 1 {
+		t.Errorf("available = %d, want 1", avail)
+	}
+	// 百度 Init 失败但创建成功 → RawDriver 保留（/admin 更新入口，D1）
+	for _, m := range mounts {
+		if m.Name == "百度" && m.RawDriver == nil {
+			t.Error("Init 失败的百度挂载应保留 RawDriver")
+		}
+		if m.Name == "坏类型" && m.RawDriver != nil {
+			t.Error("创建失败的挂载 RawDriver 应为 nil")
+		}
+	}
+}
+
+// TestAllDriversFailedStillServesDiagnostic Q1 拍板：全部失败时诊断首页仍渲染全部挂载
+func TestAllDriversFailedStillServesDiagnostic(t *testing.T) {
+	mounts := []*MountRuntime{
+		mkMount("baidu", "/百度", statusUnavailable),
+		mkMount("mobile", "/移动云盘", statusUnavailable),
+	}
+	rec := httptest.NewRecorder()
+	serveRootIndex(rec, mounts, true)
+	body := rec.Body.String()
+	if !strings.Contains(body, "已配置 2 个云盘") {
+		t.Errorf("diagnostic page should show configured mounts, got: %s", body)
+	}
+	if !strings.Contains(body, "移动云盘") || !strings.Contains(body, "百度网盘") {
+		t.Errorf("diagnostic page should show every failed mount, got: %s", body)
 	}
 }
 
@@ -89,5 +230,32 @@ func TestVaultSupported(t *testing.T) {
 		if got := vaultSupported(tt.drv); got != tt.want {
 			t.Errorf("vaultSupported(%s) = %v, want %v（驱动 Name()=%q）", tt.name, got, tt.want, tt.drv.Name())
 		}
+	}
+}
+
+// TestMountRuntimeProbeUpdate 探测结果快照更新（I3 并发安全 + 探测判据 I2）
+func TestMountRuntimeProbeUpdate(t *testing.T) {
+	m := mkMount("mobile", "/mobile", statusHealthy)
+	m.applyProbeResult(nil)
+	if m.lastCheckAt.IsZero() {
+		t.Error("探测成功应更新 lastCheckAt")
+	}
+	if !m.lastSuccessAt.After(time.Time{}) {
+		t.Error("探测成功应更新 lastSuccessAt")
+	}
+	st, _ := m.snapshot()
+	if st != statusHealthy {
+		t.Errorf("status = %q, want healthy", st)
+	}
+
+	// 连续 2 次失败 → 红；一次成功恢复
+	m.applyProbeResult(errAny)
+	m.applyProbeResult(errAny)
+	if st, _ := m.snapshot(); st != statusUnavailable {
+		t.Errorf("after 2 probe failures status = %q, want unavailable", st)
+	}
+	m.applyProbeResult(nil)
+	if st, _ := m.snapshot(); st != statusHealthy {
+		t.Errorf("after recovery status = %q, want healthy", st)
 	}
 }

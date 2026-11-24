@@ -712,3 +712,102 @@ func TestValidateVaultRules(t *testing.T) {
 		}
 	}
 }
+
+// TestValidateMounts A13（DESIGN-2026-11-24-01 §4.3）：挂载名结构校验全局 fail-fast
+func TestValidateMounts(t *testing.T) {
+	base := func(name string) *Config {
+		return &Config{Clouds: []CloudConfig{{Name: name, Type: "mobile"}}}
+	}
+	bad := []struct {
+		label string
+		cfg   *Config
+	}{
+		{"空名称", &Config{Clouds: []CloudConfig{{}}}},
+		{"路径分隔符", base("a/b")},
+		{"反斜杠", base(`a\b`)},
+		{"点", base(".")},
+		{"点点", base("..")},
+		{"超长", base(strings.Repeat("长", 65))},
+		{"重复", &Config{Clouds: []CloudConfig{{Name: "x", Type: "mobile"}, {Name: "x", Type: "tianyi"}}}},
+	}
+	for _, b := range bad {
+		if err := validateMounts(b.cfg); err == nil {
+			t.Errorf("%s：应校验失败", b.label)
+		}
+	}
+
+	// 中文合法（现有挂载名均为中文）
+	ok := &Config{Clouds: []CloudConfig{
+		{Name: "天翼个人", Type: "tianyi"},
+		{Name: "移动云盘", Type: "mobile"},
+		{Name: "百度网盘", Type: "baidu"},
+	}}
+	if err := validateMounts(ok); err != nil {
+		t.Errorf("中文挂载名应合法: %v", err)
+	}
+	// 控制字符拒绝
+	if err := validateMounts(base("a\x00b")); err == nil {
+		t.Error("控制字符应校验失败")
+	}
+}
+
+// TestWriteCredentialBaidu 百度写回（§6.2/C02）：
+// 写「验证后的最终 refresh_token」（__refresh_token 优先）+ 授权代次 +1、修订号置 1。
+func TestWriteCredentialBaidu(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/config.json"
+	cfg := &Config{Clouds: []CloudConfig{
+		{Name: "百度", Type: "baidu", RefreshToken: "rt-old", ClientID: "cid", ClientSecret: "cs", CredentialGeneration: 3, TokenRevision: 7},
+		{Name: "移动", Type: "mobile", Authorization: "auth-old"},
+	}}
+	if err := cfg.Save(path); err != nil {
+		t.Fatal(err)
+	}
+
+	fresh, err := WriteCredential(path, "百度", map[string]string{
+		"__refresh_token": "rt-final", // 验证后的最终值（上游轮换过）
+		"refresh_token":   "rt-input", // 表单原始值（不得使用）
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := fresh.Clouds[0]
+	if got.RefreshToken != "rt-final" {
+		t.Errorf("RefreshToken = %q, want rt-final（最终值优先于表单原始值）", got.RefreshToken)
+	}
+	if got.CredentialGeneration != 4 || got.TokenRevision != 1 {
+		t.Errorf("代次 = (%d,%d), want (4,1)", got.CredentialGeneration, got.TokenRevision)
+	}
+	// 移动挂载不受影响
+	if fresh.Clouds[1].Authorization != "auth-old" {
+		t.Errorf("移动挂载不应被改动: %+v", fresh.Clouds[1])
+	}
+	// 落盘验证
+	reloaded, err := LoadStrict(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.Clouds[0].RefreshToken != "rt-final" || reloaded.Clouds[0].CredentialGeneration != 4 {
+		t.Errorf("落盘内容不符: %+v", reloaded.Clouds[0])
+	}
+}
+
+// TestWriteCredentialMobileUnchanged 移动写回保持原行为（authorization）
+func TestWriteCredentialMobileUnchanged(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/config.json"
+	cfg := &Config{Clouds: []CloudConfig{{Name: "移动", Type: "mobile", Authorization: "auth-old"}}}
+	if err := cfg.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := WriteCredential(path, "移动", map[string]string{"authorization": "auth-new"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh.Clouds[0].Authorization != "auth-new" {
+		t.Errorf("Authorization = %q, want auth-new", fresh.Clouds[0].Authorization)
+	}
+	if fresh.Clouds[0].CredentialGeneration != 0 {
+		t.Errorf("移动挂载不应动代次字段: %+v", fresh.Clouds[0])
+	}
+}
