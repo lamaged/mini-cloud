@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -12,6 +13,7 @@ import (
 	"mini-cloud/drivers/tianyi"
 	"mini-cloud/internal/conf"
 	"mini-cloud/internal/driver"
+	"mini-cloud/internal/model"
 )
 
 // mkMount 构造测试挂载并写入初始状态
@@ -257,5 +259,64 @@ func TestMountRuntimeProbeUpdate(t *testing.T) {
 	m.applyProbeResult(nil)
 	if st, _ := m.snapshot(); st != statusHealthy {
 		t.Errorf("after recovery status = %q, want healthy", st)
+	}
+}
+
+// TestSynthesizeExpiryWarning P1（代码审核）：ExpiresAt 临近过期（<7 天）转黄；
+// AuthExpired 优先于临近过期；探测成功不得把临近过期洗回黑。
+func TestSynthesizeExpiryWarning(t *testing.T) {
+	at := func(d time.Duration) *time.Time { t := time.Now().Add(d); return &t }
+	tests := []struct {
+		name string
+		dh   driver.DriverHealth
+		want mountStatus
+	}{
+		{"剩 8 天不警告", driver.DriverHealth{ExpiresAt: at(8 * 24 * time.Hour)}, statusHealthy},
+		{"剩 6 天转黄", driver.DriverHealth{ExpiresAt: at(6*24*time.Hour + time.Hour)}, statusWarning},
+		{"剩 2 小时转黄", driver.DriverHealth{ExpiresAt: at(2 * time.Hour)}, statusWarning},
+		{"已过期转红", driver.DriverHealth{ExpiresAt: at(-time.Hour), AuthExpired: true, Warning: "令牌已过期"}, statusUnavailable},
+		{"过期事实优先于临近", driver.DriverHealth{ExpiresAt: at(-time.Hour), AuthExpired: true}, statusUnavailable},
+	}
+	for _, tt := range tests {
+		got, msg := synthesizeStatus(nil, tt.dh, 0, "")
+		if got != tt.want {
+			t.Errorf("%s: got %q (%s), want %q", tt.name, got, msg, tt.want)
+		}
+	}
+}
+
+// fakeHealthDriver 实现 Driver + HealthReporter 的最小测试驱动
+type fakeHealthDriver struct{ dh driver.DriverHealth }
+
+func (f *fakeHealthDriver) Name() string                            { return "fake" }
+func (f *fakeHealthDriver) Init(ctx context.Context) error          { return nil }
+func (f *fakeHealthDriver) List(ctx context.Context, p string) ([]model.Obj, error) {
+	return nil, nil
+}
+func (f *fakeHealthDriver) Link(ctx context.Context, p string) (*model.Link, error) {
+	return nil, nil
+}
+func (f *fakeHealthDriver) Health() driver.DriverHealth { return f.dh }
+
+// TestProbeSuccessKeepsExpiryWarning 探测成功不得把临近过期洗回黑（审核 P1）
+func TestProbeSuccessKeepsExpiryWarning(t *testing.T) {
+	exp := time.Now().Add(6 * 24 * time.Hour)
+	m := &MountRuntime{
+		Name:      "移动云盘",
+		Prefix:    "/移动云盘",
+		RawDriver: &fakeHealthDriver{dh: driver.DriverHealth{ExpiresAt: &exp}},
+		Available: true,
+	}
+	m.applyInitResult(nil)
+	if st, _ := m.snapshot(); st != statusWarning {
+		t.Fatalf("初始化后应为警告: %q", st)
+	}
+	m.applyProbeResult(nil) // 探测成功
+	if st, _ := m.snapshot(); st != statusWarning {
+		t.Errorf("探测成功不得把临近过期洗回黑: %q", st)
+	}
+	m.applyProbeResult(nil)
+	if st, _ := m.snapshot(); st != statusWarning {
+		t.Errorf("多次探测成功仍应保持警告: %q", st)
 	}
 }

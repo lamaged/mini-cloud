@@ -65,8 +65,12 @@ const (
 	statusUnavailable mountStatus = "unavailable" // 失效（红）
 )
 
+// warnExpiryThreshold 凭据临近过期阈值（DESIGN-2026-11-24-01 §5.3：剩余 <7 天转黄）
+const warnExpiryThreshold = 7 * 24 * time.Hour
+
 // synthesizeStatus 状态合成唯一规则（§5.2）：初始化结果 + 探测结果 + 驱动健康事实。
-// AuthExpired 优先级最高——一次 List 成功不得覆盖已确认失效。
+// AuthExpired 优先级最高——一次 List 成功不得覆盖已确认失效；
+// ExpiresAt 临近过期（<7 天）转黄，由事实驱动——探测成功也不会把黄洗回黑。
 func synthesizeStatus(initErr error, dh driver.DriverHealth, probeFails int, probeMsg string) (mountStatus, string) {
 	if initErr != nil {
 		return statusUnavailable, sanitizeErr(initErr.Error())
@@ -85,10 +89,26 @@ func synthesizeStatus(initErr error, dh driver.DriverHealth, probeFails int, pro
 		}
 		return statusUnavailable, msg
 	}
+	if dh.ExpiresAt != nil && time.Until(*dh.ExpiresAt) < warnExpiryThreshold {
+		return statusWarning, fmt.Sprintf("凭据将在 %d 天后过期，请尽快更新", expiryDaysLeft(*dh.ExpiresAt))
+	}
 	if dh.Warning != "" {
 		return statusWarning, dh.Warning
 	}
 	return statusHealthy, ""
+}
+
+// expiryDaysLeft 剩余天数（向上取整；不足 1 天按 1 天计）
+func expiryDaysLeft(t time.Time) int {
+	d := time.Until(t)
+	if d <= 0 {
+		return 0
+	}
+	days := int((d + 24*time.Hour - 1) / (24 * time.Hour))
+	if days < 1 {
+		days = 1
+	}
+	return days
 }
 
 // sanitizeErr 错误信息脱敏限长（≤200 字符）
@@ -203,14 +223,18 @@ func main() {
 	// 管理页：收集全部配置挂载（含失败挂载的状态卡；凭证更新入口仅对
 	// 「创建成功且实现 CredentialUpdater」的挂载提供，D1）。断言一律对原始驱动（铁律 7）。
 	// 状态经统一合成规则渲染（红黄黑 + 原因 + 最近检查时间）；Vault 告警随渲染时合并。
+	// hasUpdater：是否存在支持在线更新的挂载——只有它为真才注册 /admin 路由、
+	// 显示首页「管理」链接（审核 P2：状态卡不是注册管理页的理由）。
 	vaultWarn := make(map[string]func() string)
 	adminMounts := make([]admin.Mount, 0, len(mounts))
+	hasUpdater := false
 	for _, m := range mounts {
 		am := admin.Mount{Name: m.Name, Prefix: m.Prefix, Available: m.Available}
 		if m.RawDriver != nil {
 			if up, ok := m.RawDriver.(driver.CredentialUpdater); ok {
 				am.FieldsFunc = up.CredentialFields // 动态标签（剩余有效期/获取指引），渲染时现取
 				am.Update = up
+				hasUpdater = true
 			}
 		}
 		am.Status = func() admin.MountStatus {
@@ -272,8 +296,8 @@ func main() {
 	// HTTP 路由
 	mux := http.NewServeMux()
 
-	// 管理页（仅当存在支持在线更新的挂载时注册）
-	if len(adminMounts) > 0 {
+	// 管理页（仅当存在支持在线更新的挂载时注册——状态卡不是注册理由，审核 P2）
+	if hasUpdater {
 		mux.HandleFunc("GET /admin", func(w http.ResponseWriter, r *http.Request) {
 			if !checkAuth(r, serverUser, serverPass) {
 				w.Header().Set("WWW-Authenticate", `Basic realm="mini-cloud"`)
@@ -313,7 +337,7 @@ func main() {
 		}
 		// GET → 浏览器导航页（状态表 = 全部配置挂载）
 		if r.Method == "GET" || r.Method == "HEAD" {
-			serveRootIndex(w, mounts, len(adminMounts) > 0)
+			serveRootIndex(w, mounts, hasUpdater)
 			return
 		}
 		// PROPFIND → 返回云盘列表（兼容 WebDAV 客户端）

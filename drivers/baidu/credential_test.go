@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -215,5 +216,35 @@ func TestInitConfigWinsOverStaleCache(t *testing.T) {
 	}
 	if got := d.getRefreshToken(); got != "rt-config" {
 		t.Errorf("refresh_token = %q, want rt-config（config 为唯一真值源）", got)
+	}
+}
+
+// TestExchangeTokenErrorRedacted P1（代码审核）：网络错误文本不得泄露凭据——
+// Go 的 url.Error 携带完整请求 URL（含 refresh_token/client_secret，且经 URL 编码），
+// exchangeToken 必须把凭据值（原文与编码形式）替换后再对外返回。
+func TestExchangeTokenErrorRedacted(t *testing.T) {
+	secret := "rt-abc/def+g==" // 含 URL 需编码的特殊字符，验证编码形式同样被替换
+	clientSecret := "cs-xyz/789=="
+	d := New("百度", secret, "cid-public", clientSecret, t.TempDir())
+	ts := newFakeTokenServer(t, false, false, nil)
+	ts.Close() // 已关闭的服务器 → 连接被拒，走网络错误路径
+	d.client.tokenURL = ts.URL
+
+	err := d.ValidateCredential(context.Background(), map[string]string{"__req": "r", "refresh_token": secret})
+	if err == nil {
+		t.Fatal("连接失败应报错")
+	}
+	msg := err.Error()
+	for _, s := range []string{secret, clientSecret, url.QueryEscape(secret), url.QueryEscape(clientSecret)} {
+		if strings.Contains(msg, s) {
+			t.Errorf("错误文本泄露凭据 %q：%s", s, msg)
+		}
+	}
+
+	// Init 路径同样走 exchangeToken，脱敏必须一致
+	if err := d.Init(context.Background()); err == nil {
+		t.Fatal("Init 应报错")
+	} else if strings.Contains(err.Error(), secret) || strings.Contains(err.Error(), url.QueryEscape(secret)) {
+		t.Errorf("Init 错误泄露凭据: %s", err.Error())
 	}
 }

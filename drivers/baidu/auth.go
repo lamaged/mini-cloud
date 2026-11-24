@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // ============================================================
@@ -33,7 +34,10 @@ func (c *Client) exchangeToken(ctx context.Context, refreshToken, clientID, clie
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return "", "", 0, fmt.Errorf("token refresh request failed: %w", err)
+		// 脱敏（§6.9 安全要求）：Go 的 url.Error 文本携带完整请求 URL，
+		// 其中含 refresh_token/client_id/client_secret——错误文本会进日志与管理页，
+		// 必须把凭据值（含 URL 编码形式）替换掉再对外返回。
+		return "", "", 0, fmt.Errorf("token 交换网络错误: %s", redactSecrets(err.Error(), refreshToken, clientID, clientSecret))
 	}
 	defer resp.Body.Close()
 
@@ -55,6 +59,20 @@ func (c *Client) exchangeToken(ctx context.Context, refreshToken, clientID, clie
 		expiresIn = 2592000 // 默认 30 天
 	}
 	return result.AccessToken, result.RefreshToken, expiresIn, nil
+}
+
+// redactSecrets 把错误文本中的凭据值（含 URL 编码形式）替换为 ***。
+// 双保险：既挡 url.Error 携带的完整 URL，也挡任何上游包装层透传的原文。
+func redactSecrets(msg string, secrets ...string) string {
+	for _, s := range secrets {
+		if s == "" {
+			continue
+		}
+		for _, form := range []string{s, url.QueryEscape(s)} {
+			msg = strings.ReplaceAll(msg, form, "***")
+		}
+	}
+	return msg
 }
 
 // refreshToken 兼容旧调用路径的包装：无副作用交换（调用方自行 SetAccessToken 与落盘）。

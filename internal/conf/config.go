@@ -398,12 +398,13 @@ func WriteCredential(path, mountName string, values map[string]string) (*Config,
 		if cfg.Clouds[i].MountName() == mountName {
 			switch cfg.Clouds[i].Type {
 			case "baidu":
-				// 百度：写「验证后的最终 refresh_token」（保留键 __refresh_token，
-				// DESIGN-2026-11-24-01 §6.2——上游轮换过的新值不得丢弃）；
+				// 百度：只写「验证后的最终 refresh_token」（保留键 __refresh_token，
+				// DESIGN-2026-11-24-01 §6.2）——缺失即契约被破坏，fail-fast 拒绝写回，
+				// 不得回退使用表单原始输入（会掩盖调用链错误）；
 				// 用户提交 = 新授权代次（credential_generation+1、token_revision 置 1，§6.5）
 				rt := values["__refresh_token"]
 				if rt == "" {
-					rt = values["refresh_token"]
+					return nil, fmt.Errorf("缺少验证结果（__refresh_token 保留键缺失），拒绝写回配置")
 				}
 				cfg.Clouds[i].RefreshToken = rt
 				cfg.Clouds[i].CredentialGeneration++

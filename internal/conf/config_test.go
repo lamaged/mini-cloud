@@ -811,3 +811,32 @@ func TestWriteCredentialMobileUnchanged(t *testing.T) {
 		t.Errorf("移动挂载不应动代次字段: %+v", fresh.Clouds[0])
 	}
 }
+
+// TestWriteCredentialBaiduMissingReservedKey P2（代码审核）：
+// 缺 __refresh_token 必须 fail-fast——不备份、不写盘，原配置完全不变。
+func TestWriteCredentialBaiduMissingReservedKey(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/config.json"
+	cfg := &Config{Clouds: []CloudConfig{
+		{Name: "百度", Type: "baidu", RefreshToken: "rt-old", ClientID: "cid", ClientSecret: "cs", CredentialGeneration: 3},
+	}}
+	if err := cfg.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = WriteCredential(path, "百度", map[string]string{"refresh_token": "rt-input"})
+	if err == nil || !strings.Contains(err.Error(), "__refresh_token") {
+		t.Fatalf("缺失保留键应报错，got %v", err)
+	}
+	after, _ := os.ReadFile(path)
+	if !bytes.Equal(before, after) {
+		t.Error("写回失败时配置文件必须完全不变")
+	}
+	if _, err := os.Stat(path + ".bak"); err == nil {
+		t.Error("写回失败不得产生备份")
+	}
+}
