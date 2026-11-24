@@ -1,0 +1,322 @@
+# v1.3.0 设计评审稿：单挂载故障隔离、首页状态可见、百度 OAuth 维护
+
+| 项目 | 内容 |
+|---|---|
+| 文档编号 | DESIGN-2026-11-24-01（修订稿 v2） |
+| 状态 | 设计评审稿（闸门①：待 PM 批准 → 外部文档评审） |
+| 依据 | feature/file-encryption 实际代码（v1.2.0-beta，commit 2a5eae1 起） |
+| 替代 | docs/new/ 两份初稿（ISSUE-2026-11-23-01、后续完善设计方案初稿）——初稿基于公开 master v0.9.2 快照，多处与现行代码不符，本稿以实际代码核查结果为准 |
+| 目标设备 | 红米 AX6 / OpenWrt ARM64 |
+| 范围 | 批 1（A 启动隔离 + B 状态红绿灯）、批 2（C 百度 OAuth 维护）；D 百度加密不纳入本轮（单列后议） |
+
+---
+
+## 1. 背景与目标
+
+2026-11-23 真机事故：百度 `refresh_token` 失效 → `createAllDrivers` 整体失败 → 进程 `os.Exit(1)` → 8088 端口从未监听 → 天翼/移动/百度全部不可用。追查中发现百度 OAuth 凭据硬编码于源码（公共凭据）。由此提出本轮三项目标：
+
+1. **A 启动隔离（P0）**：单挂载初始化失败不拖垮其他挂载；至少一个挂载成功即提供服务。
+2. **B 状态红绿灯（P0）**：首页每个挂载框以颜色表达状态（失效=红、警告=黄、正常=黑色不动），管理页可操作；现有「提示性显示名」按 PM 拍板移除。
+3. **C 百度 OAuth 维护（P1）**：移除源码内置凭据；用户自有百度应用凭据必填；管理页支持粘贴 `refresh_token` 与一键授权；刷新、轮换、持久化、失效恢复全链路可靠。
+
+**D 百度加密（P1，初稿 §5）不纳入本轮**：改铁律不是障碍（PM），障碍是开发成本与收益不确定性（百度 CDN Range 行为、会员/非会员差异）——需先单独出可行性论证（真机实测数据），再由 PM 拍板，不做则不写。
+
+---
+
+## 2. 现状核查（相对初稿的修正）
+
+| # | 初稿表述 | 实际代码核查结果（feature 分支） |
+|---|---|---|
+| 1 | 基于公开 master v0.9.2 快照 | 本稿基于 feature/file-encryption v1.2.0-beta 实际代码；初稿「版本边界」警告（§0.2）已消解——Vault/manifest 实际代码就在本仓库（internal/vault/） |
+| 2 | `createAllDrivers` 任一失败即整体退出 | **属实**（main.go:305-327 任一 `createDriver`/`Init` 错误立即返回；main.go:84-87 收错误后 `os.Exit(1)`）。例外：移动驱动已具「受限模式」（云主机发现失败不阻断启动，Phase 2 交付）；天翼/百度无隔离。2026-11-23 事故路径在现分支可复现 |
+| 3 | 首页无状态展示 | 部分过时。首页为挂载卡片列表（main.go:434+），`displayName` = 挂载名 + 告警话（main.go:377-384，v0.9.2 起）；「管理」链接由 `hasAdmin` 决定（存在支持在线更新凭据的挂载）。/admin 已有全挂载状态卡（Phase 2：驱动告警 `HealthReporter` + Vault 告警双通道）。本轮在此之上扩展，不另起炉灶 |
+| 4 | `HealthReporter` 仅返回字符串 | **属实**（internal/driver/driver.go:38-41 `HealthWarning() string`，仅移动实现）。本轮升级为结构化快照 |
+| 5 | 百度 OAuth 硬编码 | **属实**（drivers/baidu/auth.go:15-16 `DefaultClientID`/`DefaultClientSecret`；driver.go:34-38 空值回退）。config 中 `client_id`/`client_secret` 现为「可选，有默认值」（internal/conf/config.go:47-48） |
+| 6 | 百度刷新失败导致整站退出 | **属实**（`Init` 内触发刷新，失败向上返回 → 整体退出） |
+| 7 | 百度 token 状态持久化 | 已有 `state/<挂载名>_token.json`（SaveToken/LoadToken，auth.go:65/76）；`TokenManager`（NeedRefresh/RefreshToken）+ 后台 watcher 5 分钟；凭据字段互斥锁 getter/setter（铁律 8）。初稿 §4.1「持久化错误未完整反馈」待实现时复核 |
+| 8 | 百度 `Link()` 代理下载 | 服务端代理（UA `netdisk`），**转发客户端 Range 头**给 CDN（driver.go:196-201），返回一次性流 `Reader`。本轮不改（D 论证时再评估随机读取能力） |
+| 9 | 挂载名结构校验 | 现有 conf 未校验挂载名唯一/合法（仅 vault.paths 有严格校验）；批 1 补上（初稿 §6.1 采纳） |
+| 10 | Vault 支持范围 | `vaultSupported` 仅 tianyi/mobile/local（main.go:496+，铁律 2）；本轮不动 |
+
+---
+
+## 3. PM 拍板记录（2026-11-24，同步入 TODO.md）
+
+1. **范围**：本轮 = A + B + C；D 百度加密单列后议（可放弃）。
+2. **铁律 2 修订**：百度重新纳入支持范围（OAuth 凭据体系正式维护）；「加密（Vault）不支持百度」条款保留（待 D 论证后再定）。
+3. **状态颜色**：失效=红、警告（快到期）=黄、正常=**黑色不动**；**无灰色档**（首次探测完成前按正常黑色显示）。
+4. **提示话移除**：首页卡片与根 PROPFIND 显示名一律只显示挂载名，不再拼接告警文本（PM：电视端走削刮器看不到提示，状态只经首页颜色 + /admin 表达）。
+5. **管理页百度卡片**：批 1 做「贴 refresh_token」输入框（与移动同交互）；一键授权随批 2 实现。
+6. **管理链接**：全部正常时首页不显示「管理」链接（代码已核实顺手可实现）。
+7. **首页自动刷新**：本轮不做。
+8. **节奏**：A+B 合一批、C 单独一批，各自独立走六道闸门。
+
+---
+
+## 4. 设计：A 启动隔离（批 1）
+
+### 4.1 目标行为
+
+- 逐个创建/初始化挂载；单挂载失败只记录该挂载状态，不中断流程。
+- 至少一个挂载成功 → 正常启动 HTTP 服务，仅注册成功挂载的路由。
+- 失败的挂载保留在状态表中（首页红色 + 原因摘要）。
+- 失败挂载**不做自动重试**（第一阶段）：修改配置后重启进程重新初始化。第二阶段「低频退避重试 + 动态启用路由」列为后续可选（初稿 §2.6 采纳），本轮不实现。
+
+### 4.2 数据模型
+
+```go
+type MountStatus string
+
+const (
+    StatusUnknown     MountStatus = "unknown"     // 尚未检查（不上色，PM 拍板）
+    StatusHealthy     MountStatus = "healthy"     // 正常（黑色）
+    StatusWarning     MountStatus = "warning"     // 警告（黄色）
+    StatusUnavailable MountStatus = "unavailable" // 失效（红色）
+)
+
+type MountRuntime struct {
+    Config        CloudConfig
+    Name          string
+    Prefix        string
+    Driver        driver.Driver // 初始化成功时非 nil；断言一律对原始驱动（铁律 7）
+    Status        MountStatus
+    LastError     string    // 脱敏、限长（≤200 字符）
+    LastCheckAt   time.Time // 最近一次健康探测时间
+    LastSuccessAt time.Time // 最近一次探测/访问成功时间
+    UpdatedAt     time.Time
+}
+```
+
+状态为运行期数据，与配置分离；敏感凭据永不进入状态输出。
+
+### 4.3 初始化流程与错误分级
+
+```text
+加载并校验全局配置（JSON 损坏/监听非法/认证非法 → 全局错误，退出）
+        |
+        v
+结构校验（本轮新增）：挂载名非空、唯一、不含路径分隔符与危险 URL 字符
+        |   （违例 → 全局错误 fail-fast，与 vault.paths 校验同口径）
+        v
+逐个处理 clouds：创建失败 / Init 失败 → 该挂载 StatusUnavailable + LastError，继续
+        |         Init 成功 → 注册 WebDAV 路由 + 启动 Token Watcher
+        v
+启动 HTTP Server（至少一个成功 → 正常服务；零成功 → 诊断首页，见 Q1）
+```
+
+| 错误类型 | 处理方式 | 阻止进程 |
+|---|---|---|
+| 配置文件不存在且无法创建、JSON 损坏 | 全局错误 | 是 |
+| server.listen 非法、全局认证非法 | 全局错误 | 是 |
+| 挂载名重复/非法（本轮新增校验） | 全局错误 fail-fast | 是 |
+| 某挂载 type 不支持 / 缺必需凭据 / OAuth·session 初始化失败 / 上游暂不可达 | 该挂载 UNAVAILABLE，继续 | 否 |
+| Token Watcher 后续刷新失败 | 更新挂载状态与告警 | 否 |
+
+### 4.4 验收标准
+
+1. 百度 refresh_token 故意失效 → 天翼/移动仍可正常访问。
+2. 任一挂载 `Init()` 返回错误 → 其他挂载仍注册路由。
+3. 多挂载同时失败 → 日志逐个指明挂载名、类型、错误原因。
+4. 全部挂载失败 → 行为按 Q1 拍板执行并写入文档。
+5. 单挂载失败不造成进程退出、端口不监听或其他挂载缓存被关闭。
+
+---
+
+## 5. 设计：B 状态红绿灯（批 1）
+
+### 5.1 首页展示
+
+- **布局与显示不变**：仍是挂载卡片列表；卡片样式加状态类（`ok`/`warning`/`error`），颜色语义：黑=正常、黄=警告、红=失效；无灰色。
+- 卡片内容：**仅挂载名**（desc 行保留原 href 展示）。`displayName` 简化为纯挂载名——首页与根 PROPFIND 的告警拼接一并移除（PM 拍板 §3.4）。
+- 「管理」链接：`hasAdmin && 存在任一非 HEALTHY 挂载` 才显示。
+- 状态消息（黄色/红色的原因文本）脱敏 + 限长；所有 HTML 输出沿用现有转义（html.EscapeString）。
+- 首页不做自动刷新（PM 拍板）；不做 /admin/api/status JSON 接口（初稿 §3.5 有，本轮砍：首页服务端直接渲染状态快照，无消费方）。
+- /admin 状态卡升级为结构化状态展示（颜色点 + 文字 + 最近检查时间），继续双通道（驱动健康 + Vault 告警）。
+
+### 5.2 结构化健康模型
+
+```go
+type HealthSnapshot struct {
+    Status        HealthStatus
+    Message       string
+    LastCheckAt   time.Time
+    LastSuccessAt time.Time
+    ExpiresAt     *time.Time
+}
+
+// HealthReporter 升级（原 HealthWarning() string 废弃）：
+// 断言对象必须是原始驱动（铁律 7）；Vault 与 CachedReader 不得实现。
+type HealthReporter interface {
+    Health() HealthSnapshot
+}
+```
+
+- 迁移面：仅移动实现 + main.go 两处消费点，面小；升级不保留双接口。
+- **状态合成规则全项目唯一**（应用层）：驱动只报事实（凭据到期时间、最近错误），挂载运行状态由「初始化结果 + 探测结果 + 驱动快照」合成；驱动与首页不得各自判断颜色。
+- 合成规则：
+  - 初始化失败 → UNAVAILABLE；
+  - 探测连续 2 次失败（连接/认证/上游类）→ UNAVAILABLE；单次失败不转红；
+  - 凭据警告（移动 authorization 剩 <7 天、移动受限模式、百度刷新失败但会话暂可用等）→ WARNING；
+  - 最近探测成功且无警告 → HEALTHY；一次成功探测即可从红/黄恢复；
+  - 首次探测完成前 → 按 HEALTHY 显示（无灰色档）。
+
+### 5.3 健康探测
+
+- 每挂载独立，默认每 5 分钟（启动后立即一次）；独立 ctx 超时 ≤10s；同一挂载同一时刻最多一个探测（单飞）。
+- 探测内容：`List` 根目录（raw 驱动直调，**绕过 CachedReader 缓存**，避免旧缓存掩盖上游状态）；不下载文件、不遍历目录。
+- 本轮**不做失败退避**：5 分钟已是低频，退避逻辑省去（设计决定；真机验收观察探测开销）。
+- 正常 WebDAV 请求成功可更新 `LastSuccessAt`；单次文件读取失败不等于挂载不可用。
+- 「即将过期」判定按驱动分别（初稿 §3.4 采纳）：移动解析 authorization 真实过期时间，剩 <7 天 → 黄（解析能力已存在，v0.10 管理页剩余有效期显示）；天翼无可靠到期时间不虚构，刷新失败/API 明确拒绝才转红/黄；百度见 §6.7。
+
+### 5.4 验收标准
+
+1. 百度 token 故意失效 → 首页百度框红色、天翼/移动黑色，可正常访问。
+2. 移动 authorization 剩 <7 天 → 黄色；过期 → 红色（或按现行过期语义对齐，见 §5.3）。
+3. 全部正常 → 全黑、首页无「管理」链接；任一挂载异常 → 「管理」链接出现。
+4. 首页与根 PROPFIND 显示名均为纯挂载名（无告警拼接）。
+5. 探测对云盘 API 的调用量与 AX6 负载可接受（真机观察项）。
+6. 挂载名含 HTML 特殊字符 → 首页正确转义显示。
+
+---
+
+## 6. 设计：C 百度 OAuth 维护（批 2）
+
+### 6.1 目标
+
+- 删除源码内置凭据（PM 拍板，CLAUDE.md「内置 OAuth 默认凭据」例外条款随代码删除同步清理）。
+- `client_id`/`client_secret` **必填**（用户自己的百度网盘开放平台应用：AppKey → client_id、SecretKey → client_secret）；缺失 → 该百度挂载红色「OAuth 应用凭据未配置」，不影响其他挂载；不静默回退。
+- `refresh_token` 可空（= 尚未授权，红色 + 管理页可贴）。
+- 管理页：贴 refresh_token（批 1 输入框）+ 一键授权（本批）。
+- 刷新互斥、轮换持久化、失效恢复、限频，全链路可靠。
+
+### 6.2 输入框（批 1 已建，本批补齐验证）
+
+沿用移动 CredentialUpdater 两阶段（internal/driver/driver.go:64+）：
+- `ValidateCredential`：用贴入的 refresh_token + config 中 client_id/secret 调百度刷新接口验证（10s 超时）；
+- `Commit`：原子写 config.json（临时文件+落盘+改名，写前 .bak 备份，0600）→ 生效 → 清该挂载缓存 → 代次防护（新提交凭证优先于后台刷新结果，防旧缓存/旧刷新覆盖新授权；铁律 8「取较新者」与代次机制并用）。
+
+### 6.3 一键授权（本批新增，OOB 回跳模式）
+
+```text
+管理页「开始授权」→ 服务端生成随机 state（一次性、10 分钟有效、与挂载绑定）
+     → 返回百度授权 URL（redirect_uri 按百度网盘开放平台控制台配置，开工前实测定值）
+     → 用户登录百度并授权 → 浏览器回跳到显示授权码的页面 → 用户复制授权码
+     → 管理页粘贴 → 服务端校验 state（存在、未用、未过期）
+     → 服务端以 code + client_id + client_secret 兑换 token（HTTPS、10s 超时）
+     → 调轻量用户信息接口验证 token 有效 → 原子落盘（refresh/access/expires_at）
+     → 挂载状态恢复，WebDAV 路由生效
+```
+
+- 授权码只由服务端兑换；浏览器不接触 client_secret。
+- 授权过程必须经现有管理认证（Basic Auth + CSRF，沿用 /admin 现有防护）。
+- 若百度网盘开放平台不支持 OOB/手工 code 模式（Q2）→ 一键授权降级：管理页只保留贴 refresh_token 框（批 1 输入框兜底），并在管理页给出「如何自行获取 refresh_token」指引。
+- 不自动覆盖其他百度挂载的 token（每个挂载独立状态文件，路径按挂载名隔离，现制已满足）。
+
+### 6.4 Token 持久化与刷新规则（初稿 §4.5 采纳）
+
+1. 同挂载刷新互斥（单飞）；401 回调与后台 watcher 的并发刷新也进同一把锁。
+2. 刷新响应含新 refresh_token → 轮换并持久化；无则保留旧值。
+3. 原子写：临时文件 + rename；权限 0600、目录 0700。
+4. 落盘失败 = 严重错误：日志 Error + 状态黄/红；**不得**记为「刷新成功」。
+5. 内存 token 与磁盘 token 提交顺序明确：先落盘成功，才提交内存新值。
+6. API 401/errno 失效 → 自动刷新并重试一次，防递归。
+7. 连续刷新失败限频（如最短 60s 间隔），防每个 WebDAV 请求都触发 OAuth。
+8. 不可恢复错误（`expired_token`/`has been used`）→ 红色「需要重新授权」+ 管理页入口；临时网络错误 → 黄色 + 退避重试。
+
+### 6.5 配置与迁移
+
+- config 结构字段不变（client_id/client_secret/refresh_token 已存在），语义变更：前两者必填、refresh_token 可空。
+- 旧配置（client_id/secret 为空）升级后：百度挂载红色「OAuth 应用凭据未配置」，/admin 显示填写指引；不静默使用公共凭据。
+- config.example.json 与 README 附录 A 百度行重写（申请入口：百度网盘开放平台 pan.baidu.com/union；字段对应：AppKey→client_id、SecretKey→client_secret、AppID/SignKey 不使用）。
+- 状态文件格式不变（state/<挂载名>_token.json），新增字段向后兼容。
+
+### 6.6 安全要求（初稿 §4.7 采纳）
+
+- 日志只输出挂载名、错误码、错误类别；不输出 token/secret/授权码/完整授权 URL。
+- token 交换用 HTTPS + 合理超时；state 随机、短时、一次性。
+- token 文件 0600、目录 0700、原子写。
+- 状态输出（首页/管理页）不回显任何凭据字段。
+
+### 6.7 状态映射（与 §5.2 合成规则衔接）
+
+| 条件 | 状态 |
+|---|---|
+| client_id/secret 缺失 | 红：OAuth 应用凭据未配置 |
+| refresh_token 缺失 | 红：尚未授权（管理页可授权） |
+| access_token 正常、无风险 | 黑 |
+| 刷新失败但会话暂可用 / 即将过期 | 黄 |
+| refresh_token 不可恢复失效 / 落盘失败 | 红：需要重新授权 / 存储异常 |
+
+### 6.8 验收标准（初稿 §4.8 采纳，全部 httptest 假服务器验证）
+
+1. 不配置 client_id/secret → 百度挂载明确失败，其他云盘正常启动。
+2. 配置自有应用 + 贴 refresh_token → 验证通过、落盘、重启恢复。
+3. access token 到期前主动刷新成功（现有 watcher 机制延续）。
+4. 模拟百度返回新 refresh_token → 轮换持久化，重启后使用新值。
+5. 模拟 refresh_token 失效 → 红色 + 重新授权入口，其他云盘不受影响。
+6. 模拟 token 文件不可写 → 日志与状态准确反映持久化失败。
+7. 并发请求同时触发失效 → 同挂载仅一次有效刷新，无刷新风暴。
+8. 一键授权全流程（state 校验/兑换/落盘/恢复）——需 PM 的百度应用真机走一遍（若 OOB 不可用则执行降级路径并记录）。
+
+---
+
+## 7. 错误分类（初稿 §6.2 采纳精简）
+
+`CONFIG_ERROR / AUTH_MISSING / AUTH_EXPIRED / AUTH_REFRESH_FAILED / NETWORK_ERROR / UPSTREAM_UNAVAILABLE / RATE_LIMITED / NOT_FOUND / STORAGE_ERROR / INTEGRITY_ERROR / UNKNOWN_ERROR`
+
+- 日志带：错误类别 + 挂载名 + 上游错误码 + 必要上下文；状态页显示人能读的短句；不把所有错误显示成「无法连接」。
+
+## 8. 不改动范围（铁律守护）
+
+- 只读 WebDAV（铁律 3）；未加密路径 302 行为不变（铁律 7）。
+- Vault 格式、支持范围（tianyi/mobile/local）、`vaultSupported` 一律不动；mcrypt 工具不动。
+- 百度 `Link()` 代理下载实现不动（OAuth 凭据字段相关代码除外）。
+- 包装层（Vault/CachedReader/RetryReader）不得实现新可选接口；断言对象必须为原始驱动。
+- 单账户单用户（铁律 1）；不引入外部依赖（铁律 6）；不引入数据库/消息队列/守护进程。
+- D 百度加密：不纳入本轮（§1）。
+
+## 9. 分阶段与闸门
+
+| 批 | 范围 | 闸门 |
+|---|---|---|
+| 批 1（v1.3.0 主体） | A 启动隔离 + B 状态红绿灯（含管理页百度输入框） | ① 本文档 A/B 部分评审 → ② 实现 → ③ 代码审核 + security-review（首页 HTML/状态输出涉转义）→ ④ vet + test -race + httptest → ⑤ AX6 验收（含探测开销观察）→ ⑥ 发布 |
+| 批 2 | C 百度 OAuth 维护 | ① C 部分评审（OOB 可行性随开工前实测并入）→ ② → ③ 代码审核 + security-review（新 HTTP 端点 + 凭证处理）→ ④（httptest 假百度 OAuth 服务）→ ⑤ AX6 + PM 自有应用实测授权/刷新/失效恢复 → ⑥ |
+
+版本号与发布节奏（批 1 先行发版或两批合发）由 PM 发版时拍板（Q4）。
+
+## 10. 测试矩阵（批 1/批 2）
+
+| 编号 | 场景 | 预期 |
+|---|---|---|
+| A01 | 天翼正常、百度 token 失效 | 服务启动，天翼可用，百度红色 |
+| A02 | 百度正常、移动 authorization 过期 | 服务启动，百度可用，移动红（或黄，按剩余天数） |
+| A03 | 多挂载仅一个正常 | 服务启动，仅正常挂载可访问 |
+| A04 | 所有挂载初始化失败 | 按 Q1 拍板（建议：诊断首页可访问） |
+| A05 | 运行中断网 | 该挂载连续 2 次探测失败后转红，其他独立 |
+| A06 | 网络恢复 | 一次探测成功后恢复黑/黄 |
+| A07 | 单挂载探测超时 | 不阻塞其他挂载及首页 |
+| A08 | 挂载名含 HTML 特殊字符 | 首页转义正确 |
+| C01 | 贴 refresh_token 首次验证 | 联网验证通过，原子落盘，重启可用 |
+| C02 | access token 临近过期 | 主动刷新成功 |
+| C03 | 刷新返回新 refresh_token | 轮换持久化，重启后使用新值 |
+| C04 | refresh_token 已失效 | 红色 + 重新授权入口，不拖垮服务 |
+| C05 | token 文件损坏/不可写 | 错误可见，其他挂载正常 |
+| C06 | 并发触发失效 | 同挂载单飞刷新，无风暴 |
+| C07 | 一键授权全流程 | state 校验/兑换/落盘/状态恢复（真机，PM 应用） |
+
+## 11. 待确认事项
+
+| 编号 | 事项 | 建议默认 | 状态 |
+|---|---|---|---|
+| Q1 | 全部挂载失败时是否仍启动诊断首页（无数据路由，仅状态可见） | 是 | 待 PM 拍板 |
+| Q2 | 百度网盘开放平台 OOB/手工授权码模式可行性 | 开工前用 PM 应用实测；不可用则降级为贴 token 框 | 待实测 |
+| Q3 | 一键授权 redirect_uri 具体值 | 开工前给 PM 一行确切值，PM 填入应用控制台 | 待定 |
+| Q4 | 批 1/批 2 版本号与发布节奏 | 发版时 PM 拍板 | 待定 |
+
+## 12. 风险
+
+1. **健康探测增量调用**：5 分钟 × 挂载数 × List 根目录——低频轻量，真机验收观察 AX6 负载与云盘接口风控。
+2. **OOB 模式不确定性**：百度开放平台对回调方式的限制可能变化——降级路径已备（§6.3），不影响批 1。
+3. **接口升级迁移面**：HealthReporter 仅移动实现 + main 两处消费点，面小；升级后逐一核对 401 回调注册顺序等既有不变量（CLAUDE.md 已记历史教训）。
+4. **铁律 2 修订**：百度纳入正式维护后，百度挂载缺陷按正式功能处理（PM 已知悉）。
+5. **移动过期语义对齐**：现有「过期返回空目录」行为与「红色失效」展示需对齐表述（状态红、目录空、/admin 指引），避免两处语义打架。
