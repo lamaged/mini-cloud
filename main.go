@@ -4,11 +4,14 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/xml"
+	"errors"
 	"flag"
 	"fmt"
 	"html"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"runtime"
@@ -151,14 +154,16 @@ func (m *MountRuntime) applyInitResult(initErr error) {
 }
 
 // applyProbeResult 探测完成后一次性替换快照（探测判据 §5.3：
-// err==nil 但驱动有失效事实时合成规则仍判红/黄，不得因 List 无错判健康）
+// err==nil 但驱动有失效事实时合成规则仍判红/黄，不得因 List 无错判健康）。
+// 错误只存分类短语（classifyProbeErr）——原始错误文本可能携带凭据
+// （百度 url.Error 含 access_token，安全审核 RV-2026-11-24-06），且分类更可读。
 func (m *MountRuntime) applyProbeResult(err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.lastCheckAt = time.Now()
 	if err != nil {
 		m.probeFails++
-		m.probeMsg = err.Error()
+		m.probeMsg = classifyProbeErr(err)
 	} else {
 		m.probeFails = 0
 		m.probeMsg = ""
@@ -168,6 +173,25 @@ func (m *MountRuntime) applyProbeResult(err error) {
 	m.status = st
 	m.statusMsg = msg
 	m.updatedAt = time.Now()
+}
+
+// classifyProbeErr 探测错误 → 固定分类短语（design-v1.3.0 §7 错误分类）。
+// 不保留原始错误文本：上游错误文本可能携带凭据（安全审核 RV-2026-11-24-06）。
+func classifyProbeErr(err error) string {
+	var ne net.Error
+	var ue *url.Error
+	switch {
+	case errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled):
+		return "健康检查超时"
+	case errors.As(err, &ue) || errors.As(err, &ne):
+		return "网络不可达"
+	case errors.Is(err, driver.ErrUpstream):
+		return "上游云盘不可用"
+	case errors.Is(err, os.ErrNotExist):
+		return "根目录不存在"
+	default:
+		return "上游服务异常"
+	}
 }
 
 // snapshot 读取当前状态快照（HTTP 页只读）

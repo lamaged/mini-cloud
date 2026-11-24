@@ -268,6 +268,11 @@ func validateMounts(cfg *Config) error {
 			return &semanticError{msg: fmt.Sprintf("挂载名不允许 . 或 ..：%q", name)}
 		case containsControl(name):
 			return &semanticError{msg: fmt.Sprintf("挂载名不允许控制字符：%q", name)}
+		case strings.ContainsAny(name, " {}%"):
+			// 安全审核 RV-2026-11-24-06 附加固：Go 1.22+ ServeMux 模式语法——
+			// 空格导致启动 panic、{} 是通配段语法、% 在注册时被 URL 解码，
+			// 都不得进入挂载名（URL 路由保留字符）
+			return &semanticError{msg: fmt.Sprintf("挂载名不允许空格、花括号或百分号（URL 路由保留字符）：%q", name)}
 		case seen[name]:
 			return &semanticError{msg: fmt.Sprintf("挂载名重复：%q", name)}
 		}

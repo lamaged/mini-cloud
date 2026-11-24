@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -363,5 +366,52 @@ func TestRegisterAdminRoutesGate(t *testing.T) {
 	registerAdminRoutes(muxYes, true, "u", "p", admin.New(nil, nil))
 	if rec := noAuth(muxYes); rec.Code != http.StatusUnauthorized {
 		t.Errorf("有更新能力时 /admin 应注册（未认证 401），got %d", rec.Code)
+	}
+}
+
+// TestProbeErrorClassifiedNoSecret 安全审核 RV-2026-11-24-06：
+// 探测错误只存分类短语，原始文本（含 url.Error 中的 access_token）不得进入状态；
+// 恢复后 probeMsg 清空。
+func TestProbeErrorClassifiedNoSecret(t *testing.T) {
+	m := mkMount("baidu", "/baidu", statusHealthy)
+	ue := &url.Error{Op: "Get",
+		URL: "https://pan.baidu.com/rest/2.0/xpan/file?access_token=SECRET&method=list",
+		Err: errors.New("dial tcp: connection refused")}
+
+	m.applyProbeResult(ue)
+	m.applyProbeResult(ue)
+	st, msg := m.snapshot()
+	if st != statusUnavailable {
+		t.Fatalf("连续两次探测失败应转红, got %q", st)
+	}
+	if strings.Contains(msg, "SECRET") {
+		t.Errorf("状态消息不得含凭据: %q", msg)
+	}
+	if msg != "网络不可达" {
+		t.Errorf("应为分类短语「网络不可达」, got %q", msg)
+	}
+
+	// 恢复后：转正常且消息清空
+	m.applyProbeResult(nil)
+	if st, msg := m.snapshot(); st != statusHealthy || msg != "" {
+		t.Errorf("恢复后应正常且无消息: %q %q", st, msg)
+	}
+}
+
+// TestClassifyProbeErr 探测错误分类（超时/网络/上游哨兵/兜底）
+func TestClassifyProbeErr(t *testing.T) {
+	cases := []struct {
+		err  error
+		want string
+	}{
+		{context.DeadlineExceeded, "健康检查超时"},
+		{&url.Error{Op: "Get", URL: "https://x/", Err: errors.New("refused")}, "网络不可达"},
+		{fmt.Errorf("%w: 上游失败", driver.ErrUpstream), "上游云盘不可用"},
+		{fmt.Errorf("百度网盘 errno=2"), "上游服务异常"},
+	}
+	for _, c := range cases {
+		if got := classifyProbeErr(c.err); got != c.want {
+			t.Errorf("classifyProbeErr(%v) = %q, want %q", c.err, got, c.want)
+		}
 	}
 }

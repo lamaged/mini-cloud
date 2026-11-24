@@ -2,6 +2,7 @@ package baidu
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -21,6 +22,7 @@ type Client struct {
 	accessToken  string
 	onAuthFailed func() error // 401 回调：刷新 token 并更新状态
 	tokenURL     string       // token 交换端点（测试可注入 httptest；构造后不再修改）
+	baseURL      string       // 网盘 API 基地址（测试可注入 httptest；构造后不再修改）
 }
 
 // NewClient 创建客户端
@@ -28,6 +30,7 @@ func NewClient() *Client {
 	return &Client{
 		httpClient: &http.Client{Timeout: 30 * time.Second},
 		tokenURL:   "https://openapi.baidu.com/oauth/2.0/token",
+		baseURL:    API_BASE,
 	}
 }
 
@@ -57,7 +60,7 @@ func (c *Client) apiGet(path string, params map[string]string, result interface{
 
 // apiGetWithRetry 内部实现，allowRetry 控制是否允许 401 自动重试（防止无限递归）
 func (c *Client) apiGetWithRetry(path string, params map[string]string, result interface{}, allowRetry bool) ([]byte, error) {
-	u, _ := url.Parse(API_BASE + path)
+	u, _ := url.Parse(c.baseURL + path)
 	q := u.Query()
 	q.Set("access_token", c.getAccessToken())
 	for k, v := range params {
@@ -67,7 +70,9 @@ func (c *Client) apiGetWithRetry(path string, params map[string]string, result i
 
 	resp, err := c.httpClient.Get(u.String())
 	if err != nil {
-		return nil, err
+		// 脱敏（安全审核 RV-2026-11-24-06）：url.Error 文本携带完整请求 URL（含 access_token），
+		// 错误会经 List/探测/管理页传播——与 exchangeToken 同款 redactSecrets。
+		return nil, fmt.Errorf("%s", redactSecrets(err.Error(), c.getAccessToken()))
 	}
 	defer resp.Body.Close()
 
@@ -133,7 +138,8 @@ func (c *Client) apiGetRaw(rawURL string, params map[string]string, result inter
 
 	resp, err := c.httpClient.Get(fullURL)
 	if err != nil {
-		return nil, err
+		// 脱敏（同上，安全审核 RV-2026-11-24-06）
+		return nil, fmt.Errorf("%s", redactSecrets(err.Error(), c.getAccessToken()))
 	}
 	defer resp.Body.Close()
 

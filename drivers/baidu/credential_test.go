@@ -248,3 +248,24 @@ func TestExchangeTokenErrorRedacted(t *testing.T) {
 		t.Errorf("Init 错误泄露凭据: %s", err.Error())
 	}
 }
+
+// TestAPIErrorRedacted 安全审核 RV-2026-11-24-06：
+// apiGet 网络错误文本（url.Error 携带含 access_token 的完整 URL）必须脱敏。
+func TestAPIErrorRedacted(t *testing.T) {
+	d := newTestDriver(t.TempDir())
+	d.client.SetAccessToken("at-sec/ret+1==")
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	ts.Close() // 立即关闭 → 连接被拒
+	d.client.baseURL = ts.URL
+
+	_, err := d.List(context.Background(), "/")
+	if err == nil {
+		t.Fatal("连接失败应报错")
+	}
+	msg := err.Error()
+	for _, s := range []string{"at-sec/ret+1==", url.QueryEscape("at-sec/ret+1==")} {
+		if strings.Contains(msg, s) {
+			t.Errorf("API 错误泄露 access_token %q：%s", s, msg)
+		}
+	}
+}
