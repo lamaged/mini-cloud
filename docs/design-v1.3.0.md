@@ -238,8 +238,8 @@ type HealthReporter interface {
 | 百度驱动 | 实现 `CredentialUpdater`（两阶段，internal/driver/driver.go:64+ 契约；断言对原始驱动，铁律 7） |
 | 验证 | `ValidateCredential` 调用**无副作用 token 交换函数**（审核 RV-26-24-02 阻断项）：只请求并返回 access_token/refresh_token/expires_in，**不修改客户端内存**——现 auth.go `refreshToken()` 内置 `c.SetAccessToken`（先改内存）必须先拆分为纯交换函数；验证响应含新 refresh_token 时经保留键传给 Commit（见下表后契约），**不丢弃** |
 | 配置写回 | `conf.WriteCredential` 扩展：支持写百度 `refresh_token`（现仅支持移动 authorization）——原子写（临时文件+落盘+改名）+ .bak + 0600 沿用现制；写入值为**验证后的最终 refresh_token**，非表单原始输入 |
-| 内存更新 | **顺序：验证 → 写配置 → 改内存**（审核 RV-26-24-02）：config 持久化成功后才提交客户端内存凭据（互斥锁 getter/setter，铁律 8）；任何一步失败 → 零变化 |
-| 失败处理 | 验证失败零变化（不写配置、不动内存、状态不变、不留残余验证结果） |
+| 内存更新 | **顺序：验证 → 写配置 → 改内存**（审核 RV-26-24-02）：config 持久化成功后才提交客户端内存凭据（互斥锁 getter/setter，铁律 8） |
+| 失败处理 | 见下表后「提交结果语义」（审核 RV-26-24-04：state 缓存写失败不回滚已生效凭据） |
 | 重启恢复 | 新凭据重启后经 Init 生效 |
 
 **验证结果传递契约（审核 RV-26-24-03 阻断项）**：现有接口 `ValidateCredential(ctx, values map[string]string) error` 无独立返回值——沿用现有保留键机制（`__req`/`__expiry` 同款）：
@@ -249,6 +249,15 @@ type HealthReporter interface {
 3. `CommitCredential` 用同一最终值更新内存凭据——验证、写配置、改内存三环节同一值；
 4. 验证失败不得在 `values` 中留下任何可被后续误用的残余值；
 5. `__refresh_token` 不得在管理页回显、不得写入日志。
+
+**提交结果语义（审核 RV-26-24-04，与现有接口契约对齐）**：现有 `CommitCredential` 契约——token state 写入失败时凭据仍然生效、返回 `ErrStateWriteFailed`，管理页视为已提交成功（不回滚配置）。「零变化」只适用于验证与配置写入两个环节：
+
+| 结果 | 配置 | 内存凭据 | state 缓存 | 处理 |
+|---|---|---|---|---|
+| 验证失败 | 不变 | 不变 | 不变 | 返回失败 |
+| 配置写入失败 | 不变 | 不变 | 不变 | 返回失败 |
+| Commit 真正失败 | 回滚（WriteCredential 已备 .bak） | 不生效 | 不变 | 返回失败 |
+| ErrStateWriteFailed | 保留新配置 | 保留新凭据 | 可能未更新 | 视为已提交 + 记录缓存告警（state 为纯缓存，下次重新兑换） |
 
 ### 6.3 批 1：更新 ≠ 恢复（审核 D1/D3 闭环）
 
