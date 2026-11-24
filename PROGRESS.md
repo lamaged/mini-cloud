@@ -17,6 +17,7 @@
 
 | 日期 | 事项 |
 |---|---|
+| 2026-11-24 | **批 1 代码审核复核通过（闸门③ 代码审核结案）**：RV-2026-11-24-05 四条（2 阻断 + 2 收口）复核通过全部关闭；非阻断建议 2 条随关闭落库——S1 7 天临界值测试（synthesizeStatus 拆出注入 now 的 synthesizeStatusAt 消除墙钟误差，恰好 7 天黑 / ±1 秒黄黑）；S2 管理页注册回归测试（抽取 registerAdminRoutes，无更新能力 /admin 404、有更新能力注册 401）；go vet + `go test -race` 全绿、ARM64/Windows 交叉编译通过；**闸门③ 待 security-review**（另行安排），之后闸门④ 已实质达标（vet/race/httptest）、闸门⑤ AX6 真机验收 |
 | 2026-11-24 | **批 1 代码审核第一轮处置完成（RV-2026-11-24-05，2 阻断 + 2 收口全闭环）**：①合成规则补 ExpiresAt 临近过期判定（<7 天黄，AuthExpired 优先，探测成功不洗黄）+ 边界测试 5 组；②exchangeToken 网络错误脱敏（redactSecrets 双形式替换，覆盖 Init/Validate/管理页传播链）+ 泄露断言测试；③WriteCredential 删原始值回退（缺 __refresh_token fail-fast 不备份不写盘）+ 配置不变测试；④管理页注册收紧（hasUpdater 控制 /admin 路由与首页链接）；go vet + `go test -race` 全绿、ARM64/Windows 交叉编译通过；待针对性复核后闸门③ 收尾（security-review 另行安排） |
 | 2026-11-24 | **v1.3.0 批 1 实现完成（闸门②，commit 25921b0）**：①启动隔离——MountRuntime 状态表含全部配置挂载（RawDriver 可空、创建失败 vs 初始化失败分列），createAllDrivers 逐挂载捕获失败不再整体退出，挂载名结构校验全局 fail-fast（非空/唯一/无分隔符与控制字符/≤64/中文合法），全失败仍起诊断首页（Q1）；②状态红绿灯——HealthReporter 升级为 `Health()` 事实模型（Warning/ExpiresAt/AuthExpired，移动迁移），应用层统一合成红黄黑（AuthExpired 优先级最高，探测成功不得覆盖已确认失效），每挂载 5 分钟探测（绕过 CachedReader、单飞、独立 10s 超时、快照一次性替换 + RWMutex），首页颜色落挂载名文字、纯名显示（提示话全移除含根 PROPFIND）、全正常隐藏「管理」链接，/admin 结构化状态卡（颜色点+文字+最近检查时间）；③百度凭证更新通道——删除内置 OAuth 凭据与回退（CLAUDE.md 例外条款同步清理），client_id/secret 必填（缺失=红色「应用凭据未配置」），无副作用 token 交换（exchangeToken 不碰客户端内存，验证失败零变化），CredentialUpdater 两阶段 + 保留键 `__refresh_token`（最终值贯穿验证/写配置/改内存、轮换不丢、失败不留残余），WriteCredential 支持百度 + 授权代次随提交 +1（修订号置 1），Init 以 config 为唯一真值源（旧缓存不覆盖新授权），更新≠恢复（红 + 「已保存，重启后生效」），state 目录 0700，401 回调保持 Init 最前注册不变量；自查通过：go vet + `go test -race` 全绿（新增 17 用例：启动隔离/状态合成/探测快照/颜色与管理链接/百度两阶段契约/挂载名校验/写回代次），ARM64 + Windows 交叉编译通过；文档恒同步（CLAUDE.md 路线与接口、README 附录 A/令牌更新/FAQ、config.example.json 百度段）；待闸门③ 外部代码审核 + security-review |
 | 2026-11-24 | **闸门① 通过（PM 批准）+ 终核处置（RV-2026-11-24-04）→ 批 1 开工**：终核结论「三项原问题闭合，建议批准批 1 开工」；唯一契约点（ErrStateWriteFailed 语义与 §6.2「零变化」冲突）已入稿——「零变化」仅限验证/配置写入环节，state 缓存写失败不回滚已生效凭据（视为已提交 + 缓存告警，state 纯缓存下次重兑换）；design-v1.3.0.md 升 v6 收口；开工要求 4 条（ErrStateWriteFailed 语义、`__refresh_token` 贯穿、无副作用交换函数、按验收矩阵测试后进入闸门③⑤）纳入实现；处置表 RV-2026-11-24-04 补录 |
@@ -532,7 +533,14 @@
 
 | 编号 | 级别 | 意见摘要 | 处置类别 | 处置说明 | 状态 | 复核 | 日期 |
 |---|---|---|---|---|---|---|---|
-| P1 | 阻断 | 移动临近过期未转黄（synthesizeStatus 未用 ExpiresAt） | 已改 | 合成规则补 ExpiresAt 判定（<7 天黄 + 「将在 N 天后过期」）；AuthExpired 优先；探测成功不洗黄（事实驱动）；边界测试：剩 8 天黑/6 天黄/2 小时黄/已过期红 + 探测成功后保持警告 | 已闭环 | 待复核 | 2026-11-24 |
-| P1 | 阻断 | 百度 OAuth 网络错误文本泄露凭据（url.Error 携带完整 URL） | 已改 | exchangeToken 网络错误经 redactSecrets 双重脱敏（凭据原文 + URL 编码形式均替换 ***）；覆盖 Init/Validate/管理页全传播链；测试：连接失败断言错误文本不含 secret/refresh_token 原文与编码形式 | 已闭环 | 待复核 | 2026-11-24 |
-| P2 | 重要 | WriteCredential 回退使用表单原始 refresh_token | 已改 | 删除回退：缺 `__refresh_token` 直接报错、不备份不写盘；测试断言配置完全不变且无 .bak | 已闭环 | 待复核 | 2026-11-24 |
-| P2 | 重要 | 管理页注册条件过宽（无更新能力的挂载也注册 /admin） | 已改 | hasUpdater 单独计算（存在 Update != nil 的挂载）；/admin 路由注册与首页「管理」链接均以其为准；状态卡仍随管理页展示 | 已闭环 | 待复核 | 2026-11-24 |
+| P1 | 阻断 | 移动临近过期未转黄（synthesizeStatus 未用 ExpiresAt） | 已改 | 合成规则补 ExpiresAt 判定（<7 天黄 + 「将在 N 天后过期」）；AuthExpired 优先；探测成功不洗黄（事实驱动）；边界测试：剩 8 天黑/6 天黄/2 小时黄/已过期红 + 探测成功后保持警告 | 已关闭 | 通过 | 2026-11-24 |
+| P1 | 阻断 | 百度 OAuth 网络错误文本泄露凭据（url.Error 携带完整 URL） | 已改 | exchangeToken 网络错误经 redactSecrets 双重脱敏（凭据原文 + URL 编码形式均替换 ***）；覆盖 Init/Validate/管理页全传播链；测试：连接失败断言错误文本不含 secret/refresh_token 原文与编码形式 | 已关闭 | 通过 | 2026-11-24 |
+| P2 | 重要 | WriteCredential 回退使用表单原始 refresh_token | 已改 | 删除回退：缺 `__refresh_token` 直接报错、不备份不写盘；测试断言配置完全不变且无 .bak | 已关闭 | 通过 | 2026-11-24 |
+| P2 | 重要 | 管理页注册条件过宽（无更新能力的挂载也注册 /admin） | 已改 | hasUpdater 单独计算（存在 Update != nil 的挂载）；/admin 路由注册与首页「管理」链接均以其为准；状态卡仍随管理页展示 | 已关闭 | 通过 | 2026-11-24 |
+
+复核补充（非阻断建议，随关闭一并落库）：
+
+| 编号 | 级别 | 意见摘要 | 处置类别 | 处置说明 | 状态 | 复核 | 日期 |
+|---|---|---|---|---|---|---|---|
+| S1 | 建议 | 7 天临界值缺测试（防将来误改 <=7 天） | 已改 | synthesizeStatus 拆出注入 now 的 synthesizeStatusAt（消除墙钟误差）；临界测试：恰好 7 天黑、7 天±1 秒黄/黑 | 已闭环 | — | 2026-11-24 |
+| S2 | 建议 | 无更新能力时 /admin 404 缺回归测试 | 已改 | 抽取 registerAdminRoutes；测试：无更新能力 /admin 404、有更新能力注册（未认证 401）；首页链接条件已有测试覆盖 | 已闭环 | — | 2026-11-24 |

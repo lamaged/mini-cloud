@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -11,6 +12,7 @@ import (
 	"mini-cloud/drivers/local"
 	"mini-cloud/drivers/mobile"
 	"mini-cloud/drivers/tianyi"
+	"mini-cloud/internal/admin"
 	"mini-cloud/internal/conf"
 	"mini-cloud/internal/driver"
 	"mini-cloud/internal/model"
@@ -318,5 +320,48 @@ func TestProbeSuccessKeepsExpiryWarning(t *testing.T) {
 	m.applyProbeResult(nil)
 	if st, _ := m.snapshot(); st != statusWarning {
 		t.Errorf("多次探测成功仍应保持警告: %q", st)
+	}
+}
+
+// TestSynthesizeExpiryBoundary 7 天临界值（复核补充建议）：契约是严格 <7 天才黄——
+// 恰好 7 天仍黑，防止将来误改成 <=7 天。用注入 now 的 synthesizeStatusAt 消除墙钟误差。
+func TestSynthesizeExpiryBoundary(t *testing.T) {
+	now := time.Now()
+	cases := []struct {
+		name string
+		exp  time.Time
+		want mountStatus
+	}{
+		{"恰好 7 天", now.Add(7 * 24 * time.Hour), statusHealthy},
+		{"7 天少 1 秒", now.Add(7*24*time.Hour - time.Second), statusWarning},
+		{"7 天多 1 秒", now.Add(7*24*time.Hour + time.Second), statusHealthy},
+	}
+	for _, c := range cases {
+		got, _ := synthesizeStatusAt(now, nil, driver.DriverHealth{ExpiresAt: &c.exp}, 0, "")
+		if got != c.want {
+			t.Errorf("%s: got %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+// TestRegisterAdminRoutesGate 复核补充建议：无在线更新能力的部署不得注册 /admin（404）；
+// 有更新能力时注册（未认证 401）。首页链接条件已由 TestServeRootIndexNoAdminLink 覆盖。
+func TestRegisterAdminRoutesGate(t *testing.T) {
+	noAuth := func(mux *http.ServeMux) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequest("GET", "/admin", nil))
+		return rec
+	}
+
+	muxNone := http.NewServeMux()
+	registerAdminRoutes(muxNone, false, "u", "p", admin.New(nil, nil))
+	if rec := noAuth(muxNone); rec.Code != http.StatusNotFound {
+		t.Errorf("无更新能力时 /admin 应 404，got %d", rec.Code)
+	}
+
+	muxYes := http.NewServeMux()
+	registerAdminRoutes(muxYes, true, "u", "p", admin.New(nil, nil))
+	if rec := noAuth(muxYes); rec.Code != http.StatusUnauthorized {
+		t.Errorf("有更新能力时 /admin 应注册（未认证 401），got %d", rec.Code)
 	}
 }

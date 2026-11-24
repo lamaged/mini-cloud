@@ -72,6 +72,11 @@ const warnExpiryThreshold = 7 * 24 * time.Hour
 // AuthExpired 优先级最高——一次 List 成功不得覆盖已确认失效；
 // ExpiresAt 临近过期（<7 天）转黄，由事实驱动——探测成功也不会把黄洗回黑。
 func synthesizeStatus(initErr error, dh driver.DriverHealth, probeFails int, probeMsg string) (mountStatus, string) {
+	return synthesizeStatusAt(time.Now(), initErr, dh, probeFails, probeMsg)
+}
+
+// synthesizeStatusAt 同上，now 注入版（7 天临界值测试用，避免墙钟误差）
+func synthesizeStatusAt(now time.Time, initErr error, dh driver.DriverHealth, probeFails int, probeMsg string) (mountStatus, string) {
 	if initErr != nil {
 		return statusUnavailable, sanitizeErr(initErr.Error())
 	}
@@ -89,8 +94,8 @@ func synthesizeStatus(initErr error, dh driver.DriverHealth, probeFails int, pro
 		}
 		return statusUnavailable, msg
 	}
-	if dh.ExpiresAt != nil && time.Until(*dh.ExpiresAt) < warnExpiryThreshold {
-		return statusWarning, fmt.Sprintf("凭据将在 %d 天后过期，请尽快更新", expiryDaysLeft(*dh.ExpiresAt))
+	if dh.ExpiresAt != nil && dh.ExpiresAt.Sub(now) < warnExpiryThreshold {
+		return statusWarning, fmt.Sprintf("凭据将在 %d 天后过期，请尽快更新", expiryDaysLeftAt(now, *dh.ExpiresAt))
 	}
 	if dh.Warning != "" {
 		return statusWarning, dh.Warning
@@ -100,7 +105,11 @@ func synthesizeStatus(initErr error, dh driver.DriverHealth, probeFails int, pro
 
 // expiryDaysLeft 剩余天数（向上取整；不足 1 天按 1 天计）
 func expiryDaysLeft(t time.Time) int {
-	d := time.Until(t)
+	return expiryDaysLeftAt(time.Now(), t)
+}
+
+func expiryDaysLeftAt(now, t time.Time) int {
+	d := t.Sub(now)
 	if d <= 0 {
 		return 0
 	}
@@ -297,24 +306,7 @@ func main() {
 	mux := http.NewServeMux()
 
 	// 管理页（仅当存在支持在线更新的挂载时注册——状态卡不是注册理由，审核 P2）
-	if hasUpdater {
-		mux.HandleFunc("GET /admin", func(w http.ResponseWriter, r *http.Request) {
-			if !checkAuth(r, serverUser, serverPass) {
-				w.Header().Set("WWW-Authenticate", `Basic realm="mini-cloud"`)
-				http.Error(w, "Unauthorized", http.StatusUnauthorized)
-				return
-			}
-			adminHandler.Page(w, r)
-		})
-		mux.HandleFunc("POST /admin/update", func(w http.ResponseWriter, r *http.Request) {
-			if !checkAuth(r, serverUser, serverPass) {
-				w.Header().Set("WWW-Authenticate", `Basic realm="mini-cloud"`)
-				http.Error(w, "Unauthorized", http.StatusUnauthorized)
-				return
-			}
-			adminHandler.Update(w, r)
-		})
-	}
+	registerAdminRoutes(mux, hasUpdater, serverUser, serverPass, adminHandler)
 
 	// 根路径：GET 返回导航页，WebDAV 方法返回索引
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -514,6 +506,30 @@ func createDriver(cc *conf.CloudConfig) (driver.Driver, error) {
 // ============================================================
 // 认证
 // ============================================================
+
+// registerAdminRoutes 注册管理页路由——仅当存在支持在线更新的挂载（hasUpdater）时；
+// 无更新能力时不注册（/admin 返回 404），首页「管理」链接同条件（审核 P2 + 复核补充测试）。
+func registerAdminRoutes(mux *http.ServeMux, hasUpdater bool, serverUser, serverPass string, h *admin.Handler) {
+	if !hasUpdater {
+		return
+	}
+	mux.HandleFunc("GET /admin", func(w http.ResponseWriter, r *http.Request) {
+		if !checkAuth(r, serverUser, serverPass) {
+			w.Header().Set("WWW-Authenticate", `Basic realm="mini-cloud"`)
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		h.Page(w, r)
+	})
+	mux.HandleFunc("POST /admin/update", func(w http.ResponseWriter, r *http.Request) {
+		if !checkAuth(r, serverUser, serverPass) {
+			w.Header().Set("WWW-Authenticate", `Basic realm="mini-cloud"`)
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		h.Update(w, r)
+	})
+}
 
 func checkAuth(r *http.Request, username, password string) bool {
 	u, p, ok := r.BasicAuth()
