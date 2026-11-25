@@ -137,39 +137,49 @@ func SaveToken(name, stateDir string, token *TokenState) error {
 	return writeFileAtomic(filepath.Join(stateDir, name+"_token.json"), data)
 }
 
-// writeFileAtomic 原子写（与 conf 同款：temp + chmod + fsync + rename + 父目录 fsync）
+// writeFileAtomic 原子写（与 conf 同款语义：temp + chmod + fsync + rename + 父目录 fsync）。
+// P1-C（RV-2026-11-25-04）：临时文件用唯一名（os.CreateTemp）——doRefresh（锁外）
+// 与 CommitCredential 可能并发写缓存，固定 .tmp 名会互踩（rename ENOENT /
+// 失败清理误删对方刚写好的新缓存）。
 func writeFileAtomic(path string, data []byte) error {
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0600); err != nil {
-		return err
-	}
-	if err := os.Chmod(tmp, 0600); err != nil {
-		os.Remove(tmp)
-		return err
-	}
-	f, err := os.OpenFile(tmp, os.O_WRONLY, 0)
+	dir := filepath.Dir(path)
+	base := filepath.Base(path)
+	tmp, err := os.CreateTemp(dir, base+".tmp-*")
 	if err != nil {
-		os.Remove(tmp)
 		return err
 	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		os.Remove(tmp)
+	tmpName := tmp.Name()
+	cleanup := func() {
+		tmp.Close()
+		os.Remove(tmpName)
+	}
+	if err := tmp.Chmod(0600); err != nil {
+		cleanup()
 		return err
 	}
-	if err := f.Close(); err != nil {
-		os.Remove(tmp)
+	if _, err := tmp.Write(data); err != nil {
+		cleanup()
 		return err
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		os.Remove(tmp)
+	if err := tmp.Sync(); err != nil {
+		cleanup()
 		return err
 	}
-	syncDir(filepath.Dir(path))
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	syncDir(dir)
 	return nil
 }
 
-// syncDir 目录 fsync（尽力而为：失败仅 WARN）
+// syncDir 目录 fsync（尽力而为：失败仅 WARN，与 conf 口径一致）。
+// 文件 fsync + rename 已保证不会出现半截文件；目录 fsync 只影响 rename 的断电持久性，
+// 最坏情况回退到**旧的完整缓存**（缓存可丢弃重兑换，无数据风险）。
 func syncDir(dir string) {
 	f, err := os.Open(dir)
 	if err != nil {

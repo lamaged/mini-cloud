@@ -566,3 +566,12 @@
 | P2-1 | 建议 | 轮换落盘失败归黄「暂败」，与 §6.10 红「存储异常」不符 | 已改 | DriverHealth 增 StorageFailed 事实位；recordStorageFailure（红 + 「本地配置写入失败（存储异常）」）；合成规则 StorageFailed → UNAVAILABLE；测试：落盘失败断言 StorageFailed + 合成用例 | 已闭环 | 待复核 | 2026-11-25 |
 | P2-2 | 建议 | 重启页兜底命令硬编码 init.d 路径，与设备实际管理方式不符 | 已改 | 重启页与设计 §6.12 改中性文案（「手工重启 mini-cloud 进程」，不硬编码设备侧脚本路径） | 已闭环 | 待复核 | 2026-11-25 |
 | — | 记录 | 审核员撤回其上轮 I2 误判（认定一键授权/重启按钮属提前发布） | 确认 | 13ae500 + 6e8bd3d 即批 2 交付（设计 §6.4/§6.12 定稿），口径一致，无需改代码 | 已记录 | — | 2026-11-25 |
+
+### RV-2026-11-25-04（批 2 复审，4×P1 并发问题 → 全部处置）
+
+| 编号 | 级别 | 意见摘要 | 处置类别 | 处置说明 | 状态 | 复核 | 日期 |
+|---|---|---|---|---|---|---|---|
+| P1-A | P1 | ①等待者读全局刷新状态（新一轮启动后丢本轮结果、误报「进行中」）；②成功后不清 lastRefreshErr（陈旧失败永不消失，误限频+白打上游） | 已改 | ①等待者捕获本轮 rf 后直接读 rf.err（close 前锁内写入，happens-before 成立），删除全局查询 inFlightResult；②leader 收尾成功分支补 lastRefreshErr=nil；测试：失败→拨过窗口→成功→60s 内不被误限频（上游请求数断言）+ 并发等待者全得 nil + 旧等待者读本轮结果（单元+集成双级） | 已闭环 | 待复核 | 2026-11-25 |
+| P1-B | P1 | 「代次复检+内存提交」非临界区，与 CommitCredential 交错可致旧票覆盖新授权（内存/config 不一致） | 已改 | doRefresh 的「代次复检→setRefreshToken→SetAccessToken→缓存落盘」段纳入 refreshMu 临界区（兑换与 rotatePersist 留锁外保结果共享）；锁序 refreshMu→d.mu 与 CommitCredential 一致、cfgMu 仅锁外出现无环；测试：阻塞旧刷新于兑换完成/内存提交前 → 插入完整新凭据提交 → 释放 → 断言内存/state 全部属于新授权 | 已闭环 | 待复核 | 2026-11-25 |
+| P1-C | P1 | SaveToken 固定 .tmp 名并发互踩（rename ENOENT/误删对方新缓存） | 已改 | writeFileAtomic 改 os.CreateTemp 唯一临时名（chmod 0600→write→sync→close→rename，失败清理）；目录 fsync 保持 WARN + 回退语义注释（与 conf 口径统一，审核校准不阻断）；测试：40 goroutine 并发写缓存全部成功、最终文件完整（代次必为二者之一）、无残留临时文件 | 已闭环 | 待复核 | 2026-11-25 |
+| P1-C' | 口径 | 目录 fsync 失败须报错 | 校准 | 保持 WARN（与 conf 一致）：文件 fsync+rename 已保证无半截文件，目录 fsync 只影响 rename 断电持久性，最坏回退旧完整缓存（可丢弃重兑换） | 已闭环 | 待复核 | 2026-11-25 |

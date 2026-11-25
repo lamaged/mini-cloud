@@ -101,9 +101,9 @@ func (d *Driver) SetRotationPersist(fn func(ctx context.Context, expectedGen int
 	d.refreshMu.Unlock()
 }
 
-// refreshSingleFlight 刷新单飞 + 结果共享（§6.6.1 + 审核 P1-1）：首个进入者执行兑换，
+// refreshSingleFlight 刷新单飞 + 结果共享（§6.6.1 + 审核 P1-1/P1-A）：首个进入者执行兑换，
 // 其余并发者在锁外等待其结果复用（N 并发 → token 端点仅 1 次请求）；
-// 限频（§6.6.7）：失败后 60s 内复用失败结果，不打上游；
+// 限频（§6.6.7）：失败后 60s 内复用失败结果，不打上游（成功即清零，防陈旧错误误伤）；
 // 轮换（§6.5）：先写回 config（代次不符则跳过，防迟到覆盖）→ 成功才提交内存；
 // 落盘失败 = 严重错误（§6.6.4/§6.10），内存不提交新值、健康事实报存储异常（红）。
 func (d *Driver) refreshSingleFlight(ctx context.Context) error {
@@ -114,11 +114,11 @@ func (d *Driver) refreshSingleFlight(ctx context.Context) error {
 		return err
 	}
 	if d.refreshInFlight != nil {
-		ch := d.refreshInFlight.done
+		rf := d.refreshInFlight // P1-A①：捕获本轮结果对象，醒来直接读它，不查全局
 		d.refreshMu.Unlock()
 		select {
-		case <-ch:
-			return d.inFlightResult()
+		case <-rf.done:
+			return rf.err // rf.err 在 close 前、锁内写入，happens-before 成立
 		case <-ctx.Done():
 			return ctx.Err()
 		}
@@ -130,7 +130,8 @@ func (d *Driver) refreshSingleFlight(ctx context.Context) error {
 	rt := d.getRefreshToken()
 	d.refreshMu.Unlock()
 
-	// 真正执行（不持 refreshMu：提交/代次同步可与在途刷新交错，靠写回复检丢弃迟到结果）
+	// 真正执行（不持 refreshMu：网络兑换与写回期间提交/代次同步可交错，
+	// 靠临界区内的复检丢弃迟到结果——见 doRefresh）
 	err := d.doRefresh(ctx, gen, rt)
 
 	d.refreshMu.Lock()
@@ -139,6 +140,8 @@ func (d *Driver) refreshSingleFlight(ctx context.Context) error {
 	d.refreshInFlight = nil
 	if err != nil {
 		d.lastRefreshErr = err
+	} else {
+		d.lastRefreshErr = nil // P1-A②：成功后清零，防陈旧失败误伤后续请求（误限频/白打上游）
 	}
 	d.refreshMu.Unlock()
 	return err
@@ -150,21 +153,13 @@ type refreshResult struct {
 	err  error
 }
 
-// inFlightResult 读取在途刷新结果（调用方须持/曾持 refreshMu 保证 done 已关闭）
-func (d *Driver) inFlightResult() error {
-	d.refreshMu.Lock()
-	defer d.refreshMu.Unlock()
-	if d.refreshInFlight != nil {
-		return fmt.Errorf("刷新仍在进行")
-	}
-	// 结果已合并进 lastRefreshErr / 健康事实；成功时无错误
-	if d.lastRefreshErr != nil && time.Since(d.lastRefreshAt) < time.Minute {
-		return d.lastRefreshErr
-	}
-	return nil
-}
-
-// doRefresh 执行一次刷新：兑换 →（轮换则写回 config）→ 代次复检 → 提交内存 → 缓存落盘
+// doRefresh 执行一次刷新：兑换 →（轮换则写回 config）→ 临界区（代次复检 + 内存提交）
+// → 缓存落盘。
+// P1-B（RV-2026-11-25-04）：「代次复检 → setRefreshToken → SetAccessToken」必须与
+// CommitCredential 的内存提交同锁（refreshMu）——否则可交错成「旧刷新复检通过 →
+// 用户提交新票 → 旧刷新把旧票写回内存」，运行内存与 config 不一致。
+// 网络兑换与 rotatePersist 留在锁外（不破坏结果共享）；锁序 refreshMu → d.mu
+// 与 CommitCredential 一致，cfgMu 仅出现在锁外的 persist 段，无环。
 func (d *Driver) doRefresh(ctx context.Context, gen int, rt string) error {
 	access, newRT, expiresIn, err := d.client.exchangeToken(ctx, rt, d.clientID, d.clientSecret)
 	if err != nil {
@@ -182,7 +177,10 @@ func (d *Driver) doRefresh(ctx context.Context, gen int, rt string) error {
 			}
 		}
 	}
-	// 写回后再查代次：写回期间（或之前）管理页提交了新凭据 → 丢弃本次结果，
+
+	d.refreshMu.Lock()
+	defer d.refreshMu.Unlock()
+	// 临界区内复检代次：写回期间（或之前）管理页提交了新凭据 → 丢弃本次结果，
 	// 不得覆盖内存新票/新会话（防旧覆盖新，铁律 8 精神）
 	if gen != int(d.credGen.Load()) {
 		return nil
