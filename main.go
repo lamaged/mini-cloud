@@ -35,7 +35,7 @@ import (
 	"mini-cloud/internal/webdav"
 )
 
-const version = "v1.2.0-beta" // Phase 2 完成（真机验收全部通过并合入 master；≥1 个月观察后升正式版 v1.2.0）
+const version = "v1.3.0-beta" // 批 1+批 2 完成（闸门⑤ 真机验收通过；≥1 个月观察后升正式版 v1.3.0）
 
 // MountRuntime 挂载运行时状态（DESIGN-2026-11-24-01 §4.2）：
 // 状态表 = 全部配置挂载（首页/管理页渲染源）；数据路由仅注册 Available 挂载。
