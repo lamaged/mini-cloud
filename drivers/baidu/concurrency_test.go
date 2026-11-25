@@ -228,3 +228,82 @@ func TestSaveTokenConcurrent(t *testing.T) {
 		t.Errorf("残留临时文件: %s", e)
 	}
 }
+
+// TestRefreshInFlightBeatsStaleFailure 审核 P1-D（RV-2026-11-25-05）：
+// 旧失败记录仍在（60s 窗口内），但新一轮已在途——并发请求必须加入本轮、
+// 拿到本轮成功结果，而不是被旧错误打发走。断言：全部成功 + 上游仅 1 次请求。
+func TestRefreshInFlightBeatsStaleFailure(t *testing.T) {
+	var mu sync.Mutex
+	reqs := 0
+	firstDone := make(chan struct{})
+	blockSecond := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		reqs++
+		n := reqs
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		switch n {
+		case 1:
+			// 第一次：失败（制造旧失败记录）
+			json.NewEncoder(w).Encode(map[string]string{"error": "server_error", "error_description": "临时故障"})
+		case 2:
+			// 第二轮：阻塞（确保并发请求在此期间进入）
+			close(firstDone)
+			<-blockSecond
+			json.NewEncoder(w).Encode(map[string]interface{}{"access_token": "at-fresh", "expires_in": 2592000})
+		default:
+			json.NewEncoder(w).Encode(map[string]interface{}{"access_token": "at-fresh", "expires_in": 2592000})
+		}
+	}))
+	defer ts.Close()
+
+	d := newTestDriver(t.TempDir())
+	d.client.tokenURL = ts.URL
+	d.SetCredentialGeneration(1)
+
+	// 第一次失败 → lastRefreshErr 记录
+	if err := d.RefreshToken(context.Background()); err == nil {
+		t.Fatal("第一次应失败")
+	}
+	// 拨过 60s 限频窗口：允许开新一轮
+	d.refreshMu.Lock()
+	d.lastRefreshAt = time.Now().Add(-2 * time.Minute)
+	d.refreshMu.Unlock()
+
+	// 启动第二轮（阻塞在端点上；期间旧错误仍在 lastRefreshErr 中）
+	leaderDone := make(chan error, 1)
+	go func() { leaderDone <- d.RefreshToken(context.Background()) }()
+	<-firstDone // 第二轮已到达端点并阻塞
+
+	// 第二轮在途期间的并发请求：必须加入本轮（旧代码会因旧失败限频直接返回旧错误）
+	const n = 8
+	results := make([]error, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			results[i] = d.RefreshToken(context.Background())
+		}(i)
+	}
+	// 等并发请求全部进入（卡在 rf.done 上）
+	time.Sleep(100 * time.Millisecond)
+
+	close(blockSecond) // 释放第二轮
+	if err := <-leaderDone; err != nil {
+		t.Fatalf("第二轮应成功: %v", err)
+	}
+	wg.Wait()
+
+	for i, e := range results {
+		if e != nil {
+			t.Errorf("并发请求 %d 应拿到本轮成功结果而非旧失败: %v", i, e)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if reqs != 2 {
+		t.Errorf("旧失败 + 新一轮在途：上游应只被打 2 次（1 次失败 + 1 次共享成功）：reqs=%d", reqs)
+	}
+}

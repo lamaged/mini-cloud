@@ -108,11 +108,9 @@ func (d *Driver) SetRotationPersist(fn func(ctx context.Context, expectedGen int
 // 落盘失败 = 严重错误（§6.6.4/§6.10），内存不提交新值、健康事实报存储异常（红）。
 func (d *Driver) refreshSingleFlight(ctx context.Context) error {
 	d.refreshMu.Lock()
-	if d.lastRefreshErr != nil && time.Since(d.lastRefreshAt) < time.Minute {
-		err := d.lastRefreshErr // 限频窗口内：复用失败结果，防刷新风暴
-		d.refreshMu.Unlock()
-		return err
-	}
+	// P1-D（RV-2026-11-25-05）：在途刷新优先于旧失败限频——若先判限频，
+	// 旧失败记录会拦下本应加入在途新一轮的请求（A 开新轮刷新了时间戳、
+	// 旧错误仍在窗口内，B 拿到旧失败结果，即使 A 最终成功也与 B 无关）
 	if d.refreshInFlight != nil {
 		rf := d.refreshInFlight // P1-A①：捕获本轮结果对象，醒来直接读它，不查全局
 		d.refreshMu.Unlock()
@@ -122,6 +120,11 @@ func (d *Driver) refreshSingleFlight(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		}
+	}
+	if d.lastRefreshErr != nil && time.Since(d.lastRefreshAt) < time.Minute {
+		err := d.lastRefreshErr // 无在途刷新且失败未过 60s：复用失败结果，防刷新风暴
+		d.refreshMu.Unlock()
+		return err
 	}
 	rf := &refreshResult{done: make(chan struct{})}
 	d.refreshInFlight = rf
