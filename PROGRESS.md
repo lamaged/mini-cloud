@@ -17,6 +17,7 @@
 
 | 日期 | 事项 |
 |---|---|
+| 2026-11-25 | **批 1 真机验收进行中（PM 实测）**：部署成功（UPX 3,036,072 B）；A/B 场景多组合通过——百度未授权红色 + 其他挂载照常（隔离铁证，含删 state/改凭证组合）；管理页失败挂载保留输入框与原因（D1 实测）；假票验证拒绝零变化；红卡 404 反馈 → PM 拍板改为不可点卡片（已实现+测试，待真机复验）；移动 authorization 篡改测试结果存疑（解析代码核对：篡改必然红或失败，「黑色+正常下载」说明该次编辑未生效——待 PM 干净复测）；C01 真票恢复顺延批 2（PM 拍板）；待：移动失效复测、红卡复验、探测自动转红观察、重启按钮设计决策 |
 | 2026-11-24 | **批 1 安全审核完成（RV-2026-11-24-06）**：三阶段流程（候选识别→独立误报过滤验证→置信度筛选）——1 项 HIGH 确认（探测错误原文回显 /admin 泄露百度 access_token，与 exchangeToken 同类缺陷的残留）已双层修复（驱动侧 apiGet 网络错误脱敏 + 应用侧 classifyProbeErr 分类短语不存原文）+ 测试 4 组；1 项过滤（挂载名 vs ServeMux 模式语法，命中 DoS/可用性硬排除）仍按建议随同加固（validateMounts 拒绝空格/{} /%）；go vet + `go test -race` 全绿、ARM64/Windows 交叉编译通过；闸门③（代码审核 + 安全审核）**全部结案**，待针对性复核后进入闸门⑤ AX6 真机验收 |
 | 2026-11-24 | **批 1 代码审核复核通过（闸门③ 代码审核结案）**：RV-2026-11-24-05 四条（2 阻断 + 2 收口）复核通过全部关闭；非阻断建议 2 条随关闭落库——S1 7 天临界值测试（synthesizeStatus 拆出注入 now 的 synthesizeStatusAt 消除墙钟误差，恰好 7 天黑 / ±1 秒黄黑）；S2 管理页注册回归测试（抽取 registerAdminRoutes，无更新能力 /admin 404、有更新能力注册 401）；go vet + `go test -race` 全绿、ARM64/Windows 交叉编译通过；**闸门③ 待 security-review**（另行安排），之后闸门④ 已实质达标（vet/race/httptest）、闸门⑤ AX6 真机验收 |
 | 2026-11-24 | **批 1 代码审核第一轮处置完成（RV-2026-11-24-05，2 阻断 + 2 收口全闭环）**：①合成规则补 ExpiresAt 临近过期判定（<7 天黄，AuthExpired 优先，探测成功不洗黄）+ 边界测试 5 组；②exchangeToken 网络错误脱敏（redactSecrets 双形式替换，覆盖 Init/Validate/管理页传播链）+ 泄露断言测试；③WriteCredential 删原始值回退（缺 __refresh_token fail-fast 不备份不写盘）+ 配置不变测试；④管理页注册收紧（hasUpdater 控制 /admin 路由与首页链接）；go vet + `go test -race` 全绿、ARM64/Windows 交叉编译通过；待针对性复核后闸门③ 收尾（security-review 另行安排） |

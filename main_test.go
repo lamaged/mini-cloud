@@ -114,6 +114,16 @@ func TestServeRootIndexColors(t *testing.T) {
 			t.Errorf("missing color class %q: %s", want, body)
 		}
 	}
+	// 红卡不可点击（PM 拍板 2026-11-25）：不可用挂载渲染为不可点的 div，不带链接
+	if !strings.Contains(body, `<div class="card nolink">`) {
+		t.Errorf("unavailable mount should render as non-clickable div: %s", body)
+	}
+	if strings.Contains(body, `href="/baidu/"`) {
+		t.Errorf("unavailable mount must not be a link: %s", body)
+	}
+	if !strings.Contains(body, `href="/mobile/"`) || !strings.Contains(body, `href="/tianyi/"`) {
+		t.Errorf("healthy/warning mounts should remain links: %s", body)
+	}
 	// 全部失败（A04）也要能看到每个挂载：名字仍在页面中
 	if !strings.Contains(body, "已配置 3 个云盘") {
 		t.Errorf("expected configured count, got: %s", body)

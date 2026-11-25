@@ -639,6 +639,8 @@ body{font-family:sans-serif;max-width:600px;margin:40px auto;padding:0 20px}
 h1{font-size:22px;border-bottom:2px solid #0366d6;padding-bottom:10px}
 .card{display:block;padding:16px 20px;margin:12px 0;border:1px solid #ddd;border-radius:8px;text-decoration:none;color:#333}
 .card:hover{background:#f6f8fa;border-color:#0366d6}
+.card.nolink{cursor:default}
+.card.nolink:hover{background:inherit;border-color:#ddd}
 .card .name{font-size:18px;font-weight:bold}
 .card .name.ok{color:#333}
 .card .name.warning{color:#b26a00}
@@ -665,6 +667,14 @@ h1{font-size:22px;border-bottom:2px solid #0366d6;padding-bottom:10px}
 		}
 		label := displayName(m)
 		href := webdav.EncodePathSegments(m.Prefix) + "/"
+		if st == statusUnavailable {
+			// 红卡不可点击（PM 拍板 2026-11-25）：失败挂载无数据路由，点击必 404
+			fmt.Fprintf(w, `<div class="card nolink">
+<div class="name %s">%s</div>
+<div class="desc">%s</div>
+</div>`, color, html.EscapeString(label), html.EscapeString(href))
+			continue
+		}
 		fmt.Fprintf(w, `<a class="card" href="%s">
 <div class="name %s">%s</div>
 <div class="desc">%s</div>
