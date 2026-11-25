@@ -445,7 +445,7 @@ func TestOAuthFinishHappyPath(t *testing.T) {
 	})
 	csrf := fetchCSRF(t, h)
 
-	form := url.Values{"csrf": {csrf}, "mount": {"百度"}, "url": {"https://x/callback?code=c1&state=s1"}}
+	form := url.Values{"csrf": {csrf}, "mount": {"百度"}, "code": {"c1"}, "url": {"https://x/callback?state=s1"}}
 	req := httptest.NewRequest("POST", "/admin/oauth/finish", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rec := httptest.NewRecorder()
@@ -479,15 +479,20 @@ func TestOAuthFinishBadURL(t *testing.T) {
 		return func() error { return nil }, nil
 	})
 
-	for _, bad := range []string{"not-a-url", "https://x/callback?code=c1"} { // 缺 state
+	badCases := []struct{ code, rawURL string }{
+		{"", "https://x/callback?state=s1"}, // 缺授权码
+		{"c1", ""},                          // 缺网址（无防伪串）
+		{"c1", "not-a-url"},                 // 网址无效（无防伪串）
+	}
+	for _, bc := range badCases {
 		csrf := fetchCSRF(t, h) // 一次性令牌，每次重新取
-		form := url.Values{"csrf": {csrf}, "mount": {"百度"}, "url": {bad}}
+		form := url.Values{"csrf": {csrf}, "mount": {"百度"}, "code": {bc.code}, "url": {bc.rawURL}}
 		req := httptest.NewRequest("POST", "/admin/oauth/finish", strings.NewReader(form.Encode()))
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		rec := httptest.NewRecorder()
 		h.OAuthFinish(rec, req)
-		if !strings.Contains(rec.Body.String(), "缺少") && !strings.Contains(rec.Body.String(), "无效") {
-			t.Errorf("坏网址应明确报错: %s", rec.Body.String())
+		if !strings.Contains(rec.Body.String(), "缺少") {
+			t.Errorf("缺码/缺防伪串应明确报错: %s", rec.Body.String())
 		}
 	}
 	if persisted {
@@ -508,7 +513,7 @@ func TestOAuthExchangeFailureNoPersist(t *testing.T) {
 	})
 	csrf := fetchCSRF(t, h)
 
-	form := url.Values{"csrf": {csrf}, "mount": {"百度"}, "url": {"https://x/callback?code=c1&state=s1"}}
+	form := url.Values{"csrf": {csrf}, "mount": {"百度"}, "code": {"c1"}, "url": {"https://x/callback?state=s1"}}
 	req := httptest.NewRequest("POST", "/admin/oauth/finish", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rec := httptest.NewRecorder()

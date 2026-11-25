@@ -253,15 +253,22 @@ func (h *Handler) OAuthFinish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	u, err := url.Parse(strings.TrimSpace(r.PostFormValue("url")))
-	if err != nil || u.RawQuery == "" {
-		h.renderOAuth(w, m.Name, "", "", "粘贴的网址无效，请复制浏览器地址栏的完整网址")
+	// Q2 实测（2026-11-25 真机）：oob 模式下百度在页面内以文字展示授权码，
+	// 地址栏 URL 不含 code 但保留 state——回填改为「授权码 + 网址」两个输入：
+	// code 来自码框、state 取自网址（码成对校验保持，I5）
+	code := strings.TrimSpace(r.PostFormValue("code"))
+	state := ""
+	if rawURL := strings.TrimSpace(r.PostFormValue("url")); rawURL != "" {
+		if u, err := url.Parse(rawURL); err == nil {
+			state = u.Query().Get("state")
+		}
+	}
+	if code == "" {
+		h.renderOAuth(w, m.Name, "", "", "缺少授权码：请先在百度页面点「复制授权码」，把码粘贴到输入框")
 		return
 	}
-	q := u.Query()
-	code, state := q.Get("code"), q.Get("state")
-	if code == "" || state == "" {
-		h.renderOAuth(w, m.Name, "", "", "网址中缺少授权码或防伪串，请确认复制了完整地址")
+	if state == "" {
+		h.renderOAuth(w, m.Name, "", "", "缺少防伪串（state）：请复制浏览器地址栏的完整网址一并粘贴")
 		return
 	}
 
@@ -342,7 +349,8 @@ h1{font-size:20px;border-bottom:2px solid #0366d6;padding-bottom:10px}
 .card h2{margin:0 0 6px;font-size:17px}
 .path{color:#666;font-weight:normal;font-size:13px}
 label{display:block;margin:10px 0 4px;font-size:14px;color:#333}
-input[type=password],input[type=text]{width:100%;box-sizing:border-box;padding:8px;border:1px solid #ccc;border-radius:4px;font-size:14px}
+input[type=password],label{display:block;margin:10px 0 4px;font-size:14px;color:#333}
+input[type=text]{width:100%;box-sizing:border-box;padding:8px;border:1px solid #ccc;border-radius:4px;font-size:14px}
 button{margin-top:12px;padding:8px 22px;background:#0366d6;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:14px}
 a{color:#0366d6}
 </style></head><body>
@@ -413,6 +421,7 @@ body{font-family:sans-serif;max-width:640px;margin:30px auto;padding:0 20px}
 h1{font-size:20px;border-bottom:2px solid #0366d6;padding-bottom:10px}
 .err{color:#b00020;background:#fdecea;padding:10px;border-radius:6px}
 .ok{color:#1b5e20;background:#e8f5e9;padding:10px;border-radius:6px}
+label{display:block;margin:10px 0 4px;font-size:14px;color:#333}
 input[type=text]{width:100%;box-sizing:border-box;padding:8px;border:1px solid #ccc;border-radius:4px;font-size:14px}
 button{margin-top:12px;padding:8px 22px;background:#0366d6;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:14px}
 a{color:#0366d6}
@@ -422,11 +431,14 @@ a{color:#0366d6}
 {{if .Message}}<p class="ok">{{.Message}}</p>{{end}}
 {{if .AuthURL}}
 <p>第 1 步：<a href="{{.AuthURL}}" target="_blank" rel="noopener">点此打开百度授权页</a>（新标签页打开并登录、点同意）</p>
-<p>第 2 步：授权完成后，复制浏览器<b>地址栏的完整网址</b>（里面带着授权码），粘贴到下面：</p>
+<p>第 2 步：百度页面会显示一个<b>授权码</b>（一次性、10 分钟有效）——点页面上的「复制授权码」，把码粘到下面；再把浏览器<b>地址栏的完整网址</b>也粘上（用于防伪校验）：</p>
 <form method="POST" action="/admin/oauth/finish">
 <input type="hidden" name="csrf" value="{{.CSRF}}">
 <input type="hidden" name="mount" value="{{.Mount}}">
-<input type="text" name="url" placeholder="粘贴完整网址" required>
+<label>授权码</label>
+<input type="text" name="code" placeholder="粘贴百度页面显示的授权码" required>
+<label>浏览器地址栏网址</label>
+<input type="text" name="url" placeholder="粘贴地址栏完整网址" required>
 <button type="submit">完成授权</button>
 </form>
 {{end}}
