@@ -481,7 +481,7 @@ a{color:#0366d6}
 </style></head><body>
 <h1>☁️ mini-cloud</h1>
 <p class="ok">正在重启服务，请稍候几秒后刷新页面……</p>
-<p>若 1 分钟后仍未恢复，请 SSH 登录路由器执行 <code>/etc/init.d/mini-cloud restart</code>。</p>
+<p>若 1 分钟后仍未恢复，请 SSH 登录路由器手工重启 mini-cloud 进程。</p>
 <p><a href="/">返回首页</a></p>
 </body></html>
 `))

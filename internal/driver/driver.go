@@ -36,12 +36,13 @@ type TokenManager interface {
 	RefreshToken(ctx context.Context) error
 }
 
-// DriverHealth 驱动健康事实（v1.3.0 批 1，DESIGN-2026-11-24-01 §5.2）。
+// DriverHealth 驱动健康事实（v1.3.0，DESIGN-2026-11-24-01 §5.2）。
 // 驱动只报事实、不报最终健康结论——红黄黑由应用层统一合成（全项目唯一判定规则）。
 type DriverHealth struct {
-	Warning     string     // 人读警告文案（如「刷新失败，会话暂可用」）；空 = 无警告
-	ExpiresAt   *time.Time // 凭据到期时间（驱动能可靠解析时提供）
-	AuthExpired bool       // 凭据已失效/不可恢复（区别于「临近到期」；优先级最高，探测成功不得覆盖）
+	Warning       string     // 人读警告文案（如「刷新失败，会话暂可用」）；空 = 无警告
+	ExpiresAt     *time.Time // 凭据到期时间（驱动能可靠解析时提供）
+	AuthExpired   bool       // 凭据已失效/不可恢复（区别于「临近到期」；优先级最高，探测成功不得覆盖）
+	StorageFailed bool       // 本地存储异常（如轮换写回配置失败；红，区别于凭据失效，批 2 审核 P2-1）
 }
 
 // HealthReporter 健康报告（可选接口，云盘驱动可实现此接口向应用层上报健康事实）

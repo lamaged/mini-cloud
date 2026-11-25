@@ -172,3 +172,86 @@ func mustQuery(t *testing.T, rawURL string) url.Values {
 	}
 	return u.Query()
 }
+
+// TestInitCacheReuseByGeneration 批 2（§6.5 + 审核 P1-2）：缓存复用条件——
+// V=1 且代次匹配 → 复用；代次不符 → 重新兑换（token 端点不请求 = 缓存命中）。
+func TestInitCacheReuseByGeneration(t *testing.T) {
+	// 代次匹配 → 复用缓存
+	dir := t.TempDir()
+	if err := SaveToken("百度", dir, &TokenState{V: 1, AccessToken: "at-cached", ExpiresAt: time.Now().Unix() + 3600, CredentialGeneration: 3}); err != nil {
+		t.Fatal(err)
+	}
+	d := New("百度", "rt-config", "cid", "cs", dir)
+	apiTS := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]int{"errno": 0})
+	}))
+	defer apiTS.Close()
+	d.client.baseURL = apiTS.URL
+	// token 端点为已关闭服务器：缓存命中时不得被请求（哨兵）
+	tokenTS := newFakeTokenServer(t, false, false, nil)
+	tokenTS.Close()
+	d.client.tokenURL = tokenTS.URL
+	d.SetCredentialGeneration(3)
+
+	if err := d.Init(context.Background()); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if got := d.client.getAccessToken(); got != "at-cached" {
+		t.Errorf("代次匹配应复用缓存: %q, want at-cached", got)
+	}
+
+	// 代次不符 → 重新兑换
+	dir2 := t.TempDir()
+	if err := SaveToken("百度", dir2, &TokenState{V: 1, AccessToken: "at-stale", ExpiresAt: time.Now().Unix() + 3600, CredentialGeneration: 2}); err != nil {
+		t.Fatal(err)
+	}
+	d2 := New("百度", "rt-config", "cid", "cs", dir2)
+	tokenTS2 := newFakeTokenServer(t, false, false, nil)
+	defer tokenTS2.Close()
+	d2.client.tokenURL = tokenTS2.URL
+	d2.SetCredentialGeneration(3)
+
+	if err := d2.Init(context.Background()); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if got := d2.client.getAccessToken(); got != "at-fresh" {
+		t.Errorf("代次不符应重新兑换: %q, want at-fresh", got)
+	}
+}
+
+// TestLinkErrorRedacted 审核 I1（RV-2026-11-25-02）：Link 网络错误文本不得含 access_token
+// （dlink URL 携带令牌，url.Error 会经 webdav 进日志）。
+func TestLinkErrorRedacted(t *testing.T) {
+	d := newTestDriver(t.TempDir())
+	d.client.SetAccessToken("at-sec/ret+1==")
+	dl := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	dl.Close() // 下载端点已关闭 → Do 网络失败
+
+	apiTS := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/file"):
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"errno": 0,
+				"list":  []map[string]interface{}{{"server_filename": "f.mkv", "isdir": 0, "fs_id": 1, "size": 10}},
+			})
+		case strings.Contains(r.URL.Path, "/multimedia"):
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"errno": 0,
+				// 真实 dlink 带查询串；Link 会追加 &access_token=（无查询串时 URL 非法）
+				"list": []map[string]interface{}{{"dlink": dl.URL + "?x=1"}},
+			})
+		}
+	}))
+	defer apiTS.Close()
+	d.client.baseURL = apiTS.URL
+
+	_, err := d.Link(context.Background(), "/f.mkv")
+	if err == nil {
+		t.Fatal("下载端点已关闭，应报错")
+	}
+	for _, s := range []string{"at-sec/ret+1==", url.QueryEscape("at-sec/ret+1==")} {
+		if strings.Contains(err.Error(), s) {
+			t.Errorf("Link 错误泄露 access_token %q：%s", s, err.Error())
+		}
+	}
+}

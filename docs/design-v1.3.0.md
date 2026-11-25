@@ -371,8 +371,8 @@ type HealthReporter interface {
 
 - 行为：`POST /admin/restart`（Basic Auth + CSRF，复用现有防护）→ 页面提示「正在重启」→ 约 1 秒后进程**原地重启自身**（`syscall.Exec` 执行 `/proc/self/exe` + 原启动参数）：PID 不变、日志文件描述符继承（日志连续）、init.d 的 PID_FILE/RUN_FLAG 继续有效。
 - 安全：不执行任何外部命令、不接受任何用户输入；仅认证管理员可触发（其本可通过 SSH 重启，不新增权限面）；无 CSRF 令牌或未认证一律拒绝。
-- 兜底：`syscall.Exec` 失败（个别文件系统限制）→ 页面如实提示手工重启命令，不得假装成功。
-- 验收：①点击重启后服务恢复（日志「Gateway 启动」+ 首页可访问）；②未认证/无 CSRF → 拒绝；③重启后 PID 不变、`/etc/init.d/mini-cloud stop/start` 仍可用；④AX6 真机走通。
+- 兜底：`syscall.Exec` 失败（个别文件系统限制）→ 页面如实提示手工重启（中性文案，不硬编码设备侧管理脚本路径——审核 P2-2：实际部署由设备侧统一进程管理）。
+- 验收：①点击重启后服务恢复（日志「Gateway 启动」+ 首页可访问）；②未认证/无 CSRF → 拒绝；③重启后 PID 不变、设备侧进程管理脚本仍可用；④AX6 真机走通。
 
 ---
 

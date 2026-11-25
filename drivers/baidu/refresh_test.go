@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -46,8 +47,8 @@ func TestRefreshRotationPersistsConfig(t *testing.T) {
 		t.Errorf("内存 access_token = %q, want at-fresh", got)
 	}
 	tok, err := LoadToken("百度", d.stateDir)
-	if err != nil || tok.RefreshToken != "rt-rotated" {
-		t.Errorf("state 缓存应落盘: %+v, %v", tok, err)
+	if err != nil || tok.V != 1 || tok.AccessToken != "at-fresh" || tok.CredentialGeneration != 3 {
+		t.Errorf("state 缓存应落盘（V=1、access、代次 3）: %+v, %v", tok, err)
 	}
 }
 
@@ -155,8 +156,8 @@ func TestRefreshPersistFailureKeepsOldMemory(t *testing.T) {
 		t.Errorf("落盘失败不得提交内存新值：got %q, want rt-input", got)
 	}
 	h := d.Health()
-	if h.Warning == "" {
-		t.Error("写回失败应记录健康警告")
+	if h.Warning == "" || !h.StorageFailed {
+		t.Errorf("写回失败应报存储异常红事实（审核 P2-1）: %+v", h)
 	}
 }
 
@@ -212,5 +213,51 @@ func TestRefreshTokenUsesCtx(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "context deadline") == false {
 		t.Errorf("应为超时错误: %v", err)
+	}
+}
+
+// TestRefreshInFlightShared 审核 P1-1：N 并发刷新 → token 端点仅 1 次请求，全部复用结果。
+func TestRefreshInFlightShared(t *testing.T) {
+	var mu sync.Mutex
+	reqs := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		reqs++
+		mu.Unlock()
+		time.Sleep(100 * time.Millisecond) // 拉长窗口，确保并发等待者同时到达
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{"access_token": "at-fresh", "refresh_token": "rt-rotated", "expires_in": 2592000})
+	}))
+	defer ts.Close()
+
+	d := newTestDriver(t.TempDir())
+	d.client.tokenURL = ts.URL
+	d.SetCredentialGeneration(3)
+	d.SetRotationPersist(func(ctx context.Context, g int, rt string) error { return nil })
+
+	const n = 10
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs[i] = d.RefreshToken(context.Background())
+		}(i)
+	}
+	wg.Wait()
+
+	for i, e := range errs {
+		if e != nil {
+			t.Fatalf("并发刷新 %d 失败: %v", i, e)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if reqs != 1 {
+		t.Errorf("N 并发刷新应只打 1 次端点：reqs=%d", reqs)
+	}
+	if got := d.getRefreshToken(); got != "rt-rotated" {
+		t.Errorf("内存 refresh_token = %q, want rt-rotated", got)
 	}
 }

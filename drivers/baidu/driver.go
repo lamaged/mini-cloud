@@ -40,16 +40,18 @@ type Driver struct {
 	oauthStates map[string]time.Time
 
 	// 批 2（DESIGN-2026-11-24-01 §6.5/§6.6）：刷新互斥（单飞）+ 限频 + 轮换写回
-	refreshMu     sync.Mutex
-	lastRefreshAt time.Time                    // 最近一次刷新尝试时间（限频窗口）
-	lastRefreshErr error                      // 最近一次刷新失败（60s 内复用，防刷新风暴）
-	credGen       atomic.Int64                // 当前授权代次（main 注入；轮换写回时防迟到覆盖；原子：写回回调内可改）
+	refreshMu      sync.Mutex
+	lastRefreshAt  time.Time                    // 最近一次刷新尝试时间（限频窗口）
+	lastRefreshErr error                        // 最近一次刷新失败（60s 内复用，防刷新风暴）
+	refreshInFlight *refreshResult              // 在途刷新结果（并发等待者复用，审核 P1-1）
+	credGen       atomic.Int64                  // 当前授权代次（main 注入；轮换写回时防迟到覆盖；原子：写回回调内可改）
 	rotatePersist func(ctx context.Context, expectedGen int, newRefreshToken string) error // main 注入：轮换原子写回 config
 
-	// 健康事实（§6.10）：刷新失败但会话可用 → 黄；不可恢复失效 → 红
-	healthMu  sync.Mutex
-	authDead  bool   // refresh_token 不可恢复失效（需重新授权）
-	warnText  string // 警告文案
+	// 健康事实（§6.10）：刷新失败但会话可用 → 黄；不可恢复失效 → 红；存储异常 → 红
+	healthMu     sync.Mutex
+	authDead     bool   // refresh_token 不可恢复失效（需重新授权）
+	storageBad   bool   // 本地配置写回失败（存储异常，审核 P2-1）
+	warnText     string // 警告文案
 }
 
 // New 创建百度网盘驱动（client_id/client_secret 必填，无内置默认值——
@@ -99,36 +101,83 @@ func (d *Driver) SetRotationPersist(fn func(ctx context.Context, expectedGen int
 	d.refreshMu.Unlock()
 }
 
-// refreshSingleFlight 刷新单飞（§6.6.1）：401 回调、后台 watcher、Init 共用同一把锁；
+// refreshSingleFlight 刷新单飞 + 结果共享（§6.6.1 + 审核 P1-1）：首个进入者执行兑换，
+// 其余并发者在锁外等待其结果复用（N 并发 → token 端点仅 1 次请求）；
 // 限频（§6.6.7）：失败后 60s 内复用失败结果，不打上游；
 // 轮换（§6.5）：先写回 config（代次不符则跳过，防迟到覆盖）→ 成功才提交内存；
-// 落盘失败 = 严重错误（§6.6.4），内存不提交新值。
+// 落盘失败 = 严重错误（§6.6.4/§6.10），内存不提交新值、健康事实报存储异常（红）。
 func (d *Driver) refreshSingleFlight(ctx context.Context) error {
 	d.refreshMu.Lock()
-	defer d.refreshMu.Unlock()
-
 	if d.lastRefreshErr != nil && time.Since(d.lastRefreshAt) < time.Minute {
-		return d.lastRefreshErr // 限频窗口内：复用失败结果，防刷新风暴
+		err := d.lastRefreshErr // 限频窗口内：复用失败结果，防刷新风暴
+		d.refreshMu.Unlock()
+		return err
 	}
+	if d.refreshInFlight != nil {
+		ch := d.refreshInFlight.done
+		d.refreshMu.Unlock()
+		select {
+		case <-ch:
+			return d.inFlightResult()
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	rf := &refreshResult{done: make(chan struct{})}
+	d.refreshInFlight = rf
 	d.lastRefreshAt = time.Now()
-
 	gen := int(d.credGen.Load())
 	rt := d.getRefreshToken()
-	access, newRT, expiresIn, err := d.client.exchangeToken(ctx, rt, d.clientID, d.clientSecret)
+	d.refreshMu.Unlock()
+
+	// 真正执行（不持 refreshMu：提交/代次同步可与在途刷新交错，靠写回复检丢弃迟到结果）
+	err := d.doRefresh(ctx, gen, rt)
+
+	d.refreshMu.Lock()
+	rf.err = err
+	close(rf.done)
+	d.refreshInFlight = nil
 	if err != nil {
 		d.lastRefreshErr = err
+	}
+	d.refreshMu.Unlock()
+	return err
+}
+
+// refreshResult 在途刷新结果（并发等待者复用）
+type refreshResult struct {
+	done chan struct{}
+	err  error
+}
+
+// inFlightResult 读取在途刷新结果（调用方须持/曾持 refreshMu 保证 done 已关闭）
+func (d *Driver) inFlightResult() error {
+	d.refreshMu.Lock()
+	defer d.refreshMu.Unlock()
+	if d.refreshInFlight != nil {
+		return fmt.Errorf("刷新仍在进行")
+	}
+	// 结果已合并进 lastRefreshErr / 健康事实；成功时无错误
+	if d.lastRefreshErr != nil && time.Since(d.lastRefreshAt) < time.Minute {
+		return d.lastRefreshErr
+	}
+	return nil
+}
+
+// doRefresh 执行一次刷新：兑换 →（轮换则写回 config）→ 代次复检 → 提交内存 → 缓存落盘
+func (d *Driver) doRefresh(ctx context.Context, gen int, rt string) error {
+	access, newRT, expiresIn, err := d.client.exchangeToken(ctx, rt, d.clientID, d.clientSecret)
+	if err != nil {
 		d.recordRefreshFailure(err)
 		return err
 	}
-	d.lastRefreshErr = nil
 	d.clearRefreshFailure()
 
 	if newRT != "" {
 		persist := d.rotatePersist
 		if persist != nil {
 			if err := persist(ctx, gen, newRT); err != nil {
-				d.lastRefreshErr = err
-				d.recordRefreshFailure(fmt.Errorf("轮换写回配置失败: %w", err))
+				d.recordStorageFailure()
 				return err
 			}
 		}
@@ -145,9 +194,10 @@ func (d *Driver) refreshSingleFlight(ctx context.Context) error {
 
 	// state 为纯缓存（§6.5）：写失败仅告警，access_token 丢失下次重新兑换
 	if err := SaveToken(d.name, d.stateDir, &TokenState{
-		RefreshToken: d.getRefreshToken(),
-		AccessToken:  access,
-		ExpiresAt:    time.Now().Unix() + int64(expiresIn),
+		V:                   1,
+		AccessToken:         access,
+		ExpiresAt:           time.Now().Unix() + int64(expiresIn),
+		CredentialGeneration: gen,
 	}); err != nil {
 		slog.Warn("保存 token 缓存失败（state 为纯缓存，下次重新兑换）", "err", err)
 	}
@@ -173,28 +223,42 @@ func (d *Driver) recordRefreshFailure(err error) {
 	if classifyBaiduRefreshErr(err) {
 		d.authDead = true
 		d.warnText = "百度授权已失效，需要重新授权（管理页粘贴 refresh_token 或一键授权）"
-	} else if !d.authDead {
+	} else if !d.authDead && !d.storageBad {
 		d.warnText = "百度自动刷新失败，当前会话暂可用"
 	}
+}
+
+// recordStorageFailure 轮换写回 config 失败（§6.10 + 审核 P2-1：红「存储异常」，区别于暂败黄）
+func (d *Driver) recordStorageFailure() {
+	d.healthMu.Lock()
+	defer d.healthMu.Unlock()
+	d.storageBad = true
+	d.warnText = "本地配置写入失败（存储异常），请检查路由器存储空间后重启重试"
 }
 
 // clearRefreshFailure 清除刷新失败事实（刷新成功 / 用户提交新凭证后）
 func (d *Driver) clearRefreshFailure() {
 	d.healthMu.Lock()
 	d.authDead = false
+	d.storageBad = false
 	d.warnText = ""
 	d.healthMu.Unlock()
 }
 
-// Health 健康事实（批 2 §6.10）：AuthExpired = 不可恢复失效（红）；Warning = 暂败（黄）。
+// Health 健康事实（批 2 §6.10）：AuthExpired = 不可恢复失效（红）；
+// StorageFailed = 本地存储异常（红）；Warning = 暂败（黄）。
 func (d *Driver) Health() driver.DriverHealth {
 	d.healthMu.Lock()
 	defer d.healthMu.Unlock()
 	h := driver.DriverHealth{}
-	if d.authDead {
+	switch {
+	case d.authDead:
 		h.AuthExpired = true
 		h.Warning = d.warnText
-	} else if d.warnText != "" {
+	case d.storageBad:
+		h.StorageFailed = true
+		h.Warning = d.warnText
+	case d.warnText != "":
 		h.Warning = d.warnText
 	}
 	return h
@@ -220,7 +284,10 @@ func (d *Driver) Init(ctx context.Context) error {
 	}
 
 	token, err := LoadToken(d.name, d.stateDir)
-	if err == nil && token != nil && token.RefreshToken == d.getRefreshToken() {
+	// 缓存复用条件（§6.5 批 2）：新格式（V==1）且缓存代次 == 当前授权代次——
+	// 用户提交新凭据代次 +1 → 缓存自动失配重新兑换（D2 重启恢复）；
+	// 旧格式（V==0，曾存 refresh_token）一律视为过期缓存
+	if err == nil && token != nil && token.V == 1 && token.CredentialGeneration == int(d.credGen.Load()) {
 		d.client.SetAccessToken(token.AccessToken)
 		errno, _ := d.client.apiGetWithErrno("/nas", map[string]string{"method": "uinfo"}, nil)
 		if errno == 0 {
@@ -319,7 +386,9 @@ func (d *Driver) Link(ctx context.Context, filePath string) (*model.Link, error)
 
 	resp, err := d.client.httpClient.Do(req)
 	if err != nil {
-		return nil, err
+		// 脱敏（审核 I1，RV-2026-11-25-02）：dlink URL 含 access_token，
+		// url.Error 文本会经 webdav 进日志——与 API/token 链路同款 redactSecrets
+		return nil, fmt.Errorf("%s", redactSecrets(err.Error(), d.client.getAccessToken()))
 	}
 
 	hdr := http.Header{}

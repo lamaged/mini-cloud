@@ -143,7 +143,8 @@ func TestCommitCredentialAppliesAndRotates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("state 应已落盘: %v", err)
 	}
-	if tok.RefreshToken != "rt-rotated" || tok.AccessToken != "at-fresh" {
+	// 批 2 §6.5：state 为纯缓存——只存 access/过期/格式版本/代次，不含 refresh_token
+	if tok.V != 1 || tok.AccessToken != "at-fresh" || tok.CredentialGeneration != 0 {
 		t.Errorf("state 内容不符: %+v", tok)
 	}
 
@@ -193,12 +194,12 @@ func TestInitMissingAppCredentialsAndAuth(t *testing.T) {
 	}
 }
 
-// TestInitConfigWinsOverStaleCache 防旧缓存覆盖新授权（D2 重启恢复）：
-// state 中 refresh_token 与 config 不一致时不得复用缓存会话，应以 config 为准重新交换。
-func TestInitConfigWinsOverStaleCache(t *testing.T) {
+// TestInitStaleCacheNotReused 批 2（§6.5）：旧格式缓存（V=0，曾存 refresh_token）
+// 或代次不符的缓存不得复用——应重新兑换（D2 重启恢复）。
+func TestInitStaleCacheNotReused(t *testing.T) {
 	dir := t.TempDir()
-	// 预置旧缓存（不同 refresh_token + 看似有效的 access_token）
-	if err := SaveToken("百度", dir, &TokenState{RefreshToken: "rt-old", AccessToken: "at-old", ExpiresAt: time.Now().Unix() + 3600}); err != nil {
+	// 预置旧格式缓存（无 V 字段 = 0；看似有效的 access_token）
+	if err := SaveToken("百度", dir, &TokenState{AccessToken: "at-old", ExpiresAt: time.Now().Unix() + 3600}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -210,9 +211,9 @@ func TestInitConfigWinsOverStaleCache(t *testing.T) {
 	if err := d.Init(context.Background()); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
-	// 缓存 rt-old 与 config rt-config 不一致 → 不应复用缓存 at-old，应重新交换得 at-fresh
+	// 旧格式缓存不得复用，应重新交换得 at-fresh
 	if got := d.client.getAccessToken(); got != "at-fresh" {
-		t.Errorf("旧缓存不得覆盖新授权：access_token = %q, want at-fresh", got)
+		t.Errorf("旧格式缓存不得复用：access_token = %q, want at-fresh", got)
 	}
 	if got := d.getRefreshToken(); got != "rt-config" {
 		t.Errorf("refresh_token = %q, want rt-config（config 为唯一真值源）", got)

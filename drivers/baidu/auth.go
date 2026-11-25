@@ -121,20 +121,64 @@ func (c *Client) refreshToken(refreshToken, clientID, clientSecret string) (stri
 // Token 持久化
 // ============================================================
 
-// SaveToken 保存 token 状态文件（0600；目录 0700——凭证目录收紧权限，
-// DESIGN-2026-11-24-01 §6.6.3）。批 2 将改为原子写（temp+rename）。
+// SaveToken 保存 token 缓存（原子写：temp + chmod 0600 + fsync + rename + 父目录 fsync；
+// 目录 0700——DESIGN-2026-11-24-01 §6.6.3，批 2 交付）
 func SaveToken(name, stateDir string, token *TokenState) error {
 	if err := os.MkdirAll(stateDir, 0700); err != nil {
-		return err
-	}
-	data, err := json.MarshalIndent(token, "", "  ")
-	if err != nil {
 		return err
 	}
 	if err := os.Chmod(stateDir, 0700); err != nil {
 		slog.Warn("state 目录权限收紧失败（尽力而为）", "dir", stateDir, "err", err)
 	}
-	return os.WriteFile(filepath.Join(stateDir, name+"_token.json"), data, 0600)
+	data, err := json.MarshalIndent(token, "", "  ")
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(filepath.Join(stateDir, name+"_token.json"), data)
+}
+
+// writeFileAtomic 原子写（与 conf 同款：temp + chmod + fsync + rename + 父目录 fsync）
+func writeFileAtomic(path string, data []byte) error {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmp, 0600); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	f, err := os.OpenFile(tmp, os.O_WRONLY, 0)
+	if err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	syncDir(filepath.Dir(path))
+	return nil
+}
+
+// syncDir 目录 fsync（尽力而为：失败仅 WARN）
+func syncDir(dir string) {
+	f, err := os.Open(dir)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	if err := f.Sync(); err != nil {
+		slog.Warn("目录 fsync 失败（尽力而为）", "dir", dir, "err", err)
+	}
 }
 
 func LoadToken(name, stateDir string) (*TokenState, error) {

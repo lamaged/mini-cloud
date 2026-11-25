@@ -555,3 +555,14 @@
 |---|---|---|---|---|---|---|---|
 | S1 | HIGH | 健康探测错误原文回显 /admin：百度 url.Error 携带 access_token（探测链路无脱敏，与 exchangeToken 同类缺陷的残留） | 已改 | 双层修复：①驱动侧 apiGetWithRetry/apiGetRaw 网络错误经 redactSecrets 脱敏（新增 baseURL 注入点）；②应用侧 probeMsg 不再存原文——classifyProbeErr 映射固定分类短语（超时/网络不可达/上游不可用/根目录不存在/上游服务异常），恢复后清空；测试：探测链路喂含 access_token=SECRET 的 url.Error 断言状态不含、分类短语正确、恢复清空；API 层泄露断言（特殊字符 token 原文+编码形式） | 已闭环 | 待复核 | 2026-11-24 |
 | S2 | 过滤 | 挂载名校验未覆盖 Go 1.22+ ServeMux 模式语法（空格/{} /% 致启动 panic 或路由别名） | 过滤+加固 | 命中 DoS/可用性硬排除（触发需本地写 config，别名不跨信任边界）；仍按建议随同加固——validateMounts 拒绝空格/`{}`/`%`（路由保留字符）+ 测试 3 组 + 设计稿 §4.3/A13 同步 | 已闭环 | 待复核 | 2026-11-24 |
+
+### RV-2026-11-25-02（批 2 代码审核，1 阻断 + 1 重要 + 3 收口 → 全部处置）
+
+| 编号 | 级别 | 意见摘要 | 处置类别 | 处置说明 | 状态 | 复核 | 日期 |
+|---|---|---|---|---|---|---|---|
+| P1-2 | 阻断 | state 仍存 refresh_token 且 SaveToken 非原子（设计 §6.5/§6.6.3/§6.7 应做未做） | 已改 | state 纯缓存化：TokenState 改 {V, AccessToken, ExpiresAt, CredentialGeneration}（V=1 新格式；旧格式含 refresh_token 字段的 JSON 忽略多余字段、视为过期缓存重新兑换）；缓存复用条件 = V==1 且代次匹配（用户提交代次 +1 → 自动失配重兑换）；SaveToken 原子写（temp+chmod+fsync+rename+目录 fsync，目录 0700）；测试：旧格式不复用、代次匹配复用/不符重兑换、缓存断言改新字段 | 已闭环 | 待复核 | 2026-11-25 |
+| I1 | 重要 | 百度 Link 网络错误未脱敏（dlink 含 access_token 进日志，第四处同类残留） | 已改 | Link 的 Do 错误经 redactSecrets（access_token）后返回；测试：假 API 返回指向已关闭端点的 dlink（含查询串），断言错误文本不含令牌原文与编码形式 | 已闭环 | 待复核 | 2026-11-25 |
+| P1-1 | 建议 | 刷新单飞升级为结果共享（N 并发 401 打 N 次端点） | 已改 | refreshSingleFlight 重构：refreshMu 仅做闸门，首个进入者执行 doRefresh，其余并发者在锁外等 in-flight 结果复用；测试：10 并发 → 端点仅 1 次请求、全部成功 | 已闭环 | 待复核 | 2026-11-25 |
+| P2-1 | 建议 | 轮换落盘失败归黄「暂败」，与 §6.10 红「存储异常」不符 | 已改 | DriverHealth 增 StorageFailed 事实位；recordStorageFailure（红 + 「本地配置写入失败（存储异常）」）；合成规则 StorageFailed → UNAVAILABLE；测试：落盘失败断言 StorageFailed + 合成用例 | 已闭环 | 待复核 | 2026-11-25 |
+| P2-2 | 建议 | 重启页兜底命令硬编码 init.d 路径，与设备实际管理方式不符 | 已改 | 重启页与设计 §6.12 改中性文案（「手工重启 mini-cloud 进程」，不硬编码设备侧脚本路径） | 已闭环 | 待复核 | 2026-11-25 |
+| — | 记录 | 审核员撤回其上轮 I2 误判（认定一键授权/重启按钮属提前发布） | 确认 | 13ae500 + 6e8bd3d 即批 2 交付（设计 §6.4/§6.12 定稿），口径一致，无需改代码 | 已记录 | — | 2026-11-25 |

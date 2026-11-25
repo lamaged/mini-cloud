@@ -291,6 +291,7 @@ func TestSynthesizeExpiryWarning(t *testing.T) {
 		{"剩 2 小时转黄", driver.DriverHealth{ExpiresAt: at(2 * time.Hour)}, statusWarning},
 		{"已过期转红", driver.DriverHealth{ExpiresAt: at(-time.Hour), AuthExpired: true, Warning: "令牌已过期"}, statusUnavailable},
 		{"过期事实优先于临近", driver.DriverHealth{ExpiresAt: at(-time.Hour), AuthExpired: true}, statusUnavailable},
+		{"存储异常转红", driver.DriverHealth{StorageFailed: true, Warning: "本地配置写入失败（存储异常）"}, statusUnavailable},
 	}
 	for _, tt := range tests {
 		got, msg := synthesizeStatus(nil, tt.dh, 0, "")

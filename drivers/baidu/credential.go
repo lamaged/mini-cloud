@@ -91,11 +91,13 @@ func (d *Driver) CommitCredential(values map[string]string) error {
 	d.clearRefreshFailure() // 新凭据提交成功：清除旧刷新失败事实（§6.10）
 	d.refreshMu.Unlock()
 
-	// token state 缓存：写失败凭据仍生效（config 为唯一真值源），按告警返回
+	// token state 缓存（§6.5 批 2：纯缓存，V=1 + 当前代次；写失败凭据仍生效，
+	// config 为唯一真值源，按告警返回）
 	if err := SaveToken(d.name, d.stateDir, &TokenState{
-		RefreshToken: p.refreshToken,
-		AccessToken:  p.accessToken,
-		ExpiresAt:    time.Now().Unix() + int64(p.expiresIn),
+		V:                   1,
+		AccessToken:         p.accessToken,
+		ExpiresAt:           time.Now().Unix() + int64(p.expiresIn),
+		CredentialGeneration: int(d.credGen.Load()),
 	}); err != nil {
 		// 删除残留旧缓存，保证重启后以 config.json 为准
 		os.Remove(filepath.Join(d.stateDir, d.name+"_token.json"))

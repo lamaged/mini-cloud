@@ -54,8 +54,12 @@ type DownloadResp struct {
 // Token 持久化
 // ============================================================
 
+// TokenState state 缓存（批 2 §6.5：纯缓存——只存 access_token/过期时间/格式版本/授权代次；
+// refresh_token 唯一真值源为 config.json，不再入缓存）。
+// V=1 为新格式；旧文件（无 V 或 V=0，曾含 refresh_token）视为过期缓存、重新兑换。
 type TokenState struct {
-	RefreshToken string `json:"refresh_token"`
-	AccessToken  string `json:"access_token"`
-	ExpiresAt    int64  `json:"expires_at"`
+	V                   int   `json:"v"`
+	AccessToken         string `json:"access_token"`
+	ExpiresAt           int64  `json:"expires_at"`
+	CredentialGeneration int   `json:"credential_generation"`
 }

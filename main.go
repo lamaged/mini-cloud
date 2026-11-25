@@ -90,6 +90,13 @@ func synthesizeStatusAt(now time.Time, initErr error, dh driver.DriverHealth, pr
 		}
 		return statusUnavailable, msg
 	}
+	if dh.StorageFailed {
+		msg := dh.Warning
+		if msg == "" {
+			msg = "本地存储异常"
+		}
+		return statusUnavailable, msg
+	}
 	if probeFails >= 2 {
 		msg := probeMsg
 		if msg == "" {
