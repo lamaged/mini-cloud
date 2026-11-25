@@ -843,3 +843,57 @@ func TestWriteCredentialBaiduMissingReservedKey(t *testing.T) {
 		t.Error("写回失败不得产生备份")
 	}
 }
+
+// TestRotateBaiduToken 批 2（§6.5）：轮换写回——代次相符写新票 + 修订号 +1 + 备份；
+// 代次不符跳过（返回 nil 配置、原配置不变）；未找到挂载报错。
+func TestRotateBaiduToken(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/config.json"
+	cfg := &Config{Clouds: []CloudConfig{
+		{Name: "百度", Type: "baidu", RefreshToken: "rt-old", ClientID: "cid", ClientSecret: "cs", CredentialGeneration: 5, TokenRevision: 2},
+		{Name: "移动", Type: "mobile", Authorization: "auth"},
+	}}
+	if err := cfg.Save(path); err != nil {
+		t.Fatal(err)
+	}
+
+	// 代次相符：写回 + 修订号 +1
+	fresh, err := RotateBaiduToken(path, "百度", 5, "rt-rotated")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh == nil {
+		t.Fatal("代次相符应返回新配置")
+	}
+	if fresh.Clouds[0].RefreshToken != "rt-rotated" || fresh.Clouds[0].TokenRevision != 3 {
+		t.Errorf("轮换写回不符: %+v", fresh.Clouds[0])
+	}
+	if fresh.Clouds[0].CredentialGeneration != 5 {
+		t.Errorf("轮换不得改授权代次: %+v", fresh.Clouds[0])
+	}
+	if fresh.Clouds[1].Authorization != "auth" {
+		t.Errorf("移动挂载不应被改动: %+v", fresh.Clouds[1])
+	}
+	if _, err := os.Stat(path + ".bak"); err != nil {
+		t.Error("写回前应备份 .bak")
+	}
+
+	// 代次不符（用户已提交新授权）：跳过写回、原配置不变
+	before, _ := os.ReadFile(path)
+	skipped, err := RotateBaiduToken(path, "百度", 4, "rt-late")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if skipped != nil {
+		t.Error("代次不符应返回 nil 配置（跳过）")
+	}
+	after, _ := os.ReadFile(path)
+	if !bytes.Equal(before, after) {
+		t.Error("代次不符时配置文件不得变化")
+	}
+
+	// 未找到挂载
+	if _, err := RotateBaiduToken(path, "不存在", 5, "x"); err == nil {
+		t.Error("未找到挂载应报错")
+	}
+}

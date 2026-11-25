@@ -82,9 +82,14 @@ func (d *Driver) CommitCredential(values map[string]string) error {
 		return fmt.Errorf("没有待提交的凭证，请先验证")
 	}
 
-	// 应用最终凭据到内存（互斥锁 getter/setter，铁律 8）
+	// 应用最终凭据到内存（互斥锁 getter/setter，铁律 8）。
+	// 与刷新单飞同锁（§6.5）：提交与在途轮换串行化——谁后执行谁生效，
+	// 代次检查（refreshSingleFlight 写回后复检）防迟到轮换覆盖新授权。
+	d.refreshMu.Lock()
 	d.setRefreshToken(p.refreshToken)
 	d.client.SetAccessToken(p.accessToken)
+	d.clearRefreshFailure() // 新凭据提交成功：清除旧刷新失败事实（§6.10）
+	d.refreshMu.Unlock()
 
 	// token state 缓存：写失败凭据仍生效（config 为唯一真值源），按告警返回
 	if err := SaveToken(d.name, d.stateDir, &TokenState{

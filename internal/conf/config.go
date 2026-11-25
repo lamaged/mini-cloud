@@ -433,3 +433,30 @@ func WriteCredential(path, mountName string, values map[string]string) (*Config,
 	}
 	return cfg, nil
 }
+
+// RotateBaiduToken 后台轮换写回（DESIGN-2026-11-24-01 §6.5）：expectedGen 与当前配置
+// 授权代次不符（用户已提交新凭据）时**跳过写回**、返回 (nil, nil) 不报错（迟到结果丢弃）；
+// 相符则写入新 refresh_token、token_revision +1（先备份后原子写）。
+func RotateBaiduToken(path, mountName string, expectedGen int, newRefreshToken string) (*Config, error) {
+	cfg, err := LoadStrict(path)
+	if err != nil {
+		return nil, fmt.Errorf("读取配置失败: %w", err)
+	}
+	for i := range cfg.Clouds {
+		if cfg.Clouds[i].MountName() == mountName && cfg.Clouds[i].Type == "baidu" {
+			if cfg.Clouds[i].CredentialGeneration != expectedGen {
+				return nil, nil // 代次不符：迟到的轮换结果，跳过（防旧覆盖新）
+			}
+			cfg.Clouds[i].RefreshToken = newRefreshToken
+			cfg.Clouds[i].TokenRevision++
+			if err := Backup(path); err != nil {
+				return nil, fmt.Errorf("备份配置失败: %w", err)
+			}
+			if err := cfg.Save(path); err != nil {
+				return nil, fmt.Errorf("写入配置失败: %w", err)
+			}
+			return cfg, nil
+		}
+	}
+	return nil, fmt.Errorf("未找到百度挂载: %s", mountName)
+}

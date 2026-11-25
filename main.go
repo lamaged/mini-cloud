@@ -258,9 +258,34 @@ func main() {
 	// 服务端认证信息固定快照：管理页写回只改 clouds 段，认证信息不参与运行时共享可变状态
 	serverUser, serverPass := cfg.Server.Username, cfg.Server.Password
 
-	// 创建所有驱动（单挂载故障隔离：失败只记录状态，不再整体退出）
+	// 配置写回互斥（管理页提交与百度轮换写回共用同一把锁，§6.5「比较代次→写回」互斥范围）
+	var cfgMu sync.Mutex
+
+	// 创建所有驱动（单挂载故障隔离：失败只记录状态，不再整体退出；
+	// inject 在 Init 之前给百度驱动注入轮换写回与授权代次——Init 期可能发生轮换）
 	ctx := context.Background()
-	mounts := createAllDrivers(ctx, cfg)
+	mounts := createAllDrivers(ctx, cfg, func(drv driver.Driver, cc *conf.CloudConfig) error {
+		bd, ok := drv.(*baidu.Driver)
+		if !ok {
+			return nil
+		}
+		mount := cc.MountName()
+		bd.SetCredentialGeneration(cc.CredentialGeneration)
+		bd.SetRotationPersist(func(ctx context.Context, expectedGen int, rt string) error {
+			cfgMu.Lock()
+			defer cfgMu.Unlock()
+			fresh, err := conf.RotateBaiduToken(*configPath, mount, expectedGen, rt)
+			if err != nil {
+				return err
+			}
+			if fresh == nil {
+				return nil // 代次不符：迟到的轮换结果，跳过（防旧覆盖新）
+			}
+			cfg.Clouds = fresh.Clouds // 写盘成功后才更新内存副本
+			return nil
+		})
+		return nil
+	})
 
 	// 健康探测（v1.3.0 批 1）：每挂载 5 分钟，绕过缓存直调 raw.List("/")
 	go startHealthProbe(ctx, mounts)
@@ -310,8 +335,7 @@ func main() {
 		adminMounts = append(adminMounts, am)
 	}
 
-	// 配置写回（两阶段语义：验证通过才写；互斥保护避免并发写）
-	var cfgMu sync.Mutex
+	// 配置写回（两阶段语义：验证通过才写；互斥保护避免并发写——cfgMu 见上，管理页与轮换共用）
 	adminHandler := admin.New(adminMounts, func(ctx context.Context, mountName string, values map[string]string) (func() error, error) {
 		cfgMu.Lock()
 		defer cfgMu.Unlock()
@@ -321,6 +345,22 @@ func main() {
 			return nil, err
 		}
 		cfg.Clouds = fresh.Clouds // 写盘成功后才更新内存副本
+		// 百度：在 CommitCredential 之前同步授权代次（§6.5：让在途轮换的迟到结果
+		// 在写回复检时代次不符被丢弃，防旧覆盖新）
+		for _, m := range mounts {
+			if m.Name != mountName {
+				continue
+			}
+			if bd, ok := m.RawDriver.(*baidu.Driver); ok {
+				for i := range fresh.Clouds {
+					if fresh.Clouds[i].MountName() == mountName {
+						bd.SetCredentialGeneration(fresh.Clouds[i].CredentialGeneration)
+						break
+					}
+				}
+			}
+			break
+		}
 		return func() error {
 			// 提交失败回滚（I6，PM 拍板方案①）：用 .bak 还原配置并同步内存副本。
 			// 失败必须如实返回（I8）：不得假装已还原。
@@ -434,7 +474,7 @@ func main() {
 	}
 
 	// 凭证生效后：清空该挂载的目录/链接缓存，避免旧账号数据残留（30s 目录 / 10min 链接）；
-	// 并按当前事实重算状态卡（PM 拍板 2026-11-25：贴票成功移动当场转正常，Init 失败挂载仍红提示重启）
+	// 按当前事实重算状态卡（PM 拍板 2026-11-25；授权代次已在写回闭包内同步）
 	adminHandler.OnCommitted = func(mountName string) {
 		if h, ok := davHandlers[mountName]; ok {
 			if inv, ok := h.Driver.(interface{ InvalidateAll() }); ok {
@@ -442,10 +482,11 @@ func main() {
 			}
 		}
 		for _, m := range mounts {
-			if m.Name == mountName {
-				m.refreshSnapshotFromFacts()
-				return
+			if m.Name != mountName {
+				continue
 			}
+			m.refreshSnapshotFromFacts()
+			return
 		}
 	}
 
@@ -485,7 +526,8 @@ func main() {
 // createAllDrivers 根据配置创建所有云盘驱动（v1.3.0 批 1：单挂载故障隔离）——
 // 创建/初始化失败只记录该挂载状态，不再整体返回错误；至少一个成功即启动服务；
 // 全部失败仍启动诊断首页（Q1 拍板）。失败挂载保留 RawDriver（创建成功时）进 /admin。
-func createAllDrivers(ctx context.Context, cfg *conf.Config) []*MountRuntime {
+// inject 在 Init 之前按挂载注入依赖（百度：轮换写回与授权代次，§6.5）；注入失败按挂载失败处理。
+func createAllDrivers(ctx context.Context, cfg *conf.Config, inject func(driver.Driver, *conf.CloudConfig) error) []*MountRuntime {
 	mounts := make([]*MountRuntime, 0, len(cfg.Clouds))
 	for i := range cfg.Clouds {
 		cc := &cfg.Clouds[i]
@@ -503,6 +545,15 @@ func createAllDrivers(ctx context.Context, cfg *conf.Config) []*MountRuntime {
 			continue
 		}
 		m.RawDriver = drv
+
+		if inject != nil {
+			if err := inject(drv, cc); err != nil {
+				m.applyInitResult(err)
+				slog.Error("注入驱动依赖失败", "mount", m.Name, "err", err)
+				mounts = append(mounts, m)
+				continue
+			}
+		}
 
 		if err := drv.Init(ctx); err != nil {
 			m.applyInitResult(err)

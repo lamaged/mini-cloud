@@ -173,7 +173,7 @@ func TestCreateAllDriversIsolation(t *testing.T) {
 		{Name: "百度", Type: "baidu", RefreshToken: ""}, // Init 失败：尚未授权
 		{Name: "坏类型", Type: "nonexistent"},           // 创建失败
 	}}
-	mounts := createAllDrivers(t.Context(), cfg)
+	mounts := createAllDrivers(t.Context(), cfg, nil)
 
 	if len(mounts) != 3 {
 		t.Fatalf("状态表应含全部配置挂载：got %d, want 3", len(mounts))

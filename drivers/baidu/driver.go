@@ -11,7 +11,9 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"mini-cloud/internal/driver"
@@ -32,6 +34,18 @@ type Driver struct {
 	// 待提交凭证（CredentialUpdater 两阶段：Validate 暂存、Commit 生效；按 __req 隔离并发更新）
 	pendingMu sync.Mutex
 	pending   map[string]*pendingCred
+
+	// 批 2（DESIGN-2026-11-24-01 §6.5/§6.6）：刷新互斥（单飞）+ 限频 + 轮换写回
+	refreshMu     sync.Mutex
+	lastRefreshAt time.Time                    // 最近一次刷新尝试时间（限频窗口）
+	lastRefreshErr error                      // 最近一次刷新失败（60s 内复用，防刷新风暴）
+	credGen       atomic.Int64                // 当前授权代次（main 注入；轮换写回时防迟到覆盖；原子：写回回调内可改）
+	rotatePersist func(ctx context.Context, expectedGen int, newRefreshToken string) error // main 注入：轮换原子写回 config
+
+	// 健康事实（§6.10）：刷新失败但会话可用 → 黄；不可恢复失效 → 红
+	healthMu  sync.Mutex
+	authDead  bool   // refresh_token 不可恢复失效（需重新授权）
+	warnText  string // 警告文案
 }
 
 // New 创建百度网盘驱动（client_id/client_secret 必填，无内置默认值——
@@ -66,30 +80,131 @@ func (d *Driver) setRefreshToken(t string) {
 	d.mu.Unlock()
 }
 
+// SetCredentialGeneration 注入当前授权代次（main：启动时 + 管理页提交成功后同步）。
+// 原子操作：可在轮换写回回调内调用（防迟到覆盖测试/回调路径）。
+func (d *Driver) SetCredentialGeneration(g int) {
+	d.credGen.Store(int64(g))
+}
+
+// SetRotationPersist 注入轮换写回函数（main：conf.RotateBaiduToken 原子写回 config；
+// expectedGen 与当前配置代次不符时该函数应返回 nil 表示跳过）
+func (d *Driver) SetRotationPersist(fn func(ctx context.Context, expectedGen int, newRefreshToken string) error) {
+	d.refreshMu.Lock()
+	d.rotatePersist = fn
+	d.refreshMu.Unlock()
+}
+
+// refreshSingleFlight 刷新单飞（§6.6.1）：401 回调、后台 watcher、Init 共用同一把锁；
+// 限频（§6.6.7）：失败后 60s 内复用失败结果，不打上游；
+// 轮换（§6.5）：先写回 config（代次不符则跳过，防迟到覆盖）→ 成功才提交内存；
+// 落盘失败 = 严重错误（§6.6.4），内存不提交新值。
+func (d *Driver) refreshSingleFlight(ctx context.Context) error {
+	d.refreshMu.Lock()
+	defer d.refreshMu.Unlock()
+
+	if d.lastRefreshErr != nil && time.Since(d.lastRefreshAt) < time.Minute {
+		return d.lastRefreshErr // 限频窗口内：复用失败结果，防刷新风暴
+	}
+	d.lastRefreshAt = time.Now()
+
+	gen := int(d.credGen.Load())
+	rt := d.getRefreshToken()
+	access, newRT, expiresIn, err := d.client.exchangeToken(ctx, rt, d.clientID, d.clientSecret)
+	if err != nil {
+		d.lastRefreshErr = err
+		d.recordRefreshFailure(err)
+		return err
+	}
+	d.lastRefreshErr = nil
+	d.clearRefreshFailure()
+
+	if newRT != "" {
+		persist := d.rotatePersist
+		if persist != nil {
+			if err := persist(ctx, gen, newRT); err != nil {
+				d.lastRefreshErr = err
+				d.recordRefreshFailure(fmt.Errorf("轮换写回配置失败: %w", err))
+				return err
+			}
+		}
+	}
+	// 写回后再查代次：写回期间（或之前）管理页提交了新凭据 → 丢弃本次结果，
+	// 不得覆盖内存新票/新会话（防旧覆盖新，铁律 8 精神）
+	if gen != int(d.credGen.Load()) {
+		return nil
+	}
+	if newRT != "" {
+		d.setRefreshToken(newRT)
+	}
+	d.client.SetAccessToken(access)
+
+	// state 为纯缓存（§6.5）：写失败仅告警，access_token 丢失下次重新兑换
+	if err := SaveToken(d.name, d.stateDir, &TokenState{
+		RefreshToken: d.getRefreshToken(),
+		AccessToken:  access,
+		ExpiresAt:    time.Now().Unix() + int64(expiresIn),
+	}); err != nil {
+		slog.Warn("保存 token 缓存失败（state 为纯缓存，下次重新兑换）", "err", err)
+	}
+	return nil
+}
+
+// classifyBaiduRefreshErr 失效分类（§6.6.8）：不可恢复（票作废/已用过）→ 需重新授权；
+// 其余（网络/临时）→ 暂败。
+func classifyBaiduRefreshErr(err error) bool {
+	msg := err.Error()
+	for _, k := range []string{"expired_token", "has been used", "invalid_grant"} {
+		if strings.Contains(msg, k) {
+			return true
+		}
+	}
+	return false
+}
+
+// recordRefreshFailure 记录刷新失败事实（供 Health 上报：红=不可恢复 / 黄=暂败）
+func (d *Driver) recordRefreshFailure(err error) {
+	d.healthMu.Lock()
+	defer d.healthMu.Unlock()
+	if classifyBaiduRefreshErr(err) {
+		d.authDead = true
+		d.warnText = "百度授权已失效，需要重新授权（管理页粘贴 refresh_token 或一键授权）"
+	} else if !d.authDead {
+		d.warnText = "百度自动刷新失败，当前会话暂可用"
+	}
+}
+
+// clearRefreshFailure 清除刷新失败事实（刷新成功 / 用户提交新凭证后）
+func (d *Driver) clearRefreshFailure() {
+	d.healthMu.Lock()
+	d.authDead = false
+	d.warnText = ""
+	d.healthMu.Unlock()
+}
+
+// Health 健康事实（批 2 §6.10）：AuthExpired = 不可恢复失效（红）；Warning = 暂败（黄）。
+func (d *Driver) Health() driver.DriverHealth {
+	d.healthMu.Lock()
+	defer d.healthMu.Unlock()
+	h := driver.DriverHealth{}
+	if d.authDead {
+		h.AuthExpired = true
+		h.Warning = d.warnText
+	} else if d.warnText != "" {
+		h.Warning = d.warnText
+	}
+	return h
+}
+
 // Init 初始化：校验 OAuth 应用凭据与 refresh_token，刷新或从缓存恢复会话。
 // config 为 refresh_token 唯一真值源（DESIGN-2026-11-24-01 §6.5）：state 缓存仅当
 // 其 refresh_token 与 config 一致时才复用 access_token——防旧缓存覆盖新授权
 // （否则管理页更新后重启会被旧缓存吞掉，D2 重启恢复验收）。
 func (d *Driver) Init(ctx context.Context) error {
-	// 设置 401 自动刷新回调（运行时安全网——必须在任何 early return 之前注册）
+	// 设置 401 自动刷新回调（运行时安全网——必须在任何 early return 之前注册；
+	// 批 2 起走 refreshSingleFlight：互斥 + 限频 + 轮换写回 config）
 	d.client.SetAuthRefreshCallback(func() error {
 		slog.Info("百度网盘 token 过期，自动刷新")
-		rt := d.getRefreshToken()
-		accessToken, newRefresh, expiresIn, err := d.client.refreshToken(rt, d.clientID, d.clientSecret)
-		if err != nil {
-			return err
-		}
-		d.client.SetAccessToken(accessToken)
-		if newRefresh != "" {
-			d.setRefreshToken(newRefresh)
-			rt = newRefresh
-		}
-		SaveToken(d.name, d.stateDir, &TokenState{
-			RefreshToken: rt,
-			AccessToken:  accessToken,
-			ExpiresAt:    time.Now().Unix() + int64(expiresIn),
-		})
-		return nil
+		return d.refreshSingleFlight(context.Background())
 	})
 
 	if d.clientID == "" || d.clientSecret == "" {
@@ -110,21 +225,8 @@ func (d *Driver) Init(ctx context.Context) error {
 		slog.Warn("缓存 token 已失效，重新刷新")
 	}
 
-	accessToken, newRefresh, expiresIn, err := d.client.refreshToken(d.getRefreshToken(), d.clientID, d.clientSecret)
-	if err != nil {
+	if err := d.refreshSingleFlight(ctx); err != nil {
 		return fmt.Errorf("百度网盘 token 刷新失败: %w", err)
-	}
-
-	d.client.SetAccessToken(accessToken)
-	if newRefresh != "" {
-		// 批 1：轮换的新 refresh_token 只进内存与 state 缓存；
-		// 批 2（§6.5/§6.6）实现 token_revision +1 原子写回 config。
-		d.setRefreshToken(newRefresh)
-	}
-
-	token = &TokenState{RefreshToken: d.getRefreshToken(), AccessToken: accessToken, ExpiresAt: time.Now().Unix() + int64(expiresIn)}
-	if err := SaveToken(d.name, d.stateDir, token); err != nil {
-		slog.Warn("保存 token 失败", "err", err)
 	}
 	return nil
 }
@@ -241,24 +343,12 @@ func (d *Driver) NeedRefresh() bool {
 	return time.Now().Unix()+300 > token.ExpiresAt
 }
 
+// RefreshToken TokenManager：后台 watcher 调用（批 2 §6.7：ctx 贯通到交换请求；
+// 单飞 + 限频 + 轮换写回见 refreshSingleFlight）。
 func (d *Driver) RefreshToken(ctx context.Context) error {
-	rt := d.getRefreshToken()
-	accessToken, newRefresh, expiresIn, err := d.client.refreshToken(rt, d.clientID, d.clientSecret)
-	if err != nil {
-		return err
-	}
-	d.client.SetAccessToken(accessToken)
-	if newRefresh != "" {
-		d.setRefreshToken(newRefresh)
-		rt = newRefresh
-	}
-	SaveToken(d.name, d.stateDir, &TokenState{
-		RefreshToken: rt,
-		AccessToken:  accessToken,
-		ExpiresAt:    time.Now().Unix() + int64(expiresIn),
-	})
-	return nil
+	return d.refreshSingleFlight(ctx)
 }
 
 var _ driver.Driver = (*Driver)(nil)
 var _ driver.TokenManager = (*Driver)(nil)
+var _ driver.HealthReporter = (*Driver)(nil)
