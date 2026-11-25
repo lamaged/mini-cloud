@@ -194,6 +194,18 @@ func classifyProbeErr(err error) string {
 	}
 }
 
+// refreshSnapshotFromFacts 按当前事实重算状态快照（凭证提交成功后调用，PM 拍板 2026-11-25）：
+// 不触碰探测计数与检查时间——移动贴票成功后事实即干净 → 状态卡当场转正常（旧行为即立即生效）；
+// Init 失败的挂载仍由 InitError 判红 → 「已保存，重启后生效」语义不变（D3）。
+func (m *MountRuntime) refreshSnapshotFromFacts() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	st, msg := synthesizeStatus(m.InitError, m.health(), m.probeFails, m.probeMsg)
+	m.status = st
+	m.statusMsg = msg
+	m.updatedAt = time.Now()
+}
+
 // snapshot 读取当前状态快照（HTTP 页只读）
 func (m *MountRuntime) snapshot() (mountStatus, string) {
 	m.mu.RLock()
@@ -421,11 +433,18 @@ func main() {
 		slog.Info("挂载云盘", "name", m.Name, "prefix", m.Prefix)
 	}
 
-	// 凭证生效后：清空该挂载的目录/链接缓存，避免旧账号数据残留（30s 目录 / 10min 链接）
+	// 凭证生效后：清空该挂载的目录/链接缓存，避免旧账号数据残留（30s 目录 / 10min 链接）；
+	// 并按当前事实重算状态卡（PM 拍板 2026-11-25：贴票成功移动当场转正常，Init 失败挂载仍红提示重启）
 	adminHandler.OnCommitted = func(mountName string) {
 		if h, ok := davHandlers[mountName]; ok {
 			if inv, ok := h.Driver.(interface{ InvalidateAll() }); ok {
 				inv.InvalidateAll()
+			}
+		}
+		for _, m := range mounts {
+			if m.Name == mountName {
+				m.refreshSnapshotFromFacts()
+				return
 			}
 		}
 	}

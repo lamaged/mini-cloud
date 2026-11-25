@@ -425,3 +425,34 @@ func TestClassifyProbeErr(t *testing.T) {
 		}
 	}
 }
+
+// TestRefreshSnapshotAfterCommit PM 拍板 2026-11-25：贴票成功后状态卡按当前事实重算——
+// 移动（警告事实）当场转正常；Init 失败的挂载保持红色（D3 重启语义不变）。
+func TestRefreshSnapshotAfterCommit(t *testing.T) {
+	// 移动：受限警告事实 → 黄；提交后事实干净 → 当场转黑
+	m := &MountRuntime{
+		Name:      "移动云盘",
+		Prefix:    "/移动云盘",
+		RawDriver: &fakeHealthDriver{dh: driver.DriverHealth{Warning: "云主机发现失败，服务受限"}},
+		Available: true,
+	}
+	m.applyInitResult(nil)
+	if st, _ := m.snapshot(); st != statusWarning {
+		t.Fatalf("初始应为警告, got %q", st)
+	}
+	exp := time.Now().Add(30 * 24 * time.Hour)
+	m.RawDriver.(*fakeHealthDriver).dh = driver.DriverHealth{ExpiresAt: &exp} // 提交成功 → 事实干净
+	m.refreshSnapshotFromFacts()
+	if st, msg := m.snapshot(); st != statusHealthy || msg != "" {
+		t.Errorf("贴票后应当场转正常且无消息, got %q %q", st, msg)
+	}
+
+	// Init 失败的挂载：重算后仍红（D3 不变——更新成功只代表已保存，重启才恢复）
+	bad := &MountRuntime{Name: "百度", Prefix: "/百度",
+		InitError: errors.New("百度网盘尚未授权（请在管理页粘贴 refresh_token 更新）")}
+	bad.applyInitResult(bad.InitError)
+	bad.refreshSnapshotFromFacts()
+	if st, _ := bad.snapshot(); st != statusUnavailable {
+		t.Errorf("Init 失败的挂载重算后仍应红, got %q", st)
+	}
+}
