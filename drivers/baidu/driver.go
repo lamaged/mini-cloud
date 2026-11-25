@@ -35,6 +35,10 @@ type Driver struct {
 	pendingMu sync.Mutex
 	pending   map[string]*pendingCred
 
+	// OAuth 授权状态（批 2 §6.4：state → 过期时间，一次性消费）
+	oauthMu     sync.Mutex
+	oauthStates map[string]time.Time
+
 	// 批 2（DESIGN-2026-11-24-01 §6.5/§6.6）：刷新互斥（单飞）+ 限频 + 轮换写回
 	refreshMu     sync.Mutex
 	lastRefreshAt time.Time                    // 最近一次刷新尝试时间（限频窗口）
@@ -59,6 +63,7 @@ func New(name, refreshToken, clientID, clientSecret, stateDir string) *Driver {
 		stateDir:     stateDir,
 		client:       NewClient(),
 		pending:      make(map[string]*pendingCred),
+		oauthStates:  make(map[string]time.Time),
 	}
 }
 

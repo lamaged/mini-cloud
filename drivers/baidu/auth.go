@@ -28,16 +28,57 @@ func (c *Client) exchangeToken(ctx context.Context, refreshToken, clientID, clie
 	params.Set("client_id", clientID)
 	params.Set("client_secret", clientSecret)
 
+	result, err := c.requestToken(ctx, params)
+	if err != nil {
+		return "", "", 0, err
+	}
+	expiresIn := result.ExpiresIn
+	if expiresIn <= 0 {
+		expiresIn = 2592000 // 默认 30 天
+	}
+	return result.AccessToken, result.RefreshToken, expiresIn, nil
+}
+
+// oauthRedirectURI 授权回调地址（批 2 §6.4，Q3 已定案：oob；备用
+// https://openapi.baidu.com/oauth/2.0/login_success）
+const oauthRedirectURI = "oob"
+
+// exchangeCode 授权码换 token（批 2 §6.4；无副作用，与 exchangeToken 共用请求函数）
+func (c *Client) exchangeCode(ctx context.Context, code, clientID, clientSecret string) (accessToken, refreshToken string, expiresIn int, err error) {
+	params := url.Values{}
+	params.Set("grant_type", "authorization_code")
+	params.Set("code", code)
+	params.Set("client_id", clientID)
+	params.Set("client_secret", clientSecret)
+	params.Set("redirect_uri", oauthRedirectURI)
+
+	var result *TokenResp
+	result, err = c.requestToken(ctx, params)
+	if err != nil {
+		return "", "", 0, err
+	}
+	if result.RefreshToken == "" {
+		return "", "", 0, fmt.Errorf("empty refresh_token in response")
+	}
+	expiresIn = result.ExpiresIn
+	if expiresIn <= 0 {
+		expiresIn = 2592000
+	}
+	return result.AccessToken, result.RefreshToken, expiresIn, nil
+}
+
+// requestToken token 端点通用请求（无副作用 + 网络错误脱敏：
+// url.Error 携带含凭据参数的完整 URL，refresh_token/code/client_secret 均需替换）
+func (c *Client) requestToken(ctx context.Context, params url.Values) (*TokenResp, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", c.tokenURL+"?"+params.Encode(), nil)
 	if err != nil {
-		return "", "", 0, fmt.Errorf("构造 token 请求失败: %w", err)
+		return nil, fmt.Errorf("构造 token 请求失败: %w", err)
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		// 脱敏（§6.9 安全要求）：Go 的 url.Error 文本携带完整请求 URL，
-		// 其中含 refresh_token/client_id/client_secret——错误文本会进日志与管理页，
-		// 必须把凭据值（含 URL 编码形式）替换掉再对外返回。
-		return "", "", 0, fmt.Errorf("token 交换网络错误: %s", redactSecrets(err.Error(), refreshToken, clientID, clientSecret))
+		return nil, fmt.Errorf("token 交换网络错误: %s",
+			redactSecrets(err.Error(), params.Get("refresh_token"), params.Get("code"),
+				params.Get("client_id"), params.Get("client_secret")))
 	}
 	defer resp.Body.Close()
 
@@ -48,17 +89,12 @@ func (c *Client) exchangeToken(ctx context.Context, refreshToken, clientID, clie
 	json.Unmarshal(body, &errResp)
 
 	if errResp.Error != "" {
-		return "", "", 0, fmt.Errorf("token refresh error: %s - %s", errResp.Error, errResp.ErrorDescription)
+		return nil, fmt.Errorf("token exchange error: %s - %s", errResp.Error, errResp.ErrorDescription)
 	}
 	if result.AccessToken == "" {
-		return "", "", 0, fmt.Errorf("empty access_token in response")
+		return nil, fmt.Errorf("empty access_token in response")
 	}
-
-	expiresIn := result.ExpiresIn
-	if expiresIn <= 0 {
-		expiresIn = 2592000 // 默认 30 天
-	}
-	return result.AccessToken, result.RefreshToken, expiresIn, nil
+	return &result, nil
 }
 
 // redactSecrets 把错误文本中的凭据值（含 URL 编码形式）替换为 ***。

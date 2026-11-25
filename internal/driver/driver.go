@@ -91,3 +91,17 @@ type CredentialUpdater interface {
 	// 返回 fmt.Errorf("%w: ...", ErrStateWriteFailed, err) 由调用方按告警提示。
 	CommitCredential(values map[string]string) error
 }
+
+// OAuthAuthorizer 一键授权（可选接口，批 2，DESIGN-2026-11-24-01 §6.4）：
+// 授权码手工回填流程——OAuthStart 生成一次性 state 与授权 URL；
+// OAuthExchange 校验 state、用授权码兑换 token，成功时回填 values["__refresh_token"]
+//（最终 refresh_token，供配置写回与 CommitCredential 使用同一值）与
+// values["__expiry"]（显示用），并按 values["__req"] 暂存待提交凭据。
+// 断言对象必须是原始驱动（铁律 7）。
+type OAuthAuthorizer interface {
+	// OAuthStart 生成一次性 state（短时有效）并返回百度授权 URL（redirect_uri=oob）
+	OAuthStart() (authURL string, err error)
+	// OAuthExchange 校验 state（一次性消费）并用 code 兑换 token；
+	// 不修改客户端内存（无副作用，验证语义同 CredentialUpdater.ValidateCredential）
+	OAuthExchange(ctx context.Context, state, code string, values map[string]string) error
+}

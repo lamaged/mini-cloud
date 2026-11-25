@@ -12,6 +12,7 @@ import (
 	"html/template"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -28,6 +29,7 @@ type Mount struct {
 	FieldsFunc func() []driver.CredentialField // 渲染时现取（动态标签，如剩余有效期，PM 拍板 2026-11-19）
 	Status     func() MountStatus       // 结构化状态（红黄黑 + 原因 + 最近检查时间；v1.3.0 批 1）
 	Update     driver.CredentialUpdater // 更新实现
+	OAuth      driver.OAuthAuthorizer   // 一键授权（批 2 §6.4；nil 不显示入口）
 }
 
 // MountStatus 挂载状态展示信息（应用层统一合成后注入，admin 只负责渲染）
@@ -60,6 +62,9 @@ type Handler struct {
 	OnCommitted func(mount string) // 凭证生效后回调（main 用于使该挂载缓存失效）
 
 	updateMu sync.Mutex // 更新锁：串行化「验证→写盘→生效」全流程（I1：防双标签交错导致配置与运行时不一致）
+
+	// Restart 重启回调（批 2 §6.12，main 注入：原地重启自身；nil = 不显示重启入口）
+	Restart func() error
 }
 
 // New 创建管理页处理器
@@ -157,6 +162,12 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 		h.render(w, http.StatusBadGateway, "", fmt.Sprintf("验证失败，未做任何修改：%v", err))
 		return
 	}
+	h.commitPhase(ctx, m, values, w)
+}
+
+// commitPhase 落盘配置 → 提交生效 → 渲染结果（Update 与 OAuthFinish 共用；
+// 调用方须持 updateMu）。失败回滚语义与 Update 一致（I6/I8）。
+func (h *Handler) commitPhase(ctx context.Context, m *Mount, values map[string]string, w http.ResponseWriter) {
 	rollback, err := h.persist(ctx, m.Name, values)
 	if err != nil {
 		h.render(w, http.StatusInternalServerError, "", fmt.Sprintf("写入配置文件失败，未做任何修改：%v", err))
@@ -200,6 +211,73 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 	h.render(w, http.StatusInternalServerError, "", fmt.Sprintf("凭证生效失败，配置已还原：%v", err))
 }
 
+// OAuthStart 开始一键授权（POST /admin/oauth/start，批 2 §6.4）：
+// CSRF 校验后生成授权 URL，渲染授权页（授权链接 + 回调网址回填表单）。
+func (h *Handler) OAuthStart(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		h.render(w, http.StatusBadRequest, "", "表单解析失败")
+		return
+	}
+	if !h.checkToken(r.PostFormValue("csrf")) {
+		h.render(w, http.StatusBadRequest, "", "安全校验失败，请返回管理页重试")
+		return
+	}
+	m := h.findMount(r.PostFormValue("mount"))
+	if m == nil || m.OAuth == nil {
+		h.render(w, http.StatusBadRequest, "", "该挂载不支持一键授权")
+		return
+	}
+	authURL, err := m.OAuth.OAuthStart()
+	if err != nil {
+		h.render(w, http.StatusBadGateway, "", fmt.Sprintf("发起授权失败：%v", err))
+		return
+	}
+	h.renderOAuth(w, m.Name, authURL, "", "")
+}
+
+// OAuthFinish 授权码回填（POST /admin/oauth/finish，批 2 §6.4）：
+// 解析粘贴的回调网址（code + state 成对，I5）→ 服务端校验并兑换（无副作用）→
+// 与 Update 共用 commitPhase（写配置 → 提交生效）。
+func (h *Handler) OAuthFinish(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		h.render(w, http.StatusBadRequest, "", "表单解析失败")
+		return
+	}
+	if !h.checkToken(r.PostFormValue("csrf")) {
+		h.render(w, http.StatusBadRequest, "", "安全校验失败，请返回管理页重试")
+		return
+	}
+	m := h.findMount(r.PostFormValue("mount"))
+	if m == nil || m.OAuth == nil || m.Update == nil {
+		h.render(w, http.StatusBadRequest, "", "该挂载不支持一键授权")
+		return
+	}
+
+	u, err := url.Parse(strings.TrimSpace(r.PostFormValue("url")))
+	if err != nil || u.RawQuery == "" {
+		h.renderOAuth(w, m.Name, "", "", "粘贴的网址无效，请复制浏览器地址栏的完整网址")
+		return
+	}
+	q := u.Query()
+	code, state := q.Get("code"), q.Get("state")
+	if code == "" || state == "" {
+		h.renderOAuth(w, m.Name, "", "", "网址中缺少授权码或防伪串，请确认复制了完整地址")
+		return
+	}
+
+	h.updateMu.Lock()
+	defer h.updateMu.Unlock()
+	values := make(map[string]string)
+	values["__req"] = randomToken()
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	if err := m.OAuth.OAuthExchange(ctx, state, code, values); err != nil {
+		h.renderOAuth(w, m.Name, "", "", fmt.Sprintf("授权失败，未做任何修改：%v", err))
+		return
+	}
+	h.commitPhase(ctx, m, values, w)
+}
+
 // render 渲染管理页（message 为成功提示，errMsg 为错误提示；二者互斥）
 func (h *Handler) render(w http.ResponseWriter, status int, message, errMsg string) {
 	type formMount struct {
@@ -207,20 +285,27 @@ func (h *Handler) render(w http.ResponseWriter, status int, message, errMsg stri
 		Prefix string
 		Status MountStatus
 		Fields []driver.CredentialField
+		OAuth  bool
 		CSRF   string
 	}
+	restartCSRF := ""
+	if h.Restart != nil {
+		restartCSRF = h.newToken()
+	}
 	data := struct {
-		Message string
-		Error   string
-		Mounts  []formMount
-	}{Message: message, Error: errMsg}
+		Message     string
+		Error       string
+		Mounts      []formMount
+		Restart     bool
+		RestartCSRF string
+	}{Message: message, Error: errMsg, Restart: h.Restart != nil, RestartCSRF: restartCSRF}
 
 	for i := range h.mounts {
 		m := &h.mounts[i]
 		fields := m.fieldList() // 渲染时现取（动态标签）
-		fm := formMount{Name: m.Name, Prefix: m.Prefix, Fields: fields}
-		if len(fields) > 0 {
-			fm.CSRF = h.newToken() // 仅凭证挂载需要 CSRF（无表单的状态卡不产生提交）
+		fm := formMount{Name: m.Name, Prefix: m.Prefix, Fields: fields, OAuth: m.OAuth != nil}
+		if len(fields) > 0 || fm.OAuth {
+			fm.CSRF = h.newToken() // 仅凭证挂载/一键授权挂载需要 CSRF（纯状态卡不产生提交）
 		}
 		if m.Status != nil {
 			fm.Status = m.Status()
@@ -281,8 +366,122 @@ a{color:#0366d6}
 <button type="submit">更新</button>
 </form>
 {{end}}
+{{if .OAuth}}
+<form method="POST" action="/admin/oauth/start">
+<input type="hidden" name="csrf" value="{{.CSRF}}">
+<input type="hidden" name="mount" value="{{.Name}}">
+<button type="submit">开始授权（跳转百度登录，粘贴回调网址完成）</button>
+</form>
+{{end}}
 </div>
 {{end}}
+{{if .Restart}}
+<form method="POST" action="/admin/restart" onsubmit="return confirm('确定重启 mini-cloud 服务吗？重启期间所有挂载约中断几秒');">
+<input type="hidden" name="csrf" value="{{.RestartCSRF}}">
+<button type="submit">重启服务</button>
+</form>
+{{end}}
 <p><a href="/">返回导航页</a></p>
+</body></html>
+`))
+
+// renderOAuth 渲染一键授权页（批 2 §6.4：授权链接 + 回调网址回填表单）
+func (h *Handler) renderOAuth(w http.ResponseWriter, mountName, authURL, message, errMsg string) {
+	data := struct {
+		Mount   string
+		AuthURL string
+		CSRF    string
+		Message string
+		Error   string
+	}{Mount: mountName, AuthURL: authURL, CSRF: h.newToken(), Message: message, Error: errMsg}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	// 安全响应头（与渲染管理页同口径）
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'")
+	w.WriteHeader(http.StatusOK)
+	if err := oauthTmpl.Execute(w, data); err != nil {
+		slog.Error("授权页渲染失败", "err", err)
+	}
+}
+
+var oauthTmpl = template.Must(template.New("oauth").Parse(`<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>mini-cloud 百度授权</title>
+<style>
+body{font-family:sans-serif;max-width:640px;margin:30px auto;padding:0 20px}
+h1{font-size:20px;border-bottom:2px solid #0366d6;padding-bottom:10px}
+.err{color:#b00020;background:#fdecea;padding:10px;border-radius:6px}
+.ok{color:#1b5e20;background:#e8f5e9;padding:10px;border-radius:6px}
+input[type=text]{width:100%;box-sizing:border-box;padding:8px;border:1px solid #ccc;border-radius:4px;font-size:14px}
+button{margin-top:12px;padding:8px 22px;background:#0366d6;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:14px}
+a{color:#0366d6}
+</style></head><body>
+<h1>☁️ mini-cloud 百度授权（{{.Mount}}）</h1>
+{{if .Error}}<p class="err">{{.Error}}</p>{{end}}
+{{if .Message}}<p class="ok">{{.Message}}</p>{{end}}
+{{if .AuthURL}}
+<p>第 1 步：<a href="{{.AuthURL}}" target="_blank" rel="noopener">点此打开百度授权页</a>（新标签页打开并登录、点同意）</p>
+<p>第 2 步：授权完成后，复制浏览器<b>地址栏的完整网址</b>（里面带着授权码），粘贴到下面：</p>
+<form method="POST" action="/admin/oauth/finish">
+<input type="hidden" name="csrf" value="{{.CSRF}}">
+<input type="hidden" name="mount" value="{{.Mount}}">
+<input type="text" name="url" placeholder="粘贴完整网址" required>
+<button type="submit">完成授权</button>
+</form>
+{{end}}
+<p><a href="/admin">返回管理页</a></p>
+</body></html>
+`))
+
+// RestartService 重启服务（POST /admin/restart，批 2 §6.12）：
+// CSRF + 认证后响应「正在重启」页，随后由 Restart 回调原地重启自身（PID 不变）。
+func (h *Handler) RestartService(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		h.render(w, http.StatusBadRequest, "", "表单解析失败")
+		return
+	}
+	if !h.checkToken(r.PostFormValue("csrf")) {
+		h.render(w, http.StatusBadRequest, "", "安全校验失败，请返回管理页重试")
+		return
+	}
+	if h.Restart == nil {
+		h.render(w, http.StatusBadRequest, "", "重启功能不可用")
+		return
+	}
+	h.renderRestart(w)
+	go func() {
+		time.Sleep(1 * time.Second) // 先把「正在重启」页送出去
+		if err := h.Restart(); err != nil {
+			// exec 失败不返回（成功时进程已被替换）；失败如实记日志
+			slog.Error("原地重启失败，请手工重启", "err", err)
+		}
+	}()
+}
+
+// renderRestart 渲染「正在重启」页
+func (h *Handler) renderRestart(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'")
+	w.WriteHeader(http.StatusOK)
+	if err := restartTmpl.Execute(w, nil); err != nil {
+		slog.Error("重启页渲染失败", "err", err)
+	}
+}
+
+var restartTmpl = template.Must(template.New("restart").Parse(`<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>mini-cloud 正在重启</title>
+<style>
+body{font-family:sans-serif;max-width:640px;margin:30px auto;padding:0 20px}
+h1{font-size:20px;border-bottom:2px solid #0366d6;padding-bottom:10px}
+.ok{color:#1b5e20;background:#e8f5e9;padding:10px;border-radius:6px}
+a{color:#0366d6}
+</style></head><body>
+<h1>☁️ mini-cloud</h1>
+<p class="ok">正在重启服务，请稍候几秒后刷新页面……</p>
+<p>若 1 分钟后仍未恢复，请 SSH 登录路由器执行 <code>/etc/init.d/mini-cloud restart</code>。</p>
+<p><a href="/">返回首页</a></p>
 </body></html>
 `))

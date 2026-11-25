@@ -383,3 +383,190 @@ func TestUpdateUnavailableShowsRestartPrompt(t *testing.T) {
 		t.Errorf("unavailable mount success message must prompt restart, got: %s", body)
 	}
 }
+
+// fakeOAuth 假一键授权实现
+type fakeOAuth struct {
+	startURL     string
+	startErr     error
+	exchangeErr  error
+	lastValues   map[string]string
+	exchangedState string
+}
+
+func (f *fakeOAuth) OAuthStart() (string, error) { return f.startURL, f.startErr }
+func (f *fakeOAuth) OAuthExchange(_ context.Context, state, code string, values map[string]string) error {
+	if f.exchangeErr != nil {
+		return f.exchangeErr
+	}
+	f.exchangedState = state
+	values["__refresh_token"] = "rt-final-" + code
+	values["__expiry"] = "2027-01-01 00:00"
+	f.lastValues = values
+	return nil
+}
+
+// TestOAuthStartRendersPage 批 2（§6.4）：开始授权渲染授权页（含链接与回填表单）
+func TestOAuthStartRendersPage(t *testing.T) {
+	oa := &fakeOAuth{startURL: "https://openapi.baidu.com/oauth/2.0/authorize?x=1"}
+	u := &fakeUpdater{fields: []driver.CredentialField{{Key: "refresh_token", Kind: "password"}}}
+	h := New([]Mount{
+		{Name: "百度", Prefix: "/百度", Available: false, Fields: u.CredentialFields(), Update: u, OAuth: oa},
+	}, func(ctx context.Context, mount string, values map[string]string) (func() error, error) {
+		return func() error { return nil }, nil
+	})
+	csrf := fetchCSRF(t, h)
+
+	form := url.Values{"csrf": {csrf}, "mount": {"百度"}}
+	req := httptest.NewRequest("POST", "/admin/oauth/start", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	h.OAuthStart(rec, req)
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "oauth/2.0/authorize") {
+		t.Errorf("授权页应含授权链接: %s", body)
+	}
+	if !strings.Contains(body, "/admin/oauth/finish") {
+		t.Errorf("授权页应含回填表单: %s", body)
+	}
+}
+
+// TestOAuthFinishHappyPath 批 2（§6.4）：粘贴回调网址 → state/code 解析 →
+// 兑换（__refresh_token 最终值贯穿）→ 写配置 → 提交生效。
+func TestOAuthFinishHappyPath(t *testing.T) {
+	oa := &fakeOAuth{startURL: "https://x/authorize"}
+	u := &fakeUpdater{fields: []driver.CredentialField{{Key: "refresh_token", Kind: "password"}}}
+	calls := &[]string{}
+	h := New([]Mount{
+		{Name: "百度", Prefix: "/百度", Available: false, Fields: u.CredentialFields(), Update: u, OAuth: oa},
+	}, func(ctx context.Context, mount string, values map[string]string) (func() error, error) {
+		*calls = append(*calls, "persist:"+mount+":"+values["__refresh_token"])
+		return func() error { return nil }, nil
+	})
+	csrf := fetchCSRF(t, h)
+
+	form := url.Values{"csrf": {csrf}, "mount": {"百度"}, "url": {"https://x/callback?code=c1&state=s1"}}
+	req := httptest.NewRequest("POST", "/admin/oauth/finish", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	h.OAuthFinish(rec, req)
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "更新成功") {
+		t.Fatalf("应更新成功: %s", body)
+	}
+	if oa.exchangedState != "s1" {
+		t.Errorf("exchange state = %q, want s1", oa.exchangedState)
+	}
+	if len(*calls) != 1 || (*calls)[0] != "persist:百度:rt-final-c1" {
+		t.Errorf("persist 应使用最终 refresh_token：calls=%v", *calls)
+	}
+	// 挂载不可用 → 提示重启后生效（D3）
+	if !strings.Contains(body, "重启后生效") {
+		t.Errorf("不可用挂载应提示重启后生效: %s", body)
+	}
+}
+
+// TestOAuthFinishBadURL 缺 code/state 的网址 → 拒绝且不落盘
+func TestOAuthFinishBadURL(t *testing.T) {
+	oa := &fakeOAuth{startURL: "https://x/authorize"}
+	u := &fakeUpdater{fields: []driver.CredentialField{{Key: "refresh_token", Kind: "password"}}}
+	persisted := false
+	h := New([]Mount{
+		{Name: "百度", Prefix: "/百度", Available: false, Fields: u.CredentialFields(), Update: u, OAuth: oa},
+	}, func(ctx context.Context, mount string, values map[string]string) (func() error, error) {
+		persisted = true
+		return func() error { return nil }, nil
+	})
+
+	for _, bad := range []string{"not-a-url", "https://x/callback?code=c1"} { // 缺 state
+		csrf := fetchCSRF(t, h) // 一次性令牌，每次重新取
+		form := url.Values{"csrf": {csrf}, "mount": {"百度"}, "url": {bad}}
+		req := httptest.NewRequest("POST", "/admin/oauth/finish", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		rec := httptest.NewRecorder()
+		h.OAuthFinish(rec, req)
+		if !strings.Contains(rec.Body.String(), "缺少") && !strings.Contains(rec.Body.String(), "无效") {
+			t.Errorf("坏网址应明确报错: %s", rec.Body.String())
+		}
+	}
+	if persisted {
+		t.Error("解析失败不得落盘")
+	}
+}
+
+// TestOAuthExchangeFailureNoPersist 兑换失败（如 state 无效）→ 未做任何修改
+func TestOAuthExchangeFailureNoPersist(t *testing.T) {
+	oa := &fakeOAuth{startURL: "https://x/authorize", exchangeErr: fmt.Errorf("授权状态无效，请重新开始授权")}
+	u := &fakeUpdater{fields: []driver.CredentialField{{Key: "refresh_token", Kind: "password"}}}
+	persisted := false
+	h := New([]Mount{
+		{Name: "百度", Prefix: "/百度", Available: false, Fields: u.CredentialFields(), Update: u, OAuth: oa},
+	}, func(ctx context.Context, mount string, values map[string]string) (func() error, error) {
+		persisted = true
+		return func() error { return nil }, nil
+	})
+	csrf := fetchCSRF(t, h)
+
+	form := url.Values{"csrf": {csrf}, "mount": {"百度"}, "url": {"https://x/callback?code=c1&state=s1"}}
+	req := httptest.NewRequest("POST", "/admin/oauth/finish", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	h.OAuthFinish(rec, req)
+	if !strings.Contains(rec.Body.String(), "未做任何修改") {
+		t.Errorf("兑换失败应提示未做任何修改: %s", rec.Body.String())
+	}
+	if persisted {
+		t.Error("兑换失败不得落盘")
+	}
+}
+
+// TestRestartService 批 2（§6.12）：CSRF 校验 → 渲染「正在重启」页 → 延迟调用重启回调；
+// 无 CSRF 拒绝；回调失败记日志不影响响应。
+func TestRestartService(t *testing.T) {
+	restarted := make(chan error, 1)
+	u := &fakeUpdater{fields: []driver.CredentialField{{Key: "authorization", Kind: "password"}}}
+	h, _, _ := newTestHandler(u, nil)
+	h.Restart = func() error { restarted <- nil; return nil }
+
+	csrf := fetchCSRF(t, h)
+	form := url.Values{"csrf": {csrf}}
+	req := httptest.NewRequest("POST", "/admin/restart", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	h.RestartService(rec, req)
+
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "正在重启") {
+		t.Fatalf("应渲染重启页: %d %s", rec.Code, rec.Body.String())
+	}
+	select {
+	case err := <-restarted:
+		if err != nil {
+			t.Fatalf("Restart: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("重启回调未在延迟后被调用")
+	}
+
+	// 无有效 CSRF → 拒绝且不触发重启
+	bad := url.Values{"csrf": {"forged"}}
+	req2 := httptest.NewRequest("POST", "/admin/restart", strings.NewReader(bad.Encode()))
+	req2.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec2 := httptest.NewRecorder()
+	h.RestartService(rec2, req2)
+	if !strings.Contains(rec2.Body.String(), "安全校验失败") {
+		t.Errorf("伪造 CSRF 应被拒绝: %s", rec2.Body.String())
+	}
+}
+
+// TestRestartButtonRendered 管理页存在重启入口（Restart 非 nil 时）
+func TestRestartButtonRendered(t *testing.T) {
+	u := &fakeUpdater{fields: []driver.CredentialField{{Key: "authorization", Kind: "password"}}}
+	h, _, _ := newTestHandler(u, nil)
+	h.Restart = func() error { return nil }
+	rec := httptest.NewRecorder()
+	h.Page(rec, httptest.NewRequest("GET", "/admin", nil))
+	if !strings.Contains(rec.Body.String(), "/admin/restart") {
+		t.Errorf("Restart 注入后管理页应含重启按钮: %s", rec.Body.String())
+	}
+}

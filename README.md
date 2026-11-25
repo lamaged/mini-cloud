@@ -167,7 +167,9 @@ chmod +x /etc/init.d/mini-cloud
 
 ### 更新云盘令牌（移动 / 百度）
 
-移动云盘令牌约 30 天过期；百度授权票据失效时首页对应挂载显示**红色**。打开 `http://<router-ip>:8088/admin`，在对应挂载的输入框粘贴新令牌即可，免 SSH。移动云盘更新后立即生效；百度更新后如果该挂载当时不可用，会提示「重启后生效」——重启路由器后自动恢复。
+移动云盘令牌约 30 天过期；百度授权票据失效时首页对应挂载显示**红色**。打开 `http://<router-ip>:8088/admin`，在对应挂载的输入框粘贴新令牌即可，免 SSH。移动云盘更新后立即生效；百度更新后如果该挂载当时不可用，会提示「重启后生效」——点管理页底部的「重启服务」按钮即可（不用去路由器上操作）。
+
+百度还有更省事的方式：点「开始授权（跳转百度登录）」→ 在新打开的百度页面登录并同意 → 复制浏览器**地址栏的完整网址**粘回管理页 → 点「完成授权」，程序自动换好票据并保存。
 
 ### 上传加密文件（可选）
 
@@ -234,7 +236,7 @@ mcrypt.exe encrypt -key vault.key -in 明文目录 -out 上传目录
 |---|---|---|
 | 天翼个人 / 家庭 | 手机号 + 密码 | 就是云盘 App 的登录账号密码 |
 | 移动云盘 | authorization 令牌 | 电脑浏览器登录移动云盘网页 → F12 开发者工具 → 网络请求头里找 `authorization` 字段，复制整串 Base64 |
-| 百度网盘 | `client_id` + `client_secret`（百度网盘开放平台应用）+ `refresh_token` | 在 pan.baidu.com/union 控制台申请应用：AppKey 填 `client_id`、SecretKey 填 `client_secret`（两者必填，缺失时百度挂载显示红色）；`refresh_token` 授权票据在 `/admin` 管理页粘贴更新；百度不支持加密播放 |
+| 百度网盘 | `client_id` + `client_secret`（百度网盘开放平台应用）+ `refresh_token` | 在 pan.baidu.com/union 控制台申请应用：AppKey 填 `client_id`、SecretKey 填 `client_secret`（两者必填，缺失时百度挂载显示红色）；`refresh_token` 授权票据在 `/admin` 管理页粘贴更新，或点「开始授权」一键跳转百度登录换票（控制台「OAuth 授权回调页地址」填 `oob`）；百度不支持加密播放 |
 
 ## 附录 B：播放器怎么连
 

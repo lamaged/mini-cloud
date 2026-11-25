@@ -306,6 +306,9 @@ func main() {
 				am.Update = up
 				hasUpdater = true
 			}
+			if oa, ok := m.RawDriver.(driver.OAuthAuthorizer); ok {
+				am.OAuth = oa // 一键授权（批 2 §6.4；Init 失败的挂载同样保留入口，D1）
+			}
 		}
 		am.Status = func() admin.MountStatus {
 			st, msg := m.snapshot()
@@ -473,6 +476,16 @@ func main() {
 		slog.Info("挂载云盘", "name", m.Name, "prefix", m.Prefix)
 	}
 
+	// 管理页「重启服务」（§6.12）：原地重启自身——syscall.Exec 替换进程镜像，
+	// PID 不变、日志 fd 继承、init.d 的 PID_FILE/RUN_FLAG 继续有效
+	adminHandler.Restart = func() error {
+		exe, err := os.Executable()
+		if err != nil {
+			exe = "/proc/self/exe"
+		}
+		return syscall.Exec(exe, os.Args, os.Environ())
+	}
+
 	// 凭证生效后：清空该挂载的目录/链接缓存，避免旧账号数据残留（30s 目录 / 10min 链接）；
 	// 按当前事实重算状态卡（PM 拍板 2026-11-25；授权代次已在写回闭包内同步）
 	adminHandler.OnCommitted = func(mountName string) {
@@ -622,6 +635,32 @@ func registerAdminRoutes(mux *http.ServeMux, hasUpdater bool, serverUser, server
 			return
 		}
 		h.Update(w, r)
+	})
+	// 一键授权（批 2 §6.4）：仅当存在 OAuthAuthorizer 挂载时注册
+	mux.HandleFunc("POST /admin/oauth/start", func(w http.ResponseWriter, r *http.Request) {
+		if !checkAuth(r, serverUser, serverPass) {
+			w.Header().Set("WWW-Authenticate", `Basic realm="mini-cloud"`)
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		h.OAuthStart(w, r)
+	})
+	mux.HandleFunc("POST /admin/oauth/finish", func(w http.ResponseWriter, r *http.Request) {
+		if !checkAuth(r, serverUser, serverPass) {
+			w.Header().Set("WWW-Authenticate", `Basic realm="mini-cloud"`)
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		h.OAuthFinish(w, r)
+	})
+	// 重启服务（批 2 §6.12）
+	mux.HandleFunc("POST /admin/restart", func(w http.ResponseWriter, r *http.Request) {
+		if !checkAuth(r, serverUser, serverPass) {
+			w.Header().Set("WWW-Authenticate", `Basic realm="mini-cloud"`)
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		h.RestartService(w, r)
 	})
 }
 
