@@ -761,7 +761,6 @@ h1{font-size:22px;border-bottom:2px solid #0366d6;padding-bottom:10px}
 .card .name.ok{color:#333}
 .card .name.warning{color:#b26a00}
 .card .name.error{color:#b00020}
-.card .desc{color:#666;margin-top:4px;font-size:14px}
 .admin{display:inline-block;margin-top:8px}
 </style></head><body>
 <h1>☁️ Mini Cloud WebDAV</h1>
@@ -782,19 +781,17 @@ h1{font-size:22px;border-bottom:2px solid #0366d6;padding-bottom:10px}
 			color = "error"
 		}
 		label := displayName(m)
-		href := webdav.EncodePathSegments(m.Prefix) + "/"
 		if st == statusUnavailable {
 			// 红卡不可点击（PM 拍板 2026-11-25）：失败挂载无数据路由，点击必 404
 			fmt.Fprintf(w, `<div class="card nolink">
 <div class="name %s">%s</div>
-<div class="desc">%s</div>
-</div>`, color, html.EscapeString(label), html.EscapeString(href))
+</div>`, color, html.EscapeString(label))
 			continue
 		}
+		href := webdav.EncodePathSegments(m.Prefix) + "/"
 		fmt.Fprintf(w, `<a class="card" href="%s">
 <div class="name %s">%s</div>
-<div class="desc">%s</div>
-</a>`, html.EscapeString(href), color, html.EscapeString(label), html.EscapeString(href))
+</a>`, html.EscapeString(href), color, html.EscapeString(label))
 	}
 
 	// PM 拍板 2026-11-24：全部正常时首页不显示「管理」链接，只有出问题时才显示

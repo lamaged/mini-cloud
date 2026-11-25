@@ -236,7 +236,8 @@ func (h *Handler) OAuthStart(w http.ResponseWriter, r *http.Request) {
 }
 
 // OAuthFinish 授权码回填（POST /admin/oauth/finish，批 2 §6.4）：
-// 解析粘贴的回调网址（code + state 成对，I5）→ 服务端校验并兑换（无副作用）→
+// 双输入（Q2 实测：oob 模式 URL 不含 code）——code 来自「授权码」框、
+// state 取自「地址栏网址」（code + state 成对，I5）→ 服务端校验并兑换（无副作用）→
 // 与 Update 共用 commitPhase（写配置 → 提交生效）。
 func (h *Handler) OAuthFinish(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
@@ -349,8 +350,7 @@ h1{font-size:20px;border-bottom:2px solid #0366d6;padding-bottom:10px}
 .card h2{margin:0 0 6px;font-size:17px}
 .path{color:#666;font-weight:normal;font-size:13px}
 label{display:block;margin:10px 0 4px;font-size:14px;color:#333}
-input[type=password],label{display:block;margin:10px 0 4px;font-size:14px;color:#333}
-input[type=text]{width:100%;box-sizing:border-box;padding:8px;border:1px solid #ccc;border-radius:4px;font-size:14px}
+input[type=password],input[type=text]{width:100%;box-sizing:border-box;padding:8px;border:1px solid #ccc;border-radius:4px;font-size:14px}
 button{margin-top:12px;padding:8px 22px;background:#0366d6;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:14px}
 a{color:#0366d6}
 </style></head><body>
@@ -359,7 +359,7 @@ a{color:#0366d6}
 {{if .Message}}<p class="ok">{{.Message}}</p>{{end}}
 {{range .Mounts}}
 <div class="card">
-<h2>{{.Name}} <span class="path">{{.Prefix}}</span></h2>
+<h2>{{.Name}}</h2>
 <p class="st-{{.Status.Color}}">● {{.Status.Label}}</p>
 {{if .Status.Detail}}<p class="warn">{{.Status.Detail}}</p>{{end}}
 {{if .Status.LastCheckAt}}<p class="path">最近检查：{{.Status.LastCheckAt}}</p>{{end}}

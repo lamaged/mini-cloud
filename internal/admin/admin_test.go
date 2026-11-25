@@ -431,7 +431,7 @@ func TestOAuthStartRendersPage(t *testing.T) {
 	}
 }
 
-// TestOAuthFinishHappyPath 批 2（§6.4）：粘贴回调网址 → state/code 解析 →
+// TestOAuthFinishHappyPath 批 2（§6.4）：双输入回填（code 框 + 网址框）→
 // 兑换（__refresh_token 最终值贯穿）→ 写配置 → 提交生效。
 func TestOAuthFinishHappyPath(t *testing.T) {
 	oa := &fakeOAuth{startURL: "https://x/authorize"}
