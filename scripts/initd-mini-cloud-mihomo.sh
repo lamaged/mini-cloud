@@ -43,10 +43,11 @@
 #        - 锁残留且持锁进程已退出时：**不自动回收**，报错并要求人工确认后删除。
 #          原因：自动回收（rm 或 mv）在「A 回收 → C 新建 → B 回收」的时序下会误删
 #          新锁，反而破坏互斥。锁在 /tmp（重启即清空），开机流程不会遇到残留锁。
-#   6) 停止流程以「确认 worker 已退出」为完成条件：
+#   6) 停止流程以「确认 worker 与全部受管服务都已退出」为完成条件：
 #        - 发 TERM / KILL 之前都用 /proc/<pid>/cmdline 校验身份（防 PID 复用误杀）；
-#        - worker 未确认退出、或 PID 记录缺失/损坏导致状态未知时，保留停止旗标并
-#          返回失败，不把「状态未知」当成「已停好」。
+#        - worker 的外部子进程（取包 wget）单独停止并确认（它不随 worker 退出）；
+#        - worker / mini-cloud / mihomo 任一未确认退出、或 PID 记录缺失/损坏导致
+#          状态未知时，保留停止旗标并返回失败，不把「状态未知」当成「已停好」。
 #
 # 【PID 记录 / 身份标记】
 #   WORK_PID 内容为「运行号 PID 身份标记」。它只由 start() 写、stop() 删，
@@ -180,8 +181,24 @@ pid_is_worker() {
 
 worker_alive() { pid_is_worker "$(work_pid)" "$(work_mark)"; }
 
-# 兜底：按身份标记查找残留 worker（排除自己的 PID）
-stray_workers() { pgrep -f "$SELF" 2>/dev/null | grep -v "^$$\$"; }
+# 兜底：按身份标记查找残留 worker。
+# RV-2026-11-26-01（P1-1）：① 显式排除自身 PID（不依赖 grep 引号技巧）；
+# ② 逐 PID 读 /proc/<pid>/cmdline 验证身份；③ 命令字必须是 start/boot/restart——
+# worker 由这些命令 fork；stop 自身及其临时子 shell 的末参是 stop，
+# vi 等编辑器虽含脚本路径但末参不是这些命令——都不会被误杀/误判为残留。
+stray_workers() {
+    _me=$$
+    for _p in $(pgrep -f "$SELF" 2>/dev/null); do
+        [ "$_p" = "$_me" ] && continue
+        _last=$(tr '\0' '\n' < "/proc/$_p/cmdline" 2>/dev/null | tail -n 1)
+        case "$_last" in
+            start|boot|restart) ;;
+            *) continue ;;
+        esac
+        tr '\0' ' ' < "/proc/$_p/cmdline" 2>/dev/null | grep -qF -- "$SELF" || continue
+        echo "$_p"
+    done
+}
 
 # 等某类进程消失（最多 N 秒）；0 = 已消失
 wait_gone() {
@@ -523,13 +540,31 @@ stop() {
         fi
     fi
 
-    # 3) 停 mini-cloud 与 mihomo，并确认它们真的退出（有限等待 + 告警）
+    # 3) 停 mini-cloud 与 mihomo
     # 归属约定：本脚本是该服务的唯一管理者——无论进程由本脚本还是人工启动，
     # stop 都按二进制完整路径停止（init 脚本的标准语义）。
     _p=$(pgrep -f "$MC_BIN"); [ -n "$_p" ] && kill $_p 2>/dev/null
     _p=$(pgrep -f mihomo-linux-arm64); [ -n "$_p" ] && kill $_p 2>/dev/null
-    wait_gone "$MC_BIN" "$SVC_WAIT" || log "警告：mini-cloud ${SVC_WAIT} 秒内仍未消失"
-    wait_gone mihomo-linux-arm64 "$SVC_WAIT" || log "警告：mihomo ${SVC_WAIT} 秒内仍未消失"
+
+    # 3b) 停取包 wget（RV-2026-11-26-01 P1-2）：worker 被 TERM 后，它正在等待的
+    #     wget 子进程不会跟着退出（自身超时 WGET_TIMEOUT 秒），必须按输出文件特征
+    #     找出来停掉并确认——否则「stop 成功」之后仍有旧 wget 在写 /tmp/mihomo.tar.gz。
+    _p=$(pgrep -f "/tmp/mihomo.tar.gz"); [ -n "$_p" ] && kill $_p 2>/dev/null
+    if ! wait_gone "/tmp/mihomo.tar.gz" "$WGET_TIMEOUT"; then
+        _p=$(pgrep -f "/tmp/mihomo.tar.gz"); [ -n "$_p" ] && kill -9 $_p 2>/dev/null
+        wait_gone "/tmp/mihomo.tar.gz" 2 || log "警告：取包 wget 仍未确认退出"
+    fi
+    rm -f /tmp/mihomo.tar.gz
+
+    # 3c) RV-2026-11-26-01（P2）：任一受管服务未确认退出 = 停止失败，不得报成功
+    if ! wait_gone "$MC_BIN" "$SVC_WAIT"; then
+        log "错误：mini-cloud ${SVC_WAIT} 秒内仍未退出（停止未确认）"
+        _confirmed=0
+    fi
+    if ! wait_gone mihomo-linux-arm64 "$SVC_WAIT"; then
+        log "错误：mihomo ${SVC_WAIT} 秒内仍未退出（停止未确认）"
+        _confirmed=0
+    fi
 
     # 4) 清理本脚本负责管理的代理规则（同匹配条件的其他规则也会被删除）。
     # 注意：不恢复 ip_forward（它可能是别的服务开的，恢复成 0 会误伤），
@@ -537,13 +572,13 @@ stop() {
     while iptables -t nat -D PREROUTING -s "$CLIENT_IP" -p tcp \
              -j REDIRECT --to-port "$MIHOMO_PORT" 2>/dev/null; do :; done
 
-    # 5) 只有确认 worker 已退出才撤销旗标、删记录；否则保留并返回失败
+    # 5) 只有确认 worker 与全部受管服务都已退出才撤销旗标、删记录；否则保留并返回失败
     if [ "$_confirmed" = "1" ]; then
         rm -f "$WORK_PID"
         rm -f "$STOP_FLAG"
         log "stopped"
     else
-        log "错误：worker 未能确认退出，保留停止旗标与 PID 记录，请手工检查"
+        log "错误：停止未完全确认（worker / 服务进程 / 取包 wget 仍有残留），保留停止旗标与 PID 记录，请手工检查"
     fi
 
     release_lock

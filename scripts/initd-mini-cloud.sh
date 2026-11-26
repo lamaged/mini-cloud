@@ -132,8 +132,24 @@ pid_is_worker() {
 
 worker_alive() { pid_is_worker "$(work_pid)" "$(work_mark)"; }
 
-# 兜底：按身份标记查找残留 worker（排除自己的 PID）
-stray_workers() { pgrep -f "$SELF" 2>/dev/null | grep -v "^$$\$"; }
+# 兜底：按身份标记查找残留 worker。
+# RV-2026-11-26-01（P1-1）：① 显式排除自身 PID（不依赖 grep 引号技巧）；
+# ② 逐 PID 读 /proc/<pid>/cmdline 验证身份；③ 命令字必须是 start/boot/restart——
+# worker 由这些命令 fork；stop 自身及其临时子 shell 的末参是 stop，
+# vi 等编辑器虽含脚本路径但末参不是这些命令——都不会被误杀/误判为残留。
+stray_workers() {
+    _me=$$
+    for _p in $(pgrep -f "$SELF" 2>/dev/null); do
+        [ "$_p" = "$_me" ] && continue
+        _last=$(tr '\0' '\n' < "/proc/$_p/cmdline" 2>/dev/null | tail -n 1)
+        case "$_last" in
+            start|boot|restart) ;;
+            *) continue ;;
+        esac
+        tr '\0' ' ' < "/proc/$_p/cmdline" 2>/dev/null | grep -qF -- "$SELF" || continue
+        echo "$_p"
+    done
+}
 
 # 等某类进程消失（最多 N 秒）；0 = 已消失
 wait_gone() {
@@ -365,15 +381,19 @@ stop() {
     # 3) 停 mini-cloud（归属约定：本脚本是该服务的唯一管理者，按二进制完整路径停止）
     _p=$(pgrep -f "$MC_BIN")
     [ -n "$_p" ] && kill $_p 2>/dev/null
-    wait_gone "$MC_BIN" 5 || log "警告：mini-cloud 5 秒内仍未消失"
+    # RV-2026-11-26-01（P2）：服务未确认退出 = 停止失败，不得报成功
+    if ! wait_gone "$MC_BIN" 5; then
+        log "错误：mini-cloud 5 秒内仍未退出（停止未确认）"
+        _confirmed=0
+    fi
 
-    # 4) 只有确认 worker 已退出才撤销旗标、删记录；否则保留并返回失败
+    # 4) 只有确认 worker 与服务都已退出才撤销旗标、删记录；否则保留并返回失败
     if [ "$_confirmed" = "1" ]; then
         rm -f "$WORK_PID"
         rm -f "$STOP_FLAG"
         log "stopped"
     else
-        log "错误：worker 未能确认退出，保留停止旗标与 PID 记录，请手工检查"
+        log "错误：停止未完全确认（worker 或 mini-cloud 仍有残留），保留停止旗标与 PID 记录，请手工检查"
     fi
 
     release_lock
