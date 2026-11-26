@@ -6,6 +6,7 @@
 #
 # 【用途】只把 mini-cloud 拉起来，等它的 HTTP 服务能响应后收工。不下载、不启动其他程序。
 # 【适合】只需要 WebDAV（浏览 / 播放 / 下载）的用户。
+# 【定位】正常路径可靠 + 异常明确告警；不做自动故障恢复（操作约定见 scripts/README.md）。
 #
 # 【安装】
 #   cp initd-mini-cloud.sh /etc/init.d/mini-cloud
@@ -36,8 +37,9 @@
 #          只有手工 start/stop 被异常杀死时才会残留，此时人工处理更安全。
 #   5) 停止流程以「确认 worker 已退出」为完成条件：
 #        - 发 TERM / KILL 之前都用 /proc/<pid>/cmdline 校验身份（防 PID 复用误杀）；
-#        - worker 未确认退出、或 PID 记录缺失/损坏导致状态未知时，保留停止旗标并
-#          返回失败，不把「状态未知」当成「已停好」。
+#        - 只对「PID 记录可验证」的 worker 发信号；记录缺失/损坏时只告警 + 返回失败，
+#          不扫描、不杀未知进程（脚本负责不误操作，异常恢复由用户按 README 处理）；
+#        - worker 未确认退出时保留停止旗标并返回失败，不把「状态未知」当成「已停好」。
 #
 # 【PID 记录 / 身份标记】
 #   WORK_PID 内容为「运行号 PID 身份标记」。它只由 start() 写、stop() 删，
@@ -131,25 +133,6 @@ pid_is_worker() {
 }
 
 worker_alive() { pid_is_worker "$(work_pid)" "$(work_mark)"; }
-
-# 兜底：按身份标记查找残留 worker。
-# RV-2026-11-26-01（P1-1）：① 显式排除自身 PID（不依赖 grep 引号技巧）；
-# ② 逐 PID 读 /proc/<pid>/cmdline 验证身份；③ 命令字必须是 start/boot/restart——
-# worker 由这些命令 fork；stop 自身及其临时子 shell 的末参是 stop，
-# vi 等编辑器虽含脚本路径但末参不是这些命令——都不会被误杀/误判为残留。
-stray_workers() {
-    _me=$$
-    for _p in $(pgrep -f "$SELF" 2>/dev/null); do
-        [ "$_p" = "$_me" ] && continue
-        _last=$(tr '\0' '\n' < "/proc/$_p/cmdline" 2>/dev/null | tail -n 1)
-        case "$_last" in
-            start|boot|restart) ;;
-            *) continue ;;
-        esac
-        tr '\0' ' ' < "/proc/$_p/cmdline" 2>/dev/null | grep -qF -- "$SELF" || continue
-        echo "$_p"
-    done
-}
 
 # 等某类进程消失（最多 N 秒）；0 = 已消失
 wait_gone() {
@@ -358,24 +341,12 @@ stop() {
             log "记录的 worker pid $_w 已不是本脚本进程（已退出或 PID 复用），清理过期记录"
         fi
     else
-        # PID 记录缺失或损坏：状态未知，不能直接当作「已停好」。
-        # 用身份标记兜底查找残留 worker，找不到才算确认无 worker。
-        log "警告：PID 记录缺失或格式异常，改用身份标记排查残留 worker"
-        _stray=$(stray_workers)
-        if [ -n "$_stray" ]; then
-            log "发现疑似残留 worker（pid $_stray），按标记停止"
-            kill $_stray 2>/dev/null
-            i=0
-            while [ "$i" -lt "$STOP_WAIT" ] && [ -n "$(stray_workers)" ]; do
-                sleep 1
-                i=$((i+1))
-            done
-            if [ -n "$(stray_workers)" ]; then
-                kill -9 $_stray 2>/dev/null
-                sleep 1
-                [ -n "$(stray_workers)" ] && _confirmed=0
-            fi
-        fi
+        # PID 记录缺失或损坏（RV-2026-11-26-02：脚本负责不误操作）：
+        # 状态未知时不扫描、不杀任何未验证身份的进程——明确告警并返回失败，
+        # 由用户按 scripts/README.md「异常处理」章节手工确认后再操作。
+        log "错误：worker PID 记录缺失或格式异常，无法确认 worker 状态"
+        log "       未做任何进程清理。请先手工确认没有残留 worker，再清理 $WORK_PID 后重试"
+        _confirmed=0
     fi
 
     # 3) 停 mini-cloud（归属约定：本脚本是该服务的唯一管理者，按二进制完整路径停止）

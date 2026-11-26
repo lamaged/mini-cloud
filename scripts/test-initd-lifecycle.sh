@@ -1,13 +1,13 @@
 #!/bin/sh
 # test-initd-lifecycle.sh —— 启动脚本模板的生命周期回归（开发机 sh，无需路由器/root）
 #
-# 覆盖 RV-2026-11-26-01 的回归要求：
-#   1) stray_workers 身份过滤：只有「末参 start/boot/restart」的进程才算 worker；
-#      stop 自身、其临时子 shell、vi 编辑器等含脚本路径的进程一律不误杀。
-#   2) PID 记录损坏（garbage）与缺失（删文件）时执行 stop：不杀 stop 自身、不空转。
-#   3) 服务拒绝退出（忽略 TERM）时 stop 返回失败，不误报成功。
-#   4) 两个 stop 并发：锁互斥，两者都能在有限时间内完成。
-#   5) B 在取包 wget 期间 stop：wget 子进程被杀、残留文件被清。
+# 对应脚本定位（RV-2026-11-26-02）：正常路径可靠 + 异常明确告警、不误操作。
+# 覆盖用例：
+#   1) 未知 PID 状态（记录损坏/缺失）：不扫描、不杀无关进程，告警 + stop 返回失败
+#   2) 服务拒绝退出（忽略 TERM）：stop 返回失败，不误报成功
+#   3) 以「含脚本路径 + 末参 stop」的调用形态（模拟 rc.common）执行 stop：不杀自身、不空转
+#   4) 两个 stop 并发：锁互斥，均能完成，且至少一个正常成功结束
+#   5) B 取包进程：正常响应 TERM → 清理成功；忽略 TERM → 告警 + 返回失败（不强杀）
 #
 # 用法：sh scripts/test-initd-lifecycle.sh
 # 说明：只在开发机跑；真机验证仍需单独执行（本脚本不覆盖开机流程/网络等待）。
@@ -27,49 +27,52 @@ common_env() {
     MC_DIR="$W"; MC_BIN="$W/fake-mc"; MC_CFG="$W/c.json"; MC_LOG="$W/mc.log"
     LOG="$W/boot.log"; WORK_PID="$W/work.pid"; LOCK="$W/lock"; STOP_FLAG="$W/stop"
     SELF=/etc/init.d/t-mc
-    SVC_WAIT=3      # B 用（缩短等待）；A 的 5 秒为硬编码
+    SVC_WAIT=3      # B 用（缩短等待）；A 的服务等待为硬编码 5 秒
 }
 
-# 1) stray_workers 身份过滤
-case_stray() {
-    _path=$1
+# 1) 未知 PID 状态：不扫描、不杀无关进程，告警 + 返回失败
+case_stop_unknown() {
+    _path=$1; _mode=$2      # garbage | missing
     . "$_path" || { bad "source $_path"; return; }
     common_env
-    sh -c "sleep 20" "$SELF" stop  & d1=$!     # 模拟 stop 自身/临时子 shell（末参 stop）
-    sh -c "sleep 20" vi "$SELF"    & d2=$!     # 模拟编辑器（末参不是命令字）
-    sh -c "sleep 20" "$SELF" start & w1=$!     # 模拟 worker（末参 start）
+    # 诱饵：形态与 worker 一致（含 SELF、末参 start）——但记录已损坏，脚本不得按它猜杀
+    sh -c 'sleep 20' "$SELF" start & decoy=$!
     sleep 0.5
-    r=$(stray_workers | tr '\n' ' ')
-    kill $d1 $d2 $w1 2>/dev/null
+    if [ "$_mode" = "garbage" ]; then echo "garbage" > "$WORK_PID"; else rm -f "$WORK_PID"; fi
+    t0=$(date +%s)
+    stop; rc=$?
+    t1=$(date +%s)
+    alive=no; kill -0 $decoy 2>/dev/null && alive=yes
+    kill -9 $decoy 2>/dev/null
+    warned=no; grep -q "无法确认" "$LOG" 2>/dev/null && warned=yes
     rm -rf "$W"
-    if [ "$r" = "$w1 " ]; then
-        ok "stray_workers 只命中 worker（$(basename "$_path")）"
+    if [ "$rc" = "1" ] && [ "$alive" = "yes" ] && [ "$warned" = "yes" ] && [ $((t1-t0)) -lt 8 ]; then
+        ok "未知 PID 状态：告警 + 返回失败、未杀无关进程（$_mode，$(basename "$_path")）"
     else
-        bad "stray_workers=[$r] 期望=[$w1]（$(basename "$_path")）"
+        bad "未知 PID 状态 rc=$rc 诱饵存活=$alive 告警=$warned 耗时=$((t1-t0))s（$_mode，$(basename "$_path")）"
     fi
 }
 
-# 2) PID 记录损坏/缺失 + 服务拒绝退出 → stop 返回失败、不杀自身
+# 2) 服务拒绝退出：stop 返回失败
 case_stop_resilience() {
-    _path=$1; _mode=$2
+    _path=$1
     . "$_path" || { bad "source $_path"; return; }
     common_env
-    sh -c 'trap "" TERM; while :; do sleep 1; done' "$MC_BIN" & svc=$!   # 服务忽略 TERM（命令行保留 MC_BIN 特征）
+    sh -c 'trap "" TERM; while :; do sleep 1; done' "$MC_BIN" & svc=$!
     sleep 0.5
-    if [ "$_mode" = "garbage" ]; then echo "garbage" > "$WORK_PID"; else rm -f "$WORK_PID"; fi
+    echo "garbage" > "$WORK_PID"       # 记录不可验证 → 走「未知状态」分支，不影响服务停止确认
     stop; rc=$?
     alive=no; kill -0 $svc 2>/dev/null && alive=yes
     kill -9 $svc 2>/dev/null
     rm -rf "$W"
     if [ "$rc" = "1" ] && [ "$alive" = "yes" ]; then
-        ok "stop 对未退出服务返回失败（$_mode，$(basename "$_path")）"
+        ok "服务未退出时 stop 返回失败（$(basename "$_path")）"
     else
-        bad "stop rc=$rc 服务存活=$alive（$_mode，$(basename "$_path")）"
+        bad "stop rc=$rc 服务存活=$alive（$(basename "$_path")）"
     fi
 }
 
-# 3) 以「含脚本路径 + 末参 stop」的调用形态（模拟 rc.common）执行 stop：
-#    不杀调用者自身、不因临时子 shell 空转（新实现应快速返回 0）
+# 3) rc.common 形态调用 + 损坏 PID：不杀自身、快速返回（失败而非空转）
 case_selfsafe() {
     _path=$1
     out=$(sh -c '
@@ -83,70 +86,104 @@ case_selfsafe() {
         t0=$(date +%s)
         stop; rc=$?
         t1=$(date +%s)
+        warned=no; grep -q "无法确认" "$LOG" 2>/dev/null && warned=yes
         rm -rf "$W"
-        echo "rc=$rc elapsed=$((t1-t0))"
+        echo "rc=$rc elapsed=$((t1-t0)) warned=$warned"
     ' _ "$_path" stop)
     case "$out" in
-        "rc=0 elapsed="*)
-            _e=${out#rc=0 elapsed=}
-            if [ "$_e" -lt 8 ]; then
-                ok "损坏 PID 记录下 stop 快速成功且未自杀（$(basename "$_path")，${_e}s）"
+        "rc=1 elapsed="*)
+            _e=$(echo "$out" | sed 's/.*elapsed=\([0-9]*\).*/\1/')
+            _w=$(echo "$out" | sed 's/.*warned=\([a-z]*\).*/\1/')
+            if [ "$_e" -lt 8 ] && [ "$_w" = "yes" ]; then
+                ok "rc.common 形态下 stop 快速失败且未自杀（$(basename "$_path")，${_e}s）"
             else
-                bad "stop 空转 ${_e}s（$(basename "$_path")）"
+                bad "stop 空转或无告警：[$out]（$(basename "$_path")）"
             fi ;;
         *)
-            bad "stop 自身被误杀或失败：[$out]（$(basename "$_path")）" ;;
+            bad "stop 自身被误杀或结果异常：[$out]（$(basename "$_path")）" ;;
     esac
 }
 
-# 4) 两个 stop 并发：锁互斥，均能完成
+# 4) 两个 stop 并发：锁互斥，均能完成，且至少一个成功
 case_concurrent_stop() {
     _path=$1
     . "$_path" || { bad "source $_path"; return; }
     common_env
+    sh -c 'sleep 20' "$SELF" start & w=$!      # 可识别的假 worker（有记录、响应 TERM）
+    sleep 0.5
+    echo "run $w $SELF" > "$WORK_PID"
     t0=$(date +%s)
     ( stop; echo $? > "$W/rc1" ) &
     ( stop; echo $? > "$W/rc2" ) &
     wait
     t1=$(date +%s)
     r1=$(cat "$W/rc1" 2>/dev/null); r2=$(cat "$W/rc2" 2>/dev/null)
+    kill -9 $w 2>/dev/null
     rm -rf "$W"
-    if [ "$r1" = "0" ] && [ "$r2" = "0" ]; then
-        ok "两个 stop 并发均成功（$(basename "$_path")，$((t1-t0))s）"
+    if { [ "$r1" = "0" ] || [ "$r2" = "0" ]; } && [ $((t1-t0)) -lt 15 ]; then
+        ok "两个 stop 并发均完成且至少一个成功（$(basename "$_path")，$((t1-t0))s）"
     else
-        bad "并发 stop rc1=$r1 rc2=$r2（$(basename "$_path")）"
+        bad "并发 stop rc1=$r1 rc2=$r2 耗时=$((t1-t0))s（$(basename "$_path")）"
     fi
 }
 
-# 5) B：取包 wget 期间 stop → wget 被杀、残留文件被清
-case_wget_cleanup() {
+# 5a) B：取包进程正常响应 TERM → 清理成功、残留文件被清
+case_wget_term() {
     _path=$1
     . "$_path" || { bad "source $_path"; return; }
     common_env
     WGET_TIMEOUT=3
-    sh -c 'trap "" TERM; sleep 20' /tmp/mihomo.tar.gz & wp=$!   # 模拟不随 worker 退出的 wget
+    sh -c 'sleep 20' "$SELF" start & w=$!        # 有效 worker 记录（可识别、响应 TERM）
+    sleep 0.3
+    echo "run $w $SELF" > "$WORK_PID"
+    sh -c 'sleep 20' wget -q -O /tmp/mihomo.tar.gz http://x & wp=$!  # 取包进程（响应 TERM）
     : > /tmp/mihomo.tar.gz 2>/dev/null
     sleep 0.5
-    echo garbage > "$WORK_PID"
     stop; rc=$?
+    kill -9 $w 2>/dev/null
     alive=no; kill -0 $wp 2>/dev/null && alive=yes; kill -9 $wp 2>/dev/null
     exists=no; [ -e /tmp/mihomo.tar.gz ] && exists=yes
     rm -f /tmp/mihomo.tar.gz; rm -rf "$W"
     if [ "$rc" = "0" ] && [ "$alive" = "no" ] && [ "$exists" = "no" ]; then
-        ok "stop 清理取包 wget 与残留文件（$(basename "$_path")）"
+        ok "取包进程响应 TERM → 停止并清理（$(basename "$_path")）"
     else
-        bad "wget 清理 rc=$rc wget存活=$alive 残留文件=$exists（$(basename "$_path")）"
+        bad "取包清理 rc=$rc 存活=$alive 残留=$exists（$(basename "$_path")）"
+    fi
+}
+
+# 5b) B：取包进程忽略 TERM → 不强杀，告警 + 返回失败
+case_wget_stubborn() {
+    _path=$1
+    . "$_path" || { bad "source $_path"; return; }
+    common_env
+    WGET_TIMEOUT=3
+    sh -c 'sleep 20' "$SELF" start & w=$!        # 有效 worker 记录（可识别、响应 TERM）
+    sleep 0.3
+    echo "run $w $SELF" > "$WORK_PID"
+    sh -c 'trap "" TERM; while :; do sleep 1; done' wget -q -O /tmp/mihomo.tar.gz http://x & wp=$!
+    sleep 0.5
+    stop; rc=$?
+    kill -9 $w 2>/dev/null
+    alive=no; kill -0 $wp 2>/dev/null && alive=yes
+    kill -9 $wp 2>/dev/null
+    warned=no; grep -q "取包 wget 可能仍在运行" "$LOG" 2>/dev/null && warned=yes
+    rm -f /tmp/mihomo.tar.gz; rm -rf "$W"
+    if [ "$rc" = "1" ] && [ "$alive" = "yes" ] && [ "$warned" = "yes" ]; then
+        ok "取包进程忽略 TERM → 告警 + 返回失败、不强杀（$(basename "$_path")）"
+    else
+        bad "顽固取包 rc=$rc 存活=$alive 告警=$warned（$(basename "$_path")）"
     fi
 }
 
 for s in "$A" "$B"; do
-    ( case_stray "$s" )
-    ( case_stop_resilience "$s" garbage )
-    ( case_stop_resilience "$s" missing )
+    ( case_stop_unknown "$s" garbage )
+    ( case_stop_unknown "$s" missing )
+    ( case_stop_resilience "$s" )
     ( case_selfsafe "$s" )
     ( case_concurrent_stop "$s" )
 done
-( case_wget_cleanup "$B" )
+( case_wget_term "$B" )
+( case_wget_stubborn "$B" )
 
 echo
 if [ -s "$FAILFILE" ]; then

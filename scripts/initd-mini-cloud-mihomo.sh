@@ -12,6 +12,7 @@
 #
 # 【适合谁】除了 WebDAV，还要在开机时从云盘自动取回其他程序（默认示例是 mihomo）的用户。
 #          只想要 WebDAV 的用户请用 initd-mini-cloud.sh（范本 A）。
+# 【定位】正常路径可靠 + 异常明确告警；不做自动故障恢复（操作约定见 scripts/README.md）。
 #
 # 【安装】
 #   cp initd-mini-cloud-mihomo.sh /etc/init.d/alist_init
@@ -45,9 +46,10 @@
 #          新锁，反而破坏互斥。锁在 /tmp（重启即清空），开机流程不会遇到残留锁。
 #   6) 停止流程以「确认 worker 与全部受管服务都已退出」为完成条件：
 #        - 发 TERM / KILL 之前都用 /proc/<pid>/cmdline 校验身份（防 PID 复用误杀）；
-#        - worker 的外部子进程（取包 wget）单独停止并确认（它不随 worker 退出）；
-#        - worker / mini-cloud / mihomo 任一未确认退出、或 PID 记录缺失/损坏导致
-#          状态未知时，保留停止旗标并返回失败，不把「状态未知」当成「已停好」。
+#        - 只对「PID 记录可验证」的 worker 与「wget+输出文件双特征可识别」的取包 wget 发信号；
+#          记录缺失/损坏时只告警 + 返回失败，不扫描、不杀未知进程
+#          （脚本负责不误操作，异常恢复由用户按 README 处理）；
+#        - 任一受管进程未确认退出时保留停止旗标并返回失败，不把「状态未知」当成「已停好」。
 #
 # 【PID 记录 / 身份标记】
 #   WORK_PID 内容为「运行号 PID 身份标记」。它只由 start() 写、stop() 删，
@@ -180,25 +182,6 @@ pid_is_worker() {
 }
 
 worker_alive() { pid_is_worker "$(work_pid)" "$(work_mark)"; }
-
-# 兜底：按身份标记查找残留 worker。
-# RV-2026-11-26-01（P1-1）：① 显式排除自身 PID（不依赖 grep 引号技巧）；
-# ② 逐 PID 读 /proc/<pid>/cmdline 验证身份；③ 命令字必须是 start/boot/restart——
-# worker 由这些命令 fork；stop 自身及其临时子 shell 的末参是 stop，
-# vi 等编辑器虽含脚本路径但末参不是这些命令——都不会被误杀/误判为残留。
-stray_workers() {
-    _me=$$
-    for _p in $(pgrep -f "$SELF" 2>/dev/null); do
-        [ "$_p" = "$_me" ] && continue
-        _last=$(tr '\0' '\n' < "/proc/$_p/cmdline" 2>/dev/null | tail -n 1)
-        case "$_last" in
-            start|boot|restart) ;;
-            *) continue ;;
-        esac
-        tr '\0' ' ' < "/proc/$_p/cmdline" 2>/dev/null | grep -qF -- "$SELF" || continue
-        echo "$_p"
-    done
-}
 
 # 等某类进程消失（最多 N 秒）；0 = 已消失
 wait_gone() {
@@ -520,24 +503,12 @@ stop() {
             log "记录的 worker pid $_w 已不是本脚本进程（已退出或 PID 复用），清理过期记录"
         fi
     else
-        # PID 记录缺失或损坏：状态未知，不能直接当作「已停好」。
-        # 用身份标记兜底查找残留 worker，找不到才算确认无 worker。
-        log "警告：PID 记录缺失或格式异常，改用身份标记排查残留 worker"
-        _stray=$(stray_workers)
-        if [ -n "$_stray" ]; then
-            log "发现疑似残留 worker（pid $_stray），按标记停止"
-            kill $_stray 2>/dev/null
-            i=0
-            while [ "$i" -lt "$STOP_WAIT" ] && [ -n "$(stray_workers)" ]; do
-                sleep 1
-                i=$((i+1))
-            done
-            if [ -n "$(stray_workers)" ]; then
-                kill -9 $_stray 2>/dev/null
-                sleep 1
-                [ -n "$(stray_workers)" ] && _confirmed=0
-            fi
-        fi
+        # PID 记录缺失或损坏（RV-2026-11-26-02：脚本负责不误操作）：
+        # 状态未知时不扫描、不杀任何未验证身份的进程——明确告警并返回失败，
+        # 由用户按 scripts/README.md「异常处理」章节手工确认后再操作。
+        log "错误：worker PID 记录缺失或格式异常，无法确认 worker 状态"
+        log "       未做任何进程清理。请先手工确认没有残留 worker，再清理 $WORK_PID 后重试"
+        _confirmed=0
     fi
 
     # 3) 停 mini-cloud 与 mihomo
@@ -546,13 +517,16 @@ stop() {
     _p=$(pgrep -f "$MC_BIN"); [ -n "$_p" ] && kill $_p 2>/dev/null
     _p=$(pgrep -f mihomo-linux-arm64); [ -n "$_p" ] && kill $_p 2>/dev/null
 
-    # 3b) 停取包 wget（RV-2026-11-26-01 P1-2）：worker 被 TERM 后，它正在等待的
-    #     wget 子进程不会跟着退出（自身超时 WGET_TIMEOUT 秒），必须按输出文件特征
-    #     找出来停掉并确认——否则「stop 成功」之后仍有旧 wget 在写 /tmp/mihomo.tar.gz。
-    _p=$(pgrep -f "/tmp/mihomo.tar.gz"); [ -n "$_p" ] && kill $_p 2>/dev/null
-    if ! wait_gone "/tmp/mihomo.tar.gz" "$WGET_TIMEOUT"; then
-        _p=$(pgrep -f "/tmp/mihomo.tar.gz"); [ -n "$_p" ] && kill -9 $_p 2>/dev/null
-        wait_gone "/tmp/mihomo.tar.gz" 2 || log "警告：取包 wget 仍未确认退出"
+    # 3b) 停取包 wget：worker 被 TERM 后，它正在等待的 wget 子进程不会跟着退出
+    #     （自身超时 WGET_TIMEOUT 秒）。识别特征必须同时含「wget」与输出文件路径
+    #     （仅按路径匹配会误杀碰巧命令行含该路径的其他进程，如 vi）。
+    #     只发停止信号 + 有界等待；请不动就明确报错交用户处理
+    #     （RV-2026-11-26-02：不做强杀升级、不扩大自动清理范围）。
+    _fetch_pat="wget.*mihomo\.tar\.gz"
+    _p=$(pgrep -f "$_fetch_pat"); [ -n "$_p" ] && kill $_p 2>/dev/null
+    if ! wait_gone "$_fetch_pat" "$WGET_TIMEOUT"; then
+        log "错误：取包 wget 可能仍在运行（最多 ${WGET_TIMEOUT} 秒后自行结束），请稍候再 start"
+        _confirmed=0
     fi
     rm -f /tmp/mihomo.tar.gz
 
