@@ -4,6 +4,8 @@
 
 ## 待拍板
 
+- [ ] 启动脚本模板（scripts/initd-mini-cloud.sh / initd-mini-cloud-mihomo.sh）外部审核通过后：①真机替换验收——新 B 替换 /etc/init.d/alist_init（旧版备份 .prev 供回滚），复验冷启动×2 / stop 确认全停 + iptables 清理 / boot 等待期 stop 不复活 / 重复 start 互斥；②README「开机自启」小抄与新模板的整合方式（PM 拍板：保留小抄身形或改为指向模板）；③设备私有版 alist_init 的退役时机
+
 - [x] ~~Q2/Q3：百度网盘开放平台「授权码手工回填」模式可行性 + 一键授权 redirect_uri 具体值——批 2 开工前用 PM 应用实测~~ **已闭（2026-11-25 真机实测）**：redirect_uri=oob 控制台可填生效；oob 模式以页面文字展示授权码、URL 不含 code 但保留 state——回填适配为「授权码 + 地址栏网址」双输入，成对校验不变
 - [ ] Q4：批 1/批 2 版本号与发布节奏（批 1 先行发版或两批合发）——发版时 PM 定
 - [ ] 百度加密（D）是否立项：本轮不纳入；需先出可行性报告（百度 CDN Range 行为、会员/非会员差别真机实测）再拍板——挂起，可放弃
