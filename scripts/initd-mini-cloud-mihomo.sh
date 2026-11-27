@@ -254,7 +254,7 @@ work() {
     fi
 
     # [6/8] 下载 mihomo（双云盘互备，有限重试）
-    step 7 "下载 mihomo"
+    step 8 "下载 mihomo"
     _ok=0; _t=1
     while [ "$_t" -le "$FETCH_TRIES" ]; do
         stop_requested && { ok "收到停止请求，中止"; say "===== 已中止 ====="; return 0; }
@@ -320,7 +320,7 @@ work() {
     if [ "$_fwd" = "1" ] && [ "$_ipt" = "1" ]; then
         ok "ip_forward 与 iptables 规则均已就绪"
     else
-        fail "转发配置未完全成功（ip_forward=$_fwd iptables=$_ipt）：代理不可用，请检查系统转发设置后重试"
+        fail "转发配置未完全成功（ip_forward=$_fwd iptables=$_ipt）：代理不可用，请检查 ip_forward 设置及 iptables 规则后重试"
         say "===== 启动失败（第 8 步）====="; return 1
     fi
 
