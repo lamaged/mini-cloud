@@ -109,57 +109,21 @@ tail -n 5 /data/mini-cloud/mini-cloud.log
 - 浏览器打开 `http://<router-ip>:8088/`，输入 `config.json` 里设的用户名密码——能看到你的网盘列表 = 成功；
 - 电视/手机播放器：新建 WebDAV 源，地址填 `http://<router-ip>:8088/<网盘name>/`，账号密码同上（各家播放器的填法见[附录 B](#附录-b播放器怎么连)）。
 
-> **重启后自动运行（小抄）**：建一个开机自启脚本（OpenWrt 标准做法），分三步：
+> **重启后自动运行（小抄）**：用仓库里现成的脚本——只用 WebDAV 选 [scripts/initd-mini-cloud.sh](scripts/initd-mini-cloud.sh)；还要开机从云盘取 mihomo 用 [scripts/initd-mini-cloud-mihomo.sh](scripts/initd-mini-cloud-mihomo.sh)。**两个只能装一个**（会抢 8088 端口）。三步：
 
-第 1 步：用 WinSCP 新建文件 `/etc/init.d/mini-cloud`，内容如下：
+第 1 步：把选好的脚本下载到电脑上，改掉文件头带 `<...>` 的占位符（路由器地址、网盘名等，按注释填写）；操作约定与风险说明见 [scripts/README.md](scripts/README.md)。
 
-```sh
-#!/bin/sh /etc/rc.common
-# mini-cloud 开机自启
-START=99
-
-PROG=/data/mini-cloud/mini-cloud-arm64-upx
-CONFIG=/data/mini-cloud/config/config.json
-LOG=/data/mini-cloud/mini-cloud.log
-PID_FILE=/tmp/mini-cloud.pid
-RUN_FLAG=/tmp/mini-cloud.run
-
-start() {
-    # 已经在跑就不重复启动；上次崩溃留下的标记要清掉重新拉起
-    if [ -f ${RUN_FLAG} ] && kill -0 $(cat ${PID_FILE}) 2>/dev/null; then
-        return 0
-    fi
-    rm -f ${RUN_FLAG} ${PID_FILE}
-    touch ${LOG}
-    echo "" >> ${LOG}
-    echo "===== boot $(date) =====" >> ${LOG}
-    touch ${RUN_FLAG}
-    sleep 20    # 等网络就绪（如果启动时网盘没连上，可调大到 60）
-    [ -f ${RUN_FLAG} ] || return 0    # 等待期间被 stop 了，就不启动
-    ${PROG} -config ${CONFIG} >> ${LOG} 2>&1 &
-    echo $! > ${PID_FILE}
-}
-
-stop() {
-    rm -f ${RUN_FLAG}    # 先摘标记，防止 start 的等待醒来后又拉起进程
-    [ -f ${PID_FILE} ] && kill $(cat ${PID_FILE}) >> ${LOG} 2>&1
-    rm -f ${PID_FILE}
-}
-```
-
-> 说明：`RUN_FLAG` 是运行标记——防止重复启动、也防止「stop 之后等待期醒来又自己拉起来」；`PID_FILE` 记着进程号，`stop` 只杀本程序的进程。
-
-第 2 步：SSH 登录路由器，执行：
+第 2 步：用 WinSCP 传到路由器的 `/etc/init.d/` 下，改名为你的服务名（如 `mini-cloud`），SSH 执行：
 
 ```bash
-chmod +x /etc/init.d/mini-cloud
-/etc/init.d/mini-cloud enable
-/etc/init.d/mini-cloud start
+chmod +x /etc/init.d/<服务名>
+/etc/init.d/<服务名> enable
 ```
 
 第 3 步：验证
 
-重启路由器，等 1 分钟，浏览器打开 `http://<router-ip>:8088/` 能看到网盘列表 = 自启成功。
+- **手工启动看状态**：`/etc/init.d/<服务名> start`——屏幕上会一步步显示 `[1/5] 检测网络........成功`、`[2/5] 检查系统时间........成功`……，看到「启动完成」即成功；哪一步失败会显示原因和建议；
+- **开机验证**：重启路由器，等 1 分钟，浏览器打开 `http://<router-ip>:8088/` 能看到网盘列表 = 自启成功（开机过程同样逐步记录在 `/tmp` 日志里，路径见 scripts/README.md）。
 
 ---
 
@@ -199,7 +163,7 @@ mcrypt.exe encrypt -key vault.key -in 明文目录 -out 上传目录
 | 天翼的 4K 卡顿，移动的不卡 | 天翼 CDN 对单链接限速约 50 Mbps，高码率 4K 必然卡 | 换移动云盘播 4K，或等天翼策略变化 |
 | 加密目录是空的 / 文件点开报错 | 多半是文件还没上传完（上传中间态） | 等上传完成，≤5 分钟自动恢复 |
 | 上传了加密目录却不显示 | `_mc` 放错层级（应放在 `backup/<目录名>/_mc`） | 云盘里移动 `_mc` 到正确位置；`/admin` 有对应警告 |
-| 想清日志 | 用覆盖清空 | `> /data/mini-cloud/mini-cloud.log`（别用 rm 删文件） |
+| 想清日志 | 用覆盖清空 | `> /data/mini-cloud/mini-cloud.log`（部署脚本启动）或 `> /data/mini-cloud/log/mini-cloud.log`（自启脚本启动）（别用 rm 删文件） |
 | 忘记路由器地址/账号 | 看 config.json | `listen` 是端口，`username/password` 是登录账号 |
 
 ---
@@ -210,7 +174,7 @@ mcrypt.exe encrypt -key vault.key -in 明文目录 -out 上传目录
 - 百度网盘挂载不启用加密（只读直连）；非会员高码率可能卡顿（百度 CDN 策略）；
 - 加密播放仅支持天翼 / 移动；
 - 天翼家庭 CDN 单链接限速 ~50 Mbps（4K 高码率必然卡顿，与网关无关）；
-- 进程崩溃后需手工重启：SSH 登录路由器，执行 `/etc/init.d/mini-cloud restart`（脚本会自动清掉崩溃残留的标记）；
+- 进程崩溃后需手工重启：SSH 登录路由器，执行 `/etc/init.d/<服务名> restart`（服务名是安装自启脚本时起的名字）；
 - 局域网内 HTTP 明文传输（含 Basic Auth 口令）；需要更安全请自行前置 HTTPS 反向代理；
 - 仅支持单账户单用户。
 
@@ -305,6 +269,7 @@ tail -f /data/mini-cloud/mini-cloud.log
 - **新增** 百度凭证更新通道：删除源码内置公共凭据，`client_id`/`client_secret` 必填（百度网盘开放平台应用）；管理页粘贴 `refresh_token` 更新（验证不碰运行状态、失败零变化）
 - **新增** 百度一键授权：管理页「开始授权」→ 百度登录同意 → 复制授权码 + 地址栏网址回填 → 自动换票落盘（回调地址控制台填 `oob`）
 - **新增** 管理页「重启服务」按钮：原地重启（进程号不变、日志连续），免 SSH
+- **新增** 开机自启脚本模板（`scripts/initd-mini-cloud.sh` 纯 WebDAV / `scripts/initd-mini-cloud-mihomo.sh` 另从云盘加密目录取 mihomo）：手工 start 时每步状态实时显示在屏幕上、开机时后台执行并逐步骤写日志，哪步失败给原因和建议；操作约定见 `scripts/README.md`
 - **加固** 百度刷新链路：同挂载刷新单飞（并发共享一次上游请求）、换发的新票原子写回配置（防旧票重启作废）、失效分类（票作废=红+重新授权；网络/存储问题=红/黄提示）、失败限频防风暴、token 缓存纯缓存化 + 原子落盘
 - **测试** 外部审核三轮 + 安全审核闭环；真机验收全通过（一键授权、重启按钮、隔离回归、空闲内存 14 MB）
 
