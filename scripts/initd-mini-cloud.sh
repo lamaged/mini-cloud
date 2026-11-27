@@ -16,7 +16,7 @@
 #   /etc/init.d/mini-cloud enable
 #   reboot
 #
-# 【二选一】若用范本 B（initd-mini-cloud-mihomo.sh），本脚本不要安装（会抢 8088 端口）。
+# 【二选一】若用范本 B（initd-mini-cloud-mihello.sh），本脚本不要安装（会抢 8088 端口）。
 #
 # 【真机硬约束（都是实测踩出来的）】
 #   1) mini-cloud 必须在 /data/mini-cloud 下启动（state/ 相对工作目录）。

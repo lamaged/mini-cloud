@@ -109,7 +109,7 @@ tail -n 5 /data/mini-cloud/mini-cloud.log
 - 浏览器打开 `http://<router-ip>:8088/`，输入 `config.json` 里设的用户名密码——能看到你的网盘列表 = 成功；
 - 电视/手机播放器：新建 WebDAV 源，地址填 `http://<router-ip>:8088/<网盘name>/`，账号密码同上（各家播放器的填法见[附录 B](#附录-b播放器怎么连)）。
 
-> **重启后自动运行（小抄）**：用仓库里现成的脚本——只用 WebDAV 选 [scripts/initd-mini-cloud.sh](scripts/initd-mini-cloud.sh)；还要开机从云盘取 mihomo 用 [scripts/initd-mini-cloud-mihomo.sh](scripts/initd-mini-cloud-mihomo.sh)。**两个只能装一个**（会抢 8088 端口）。三步：
+> **重启后自动运行（小抄）**：用仓库里现成的脚本——只用 WebDAV 选 [scripts/initd-mini-cloud.sh](scripts/initd-mini-cloud.sh)；还要开机从云盘取一个自己的应用（示例名 mihello）用 [scripts/initd-mini-cloud-mihello.sh](scripts/initd-mini-cloud-mihello.sh)。**两个只能装一个**（会抢 8088 端口）。三步：
 
 第 1 步：把选好的脚本下载到电脑上，改掉文件头带 `<...>` 的占位符（路由器地址、网盘名等，按注释填写）；操作约定与风险说明见 [scripts/README.md](scripts/README.md)。
 
@@ -269,7 +269,7 @@ tail -f /data/mini-cloud/mini-cloud.log
 - **新增** 百度凭证更新通道：删除源码内置公共凭据，`client_id`/`client_secret` 必填（百度网盘开放平台应用）；管理页粘贴 `refresh_token` 更新（验证不碰运行状态、失败零变化）
 - **新增** 百度一键授权：管理页「开始授权」→ 百度登录同意 → 复制授权码 + 地址栏网址回填 → 自动换票落盘（回调地址控制台填 `oob`）
 - **新增** 管理页「重启服务」按钮：原地重启（进程号不变、日志连续），免 SSH
-- **新增** 开机自启脚本模板（`scripts/initd-mini-cloud.sh` 纯 WebDAV / `scripts/initd-mini-cloud-mihomo.sh` 另从云盘加密目录取 mihomo）：手工 start 时每步状态实时显示在屏幕上、开机时后台执行并逐步骤写日志，哪步失败给原因和建议；操作约定见 `scripts/README.md`
+- **新增** 开机自启脚本模板（`scripts/initd-mini-cloud.sh` 纯 WebDAV / `scripts/initd-mini-cloud-mihello.sh` 另从云盘加密目录取示例应用 mihello）：手工 start 时每步状态实时显示在屏幕上、开机时后台执行并逐步骤写日志，哪步失败给原因和建议；操作约定见 `scripts/README.md`
 - **加固** 百度刷新链路：同挂载刷新单飞（并发共享一次上游请求）、换发的新票原子写回配置（防旧票重启作废）、失效分类（票作废=红+重新授权；网络/存储问题=红/黄提示）、失败限频防风暴、token 缓存纯缓存化 + 原子落盘
 - **测试** 外部审核三轮 + 安全审核闭环；真机验收全通过（一键授权、重启按钮、隔离回归、空闲内存 14 MB）
 

@@ -14,7 +14,7 @@
 set -u
 DIR=$(cd "$(dirname "$0")" && pwd)
 A="$DIR/initd-mini-cloud.sh"
-B="$DIR/initd-mini-cloud-mihomo.sh"
+B="$DIR/initd-mini-cloud-mihello.sh"
 
 FAILFILE=$(mktemp)
 export FAILFILE
@@ -93,13 +93,13 @@ case_wget_term() {
     _path=$1
     . "$_path" || { fail_case "source $_path"; return; }
     common_env
-    sh -c 'sleep 20' wget -q -O /tmp/mihomo.tar.gz http://x & wp=$!
-    : > /tmp/mihomo.tar.gz 2>/dev/null
+    sh -c 'sleep 20' wget -q -O /tmp/mihello.tar.gz http://x & wp=$!
+    : > /tmp/mihello.tar.gz 2>/dev/null
     sleep 0.5
     stop; rc=$?
     alive=no; kill -0 $wp 2>/dev/null && alive=yes; kill -9 $wp 2>/dev/null
-    exists=no; [ -e /tmp/mihomo.tar.gz ] && exists=yes
-    rm -f /tmp/mihomo.tar.gz; rm -rf "$W"
+    exists=no; [ -e /tmp/mihello.tar.gz ] && exists=yes
+    rm -f /tmp/mihello.tar.gz; rm -rf "$W"
     if [ "$rc" = "0" ] && [ "$alive" = "no" ] && [ "$exists" = "no" ]; then
         pass_case "取包进程响应 TERM → 停止并清理（$(basename "$_path")）"
     else
@@ -112,13 +112,13 @@ case_wget_stubborn() {
     _path=$1
     . "$_path" || { fail_case "source $_path"; return; }
     common_env
-    sh -c 'trap "" TERM; while :; do sleep 1; done' wget -q -O /tmp/mihomo.tar.gz http://x & wp=$!
+    sh -c 'trap "" TERM; while :; do sleep 1; done' wget -q -O /tmp/mihello.tar.gz http://x & wp=$!
     sleep 0.5
     stop; rc=$?
     alive=no; kill -0 $wp 2>/dev/null && alive=yes
     kill -9 $wp 2>/dev/null
     warned=no; grep -q "取包 wget 可能仍在运行" "$LOG" 2>/dev/null && warned=yes
-    rm -f /tmp/mihomo.tar.gz; rm -rf "$W"
+    rm -f /tmp/mihello.tar.gz; rm -rf "$W"
     if [ "$rc" = "1" ] && [ "$alive" = "yes" ] && [ "$warned" = "yes" ]; then
         pass_case "取包进程忽略 TERM → 失败提示、不强杀（$(basename "$_path")）"
     else

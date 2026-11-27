@@ -1,6 +1,6 @@
 # 开机自启脚本（initd-mini-cloud*.sh）使用与风险说明
 
-> 适用于 `initd-mini-cloud.sh`（范本 A）与 `initd-mini-cloud-mihomo.sh`（范本 B）。
+> 适用于 `initd-mini-cloud.sh`（范本 A）与 `initd-mini-cloud-mihello.sh`（范本 B）。
 > 脚本定位（v3，PM 拍板 2026-11-27）：**按顺序执行 → 每步如实报告「开始/成功/失败」→ 失败给一句原因和建议**。
 > 外部问题（网络、云盘、时间）只检测和报告，不修复；异常恢复由人处理。
 
@@ -31,7 +31,7 @@
 ## 1. 管理范围
 
 - **范本 A**：只管理 mini-cloud（WebDAV）。
-- **范本 B**：管理 mini-cloud + 从云盘加密单元取回的 mihomo。
+- **范本 B**：管理 mini-cloud + 从云盘加密单元取回的示例应用（示例名 `mihello`——实际加载什么应用由你自己决定：把包名、二进制名、健康检查地址与 token 换成你自己应用的即可）。
 - **两份范本互斥安装，不得同时启用**（会抢 8088 端口）。
 - mini-cloud 必须从 `/data/mini-cloud` 工作目录启动（`state/` 相对工作目录，从别处起会丢会话）。
 - 脚本只管理自己拉起/记录的这几类进程；其他服务不在管理范围。
@@ -50,23 +50,23 @@
 - **stop 返回失败或日志提示「未确认退出」**：不要立即再次 start；先确认残留进程并手工处理，再重试。
 - **PID 记录缺失/损坏**：脚本不扫描、不杀任何未验证身份的进程，只告警并返回失败；按日志提示手工确认没有残留 worker 后，清理 `/tmp` 下对应状态文件再操作。
 - **取包 wget 未确认退出（范本 B）**：等日志提示的秒数后自行结束；其间不要 start。
-- **下载 / 解压 / mihomo 启动失败**：查看开机日志与 `/tmp` 临时文件，确认云盘内包完整可读后再重启。
+- **下载 / 解压 / mihello 启动失败**：查看开机日志与 `/tmp` 临时文件，确认云盘内包完整可读后再重启。
 - **不要**在脚本运行期间手工删除锁目录、停止旗标或 PID 记录文件。
 
 ### 状态文件清单与清理时机（/tmp，重启自动清空）
 
 | 用途 | 范本 A | 范本 B |
 |---|---|---|
-| 操作日志 | `/tmp/mini-cloud-boot.log` | `/tmp/mini-cloud-mihomo.log` |
-| worker 记录（运行号 PID 身份标记） | `/tmp/mini-cloud-work.pid` | `/tmp/mini-cloud-mihomo-work.pid` |
-| 启动锁目录 | `/tmp/mini-cloud.lock` | `/tmp/mini-cloud-mihomo.lock` |
-| 停止旗标 | `/tmp/mini-cloud.stop` | `/tmp/mini-cloud-mihomo.stop` |
-| 取包临时文件（B 专用） | — | `/tmp/mihomo.tar.gz`、`/tmp/mihomo_check`、目录 `/tmp/mihomo/` |
+| 操作日志 | `/tmp/mini-cloud-boot.log` | `/tmp/mini-cloud-mihello.log` |
+| worker 记录（运行号 PID 身份标记） | `/tmp/mini-cloud-work.pid` | `/tmp/mini-cloud-mihello-work.pid` |
+| 启动锁目录 | `/tmp/mini-cloud.lock` | `/tmp/mini-cloud-mihello.lock` |
+| 停止旗标 | `/tmp/mini-cloud.stop` | `/tmp/mini-cloud-mihello.stop` |
+| 取包临时文件（B 专用） | — | `/tmp/mihello.tar.gz`、`/tmp/mihello_check`、目录 `/tmp/mihello/` |
 
 清理时机（按顺序）：
 
-1. **先确认进程**：`ps | grep -E "mini-cloud|mihomo"` 确认没有相关进程；
-2. **再删 worker 记录与停止旗标**（范本 B 为 `/tmp/mini-cloud-mihomo-work.pid` 与 `/tmp/mini-cloud-mihomo.stop`）——**进程还活着时不要删停止旗标**：它是「让 worker 别再拉起服务」的唯一信号，删了等于撤销停止请求；
+1. **先确认进程**：`ps | grep -E "mini-cloud|mihello"` 确认没有相关进程；
+2. **再删 worker 记录与停止旗标**（范本 B 为 `/tmp/mini-cloud-mihello-work.pid` 与 `/tmp/mini-cloud-mihello.stop`）——**进程还活着时不要删停止旗标**：它是「让 worker 别再拉起服务」的唯一信号，删了等于撤销停止请求；
 3. **锁目录**只在确定没有 start/stop 正在进行时删；日志提示「启动锁残留（持锁进程已退出）」即表示可以删；
 4. 日志与取包临时文件可随时清理（/tmp 为内存盘，重启自动清空）。
 
@@ -82,12 +82,12 @@
 ## 5. 更新与维护
 
 - **更新脚本前先 stop**；替换后检查配置文件、可执行位与语法（`sh -n`）。
-- 更新 mihomo 包：确认云盘加密单元内的包完整、可读取；包为受信任的自有产物。
+- 更新 mihello 包：确认云盘加密单元内的包完整、可读取；包为受信任的自有产物。
 - 修改脚本后：先跑本地生命周期回归 `sh scripts/test-initd-lifecycle.sh`（开发机，无需路由器），再在路由器上完成实际启停 + 冷启动验证。
 - 审核分级（PM 拍板 2026-11-26）：**P0**（误杀/数据破坏/正常路径失败）改代码；**P1** 优先简单修复或写入本说明的操作约定；**P2** 记 TODO，不阻断交付。
 
 ## 6. 日志与排查锚点
 
-- 开机流程日志：`/tmp/mini-cloud-boot.log`（范本 A）/ `/tmp/mini-cloud-mihomo.log`（范本 B）（内存盘，重启清空）。
+- 开机流程日志：`/tmp/mini-cloud-boot.log`（范本 A）/ `/tmp/mini-cloud-mihello.log`（范本 B）（内存盘，重启清空）。
 - mini-cloud 日志：`/data/mini-cloud/log/mini-cloud.log`。
 - 排查锚点见各脚本文件头「排查锚点」段。

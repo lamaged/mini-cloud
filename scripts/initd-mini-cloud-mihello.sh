@@ -1,6 +1,11 @@
 #!/bin/sh /etc/rc.common
 #
-# initd-mini-cloud-mihomo.sh —— 开机：启动 mini-cloud，再从网盘加密单元取 mihomo 并启动（范本 B）
+# initd-mini-cloud-mihello.sh —— 开机：启动 mini-cloud，再从网盘加密单元取 mihello 并启动（范本 B）
+#
+# 【示例应用说明】本范本里的「mihello」只是一个**示例应用名**，用来演示
+#   「开机从云盘加密目录取一个程序并启动」。实际要加载什么应用由你自己决定：
+#   把包名（MIHELLO_TGZ）、二进制名（MIHELLO_BIN）、启动参数（-d $DATA_DIR）、
+#   健康检查地址（MIHELLO_API）与认证 token 换成你自己应用的即可。
 #
 # 【定位（v3，PM 拍板 2026-11-27）】脚本只做三件事：
 #   按顺序执行 → 每步如实报告「开始/成功/失败」 → 失败给一句原因和建议。
@@ -11,7 +16,7 @@
 #   手工 SSH（/etc/init.d/<服务名> start）：前台执行，每步实时打在屏幕上 + 同样写日志。
 #
 # 【安装】
-#   cp initd-mini-cloud-mihomo.sh /etc/init.d/alist_init
+#   cp initd-mini-cloud-mihello.sh /etc/init.d/alist_init
 #   chmod +x /etc/init.d/alist_init
 #   /etc/init.d/alist_init enable
 #   reboot
@@ -22,7 +27,7 @@
 #   1) mini-cloud 必须在 /data/mini-cloud 下启动（state/ 相对工作目录）。
 #   2) 开机流程放在后台子进程里跑：boot 阶段 rc.common 会对主脚本发 TERM（实测约 40 秒），
 #      不会波及它 fork 出来的子进程。
-#   3) mihomo 包必须放在「加密单元」里（默认 backup/AX6）：普通目录会 302 跳到 https，
+#   3) mihello 包必须放在「加密单元」里（默认 backup/AX6）：普通目录会 302 跳到 https，
 #      BusyBox wget 没有 TLS；加密单元由 mini-cloud 解密后以 HTTP 直出。
 #   4) 所有等待都有上限；不用固定 sleep 等网络/就绪。
 #
@@ -48,16 +53,16 @@ MC_PASS=""
 CLOUD_NAME_1="<云盘名-1>"      # = config.json 里 clouds[].name（主用云盘）
 CLOUD_NAME_2="<云盘名-2>"      # = config.json 里 clouds[].name（备用云盘）
 CLOUD_SUBDIR=backup/AX6         # 加密单元路径（容器名/单元名）
-MIHOMO_TGZ=mihomo.tar.gz
+MIHELLO_TGZ=mihello.tar.gz
 
-# ---- mihomo ----
-MIHOMO_DIR=/tmp/mihomo
-DATA_DIR=/data/mihomo
-MIHOMO_BIN="$MIHOMO_DIR/mihomo-linux-arm64"
-MIHOMO_API="http://<router-ip>:9092/version"
-MIHOMO_TOKEN=123456             # ★示例值：必须改成与 mihomo 配置一致的 secret
+# ---- mihello ----
+MIHELLO_DIR=/tmp/mihello
+DATA_DIR=/data/mihello
+MIHELLO_BIN="$MIHELLO_DIR/mihello-linux-arm64"
+MIHELLO_API="http://<router-ip>:9092/version"
+MIHELLO_TOKEN=123456             # ★示例值：必须改成与 mihello 配置一致的 secret
 CLIENT_IP="<client-ip>"
-MIHOMO_PORT=7892
+MIHELLO_PORT=7892
 
 # ---- 等待参数 ----
 NET_WAIT_MAX=120              # 120 × 5 秒 = 10 分钟
@@ -69,10 +74,10 @@ STOP_WAIT=5                   # 等进程退出的上限（秒）
 
 # ---- 内部文件 ----
 SELF="${initscript:-$0}"
-LOG=/tmp/mini-cloud-mihomo.log
-WORK_PID=/tmp/mini-cloud-mihomo-work.pid
-LOCK=/tmp/mini-cloud-mihomo.lock
-STOP_FLAG=/tmp/mini-cloud-mihomo.stop
+LOG=/tmp/mini-cloud-mihello.log
+WORK_PID=/tmp/mini-cloud-mihello-work.pid
+LOCK=/tmp/mini-cloud-mihello.lock
+STOP_FLAG=/tmp/mini-cloud-mihello.stop
 MC_MODE=boot
 
 # ============================================================
@@ -168,16 +173,16 @@ mc_running() { pgrep -f "$MC_BIN" >/dev/null 2>&1; }
 fetch_once() {
     for cloud in "$CLOUD_NAME_1" "$CLOUD_NAME_2"; do
         stop_requested && { log "收到停止请求（取包 $cloud）"; return 2; }
-        _url="http://${MC_USER}:${MC_PASS}@${MC_HOST}:${MC_PORT}/${cloud}/${CLOUD_SUBDIR}/${MIHOMO_TGZ}"
+        _url="http://${MC_USER}:${MC_PASS}@${MC_HOST}:${MC_PORT}/${cloud}/${CLOUD_SUBDIR}/${MIHELLO_TGZ}"
         _safe=$(echo "$_url" | sed 's/:[^:@/]*@/:***@/')
-        rm -f /tmp/mihomo.tar.gz
+        rm -f /tmp/mihello.tar.gz
         log "fetch $_safe"
-        if wget -q -T "$WGET_TIMEOUT" -O /tmp/mihomo.tar.gz "$_url" \
-           && tar -tzf /tmp/mihomo.tar.gz 2>/dev/null | grep -q 'mihomo/'; then
-            log "got ${MIHOMO_TGZ} from [${cloud}] ($(wc -c < /tmp/mihomo.tar.gz) bytes)"
+        if wget -q -T "$WGET_TIMEOUT" -O /tmp/mihello.tar.gz "$_url" \
+           && tar -tzf /tmp/mihello.tar.gz 2>/dev/null | grep -q 'mihello/'; then
+            log "got ${MIHELLO_TGZ} from [${cloud}] ($(wc -c < /tmp/mihello.tar.gz) bytes)"
             return 0
         fi
-        rm -f /tmp/mihomo.tar.gz
+        rm -f /tmp/mihello.tar.gz
         log "  [${cloud}] failed"
     done
     return 1
@@ -188,7 +193,7 @@ fetch_once() {
 # ============================================================
 work() {
     STEP_N=0
-    say "===== mini-cloud + mihomo 启动 ====="
+    say "===== mini-cloud + mihello 启动 ====="
 
     # [1/8] 检查本地文件（放在网络等待之前：缺文件不用白等 10 分钟）
     step 8 "检查本地文件"
@@ -253,8 +258,8 @@ work() {
         say "===== 启动失败（第 5 步）====="; return 1
     fi
 
-    # [6/8] 下载 mihomo（双云盘互备，有限重试）
-    step 8 "下载 mihomo"
+    # [6/8] 下载 mihello（双云盘互备，有限重试）
+    step 8 "下载 mihello"
     _ok=0; _t=1
     while [ "$_t" -le "$FETCH_TRIES" ]; do
         stop_requested && { ok "收到停止请求，中止"; say "===== 已中止 ====="; return 0; }
@@ -265,42 +270,42 @@ work() {
         log "第 $_t/$FETCH_TRIES 轮失败，10 秒后重试"
         sleep 10; _t=$((_t+1))
     done
-    if [ "$_ok" = "1" ]; then ok "$(wc -c < /tmp/mihomo.tar.gz) 字节"
+    if [ "$_ok" = "1" ]; then ok "$(wc -c < /tmp/mihello.tar.gz) 字节"
     else
-        fail "两个云盘都取不到包：请检查加密单元内 $CLOUD_SUBDIR/$MIHOMO_TGZ 是否存在且完整"; say "===== 启动失败（第 6 步）====="; return 1
+        fail "两个云盘都取不到包：请检查加密单元内 $CLOUD_SUBDIR/$MIHELLO_TGZ 是否存在且完整"; say "===== 启动失败（第 6 步）====="; return 1
     fi
 
-    # [7/8] 解压并启动 mihomo
-    step 8 "解压并启动 mihomo"
+    # [7/8] 解压并启动 mihello
+    step 8 "解压并启动 mihello"
     stop_requested && { ok "收到停止请求，中止"; say "===== 已中止 ====="; return 0; }
-    rm -rf "$MIHOMO_DIR"
+    rm -rf "$MIHELLO_DIR"
     cd /tmp || { fail "cd /tmp 失败"; say "===== 启动失败（第 7 步）====="; return 1; }
-    if ! tar -zxvf mihomo.tar.gz >> "$LOG" 2>&1; then
-        rm -rf "$MIHOMO_DIR"; rm -f mihomo.tar.gz
+    if ! tar -zxvf mihello.tar.gz >> "$LOG" 2>&1; then
+        rm -rf "$MIHELLO_DIR"; rm -f mihello.tar.gz
         fail "解压失败（包损坏或磁盘满）：请重新上传完整包后重试"; say "===== 启动失败（第 7 步）====="; return 1
     fi
-    rm -f mihomo.tar.gz
-    if [ ! -s "$MIHOMO_BIN" ]; then
-        rm -rf "$MIHOMO_DIR"
-        fail "解压后 $MIHOMO_BIN 不存在"; say "===== 启动失败（第 7 步）====="; return 1
+    rm -f mihello.tar.gz
+    if [ ! -s "$MIHELLO_BIN" ]; then
+        rm -rf "$MIHELLO_DIR"
+        fail "解压后 $MIHELLO_BIN 不存在"; say "===== 启动失败（第 7 步）====="; return 1
     fi
-    "$MIHOMO_BIN" -d "$DATA_DIR" >> /dev/null 2>&1 &
+    "$MIHELLO_BIN" -d "$DATA_DIR" >> /dev/null 2>&1 &
     _mp=$!
     _i=1; _ok=0
     while [ "$_i" -le 15 ]; do
         kill -0 "$_mp" 2>/dev/null || break
-        if wget -q -T 2 -O /tmp/mihomo_check \
-             --header="Authorization: Bearer ${MIHOMO_TOKEN}" "$MIHOMO_API" 2>/dev/null; then
-            rm -f /tmp/mihomo_check; _ok=1; break
+        if wget -q -T 2 -O /tmp/mihello_check \
+             --header="Authorization: Bearer ${MIHELLO_TOKEN}" "$MIHELLO_API" 2>/dev/null; then
+            rm -f /tmp/mihello_check; _ok=1; break
         fi
         sleep 1; _i=$((_i+1))
     done
-    if [ "$_ok" = "1" ]; then ok "mihomo API 已响应（PID $_mp）"
+    if [ "$_ok" = "1" ]; then ok "mihello API 已响应（PID $_mp）"
     else
-        rm -f /tmp/mihomo_check
+        rm -f /tmp/mihello_check
         kill "$_mp" 2>/dev/null; sleep 1
         kill -0 "$_mp" 2>/dev/null && kill -9 "$_mp" 2>/dev/null
-        fail "mihomo 未就绪（进程已退出或 API 无响应）：请检查 mihomo 配置与日志"; say "===== 启动失败（第 7 步）====="; return 1
+        fail "mihello 未就绪（进程已退出或 API 无响应）：请检查 mihello 配置与日志"; say "===== 启动失败（第 7 步）====="; return 1
     fi
 
     # [8/8] 配置网络转发（两项结果分别如实报告）
@@ -311,10 +316,10 @@ work() {
         _fwd=1
     fi
     while iptables -t nat -D PREROUTING -s "$CLIENT_IP" -p tcp \
-             -j REDIRECT --to-port "$MIHOMO_PORT" 2>/dev/null; do :; done
+             -j REDIRECT --to-port "$MIHELLO_PORT" 2>/dev/null; do :; done
     _ipt=0
     if iptables -t nat -A PREROUTING -s "$CLIENT_IP" -p tcp \
-             -j REDIRECT --to-port "$MIHOMO_PORT" 2>>"$LOG"; then
+             -j REDIRECT --to-port "$MIHELLO_PORT" 2>>"$LOG"; then
         _ipt=1
     fi
     if [ "$_fwd" = "1" ] && [ "$_ipt" = "1" ]; then
@@ -361,7 +366,7 @@ stop() {
     acquire_lock || { say "另一个 start/stop 正在进行，本次 stop 失败"; return 1; }
     touch "$STOP_FLAG"
 
-    say "===== mini-cloud + mihomo 停止 ====="
+    say "===== mini-cloud + mihello 停止 ====="
     _rc=0
 
     # [1/5] 停止启动 worker
@@ -391,28 +396,28 @@ stop() {
 
     # [3/5] 停止取包进程（识别特征：wget + 输出文件；请不动就报错，不强杀）
     step 5 "停止取包进程"
-    _fp="wget.*mihomo\\.tar\\.gz"
+    _fp="wget.*mihello\\.tar\\.gz"
     _p=$(pgrep -f "$_fp"); [ -n "$_p" ] && kill $_p 2>/dev/null
     if wait_gone "$_fp" "$WGET_TIMEOUT"; then
-        rm -f /tmp/mihomo.tar.gz
+        rm -f /tmp/mihello.tar.gz
         ok "无取包进程（残留文件已清理）"
     else
         fail "取包 wget 可能仍在运行（最多 ${WGET_TIMEOUT} 秒自行结束），请稍候再 start"; _rc=1
     fi
 
-    # [4/5] 停止 mihomo
-    step 5 "停止 mihomo"
-    _p=$(pgrep -f mihomo-linux-arm64); [ -n "$_p" ] && kill $_p 2>/dev/null
-    if wait_gone mihomo-linux-arm64 "$STOP_WAIT"; then
-        ok "mihomo 已退出"
+    # [4/5] 停止 mihello
+    step 5 "停止 mihello"
+    _p=$(pgrep -f mihello-linux-arm64); [ -n "$_p" ] && kill $_p 2>/dev/null
+    if wait_gone mihello-linux-arm64 "$STOP_WAIT"; then
+        ok "mihello 已退出"
     else
-        fail "mihomo 未确认退出：请 ps 确认后手工处理"; _rc=1
+        fail "mihello 未确认退出：请 ps 确认后手工处理"; _rc=1
     fi
 
     # [5/5] 清理 iptables 规则 + 状态（只有全部确认退出才清状态，否则保留旗标防 worker 拉服务）
     step 5 "清理 iptables 规则"
     while iptables -t nat -D PREROUTING -s "$CLIENT_IP" -p tcp \
-             -j REDIRECT --to-port "$MIHOMO_PORT" 2>/dev/null; do :; done
+             -j REDIRECT --to-port "$MIHELLO_PORT" 2>/dev/null; do :; done
     if [ "$_rc" = "0" ]; then
         rm -f "$WORK_PID" "$STOP_FLAG"
         ok "规则已清理"; say "===== 停止完成 ====="
