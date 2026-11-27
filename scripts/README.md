@@ -53,6 +53,23 @@
 - **下载 / 解压 / mihomo 启动失败**：查看开机日志与 `/tmp` 临时文件，确认云盘内包完整可读后再重启。
 - **不要**在脚本运行期间手工删除锁目录、停止旗标或 PID 记录文件。
 
+### 状态文件清单与清理时机（/tmp，重启自动清空）
+
+| 用途 | 范本 A | 范本 B |
+|---|---|---|
+| 操作日志 | `/tmp/mini-cloud-boot.log` | `/tmp/mini-cloud-mihomo.log` |
+| worker 记录（运行号 PID 身份标记） | `/tmp/mini-cloud-work.pid` | `/tmp/mini-cloud-mihomo-work.pid` |
+| 启动锁目录 | `/tmp/mini-cloud.lock` | `/tmp/mini-cloud-mihomo.lock` |
+| 停止旗标 | `/tmp/mini-cloud.stop` | `/tmp/mini-cloud-mihomo.stop` |
+| 取包临时文件（B 专用） | — | `/tmp/mihomo.tar.gz`、`/tmp/mihomo_check`、目录 `/tmp/mihomo/` |
+
+清理时机（按顺序）：
+
+1. **先确认进程**：`ps | grep -E "mini-cloud|mihomo"` 确认没有相关进程；
+2. **再删 worker 记录与停止旗标**（范本 B 为 `/tmp/mini-cloud-mihomo-work.pid` 与 `/tmp/mini-cloud-mihomo.stop`）——**进程还活着时不要删停止旗标**：它是「让 worker 别再拉起服务」的唯一信号，删了等于撤销停止请求；
+3. **锁目录**只在确定没有 start/stop 正在进行时删；日志提示「启动锁残留（持锁进程已退出）」即表示可以删；
+4. 日志与取包临时文件可随时清理（/tmp 为内存盘，重启自动清空）。
+
 ## 4. 设计限制
 
 - 网络、就绪、下载、进程退出等所有等待都有上限；脚本不提供无限重试或自动故障恢复。
