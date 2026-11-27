@@ -118,13 +118,13 @@ wait_gone() {
 
 stop_requested() { [ -f "$STOP_FLAG" ]; }
 
-# 启动前自检（配置类问题：缺文件直接报，不白等网络）
+# 启动前自检（配置类问题：缺文件直接报，不白等网络；错误上屏——人工调试先看到它）
 preflight() {
-    [ -d "$MC_DIR" ] || { log "配置问题：目录不存在 $MC_DIR"; return 1; }
-    [ -x "$MC_BIN" ] || { log "配置问题：二进制不存在或不可执行 $MC_BIN"; return 1; }
-    [ -f "$MC_CFG" ] || { log "配置问题：配置文件不存在 $MC_CFG"; return 1; }
+    [ -d "$MC_DIR" ] || { say "  配置问题：目录不存在 $MC_DIR"; return 1; }
+    [ -x "$MC_BIN" ] || { say "  配置问题：二进制不存在或不可执行 $MC_BIN"; return 1; }
+    [ -f "$MC_CFG" ] || { say "  配置问题：配置文件不存在 $MC_CFG"; return 1; }
     mkdir -p "$(dirname "$MC_LOG")" 2>/dev/null
-    ( : >> "$MC_LOG" ) 2>/dev/null || { log "配置问题：日志不可写 $MC_LOG"; return 1; }
+    ( : >> "$MC_LOG" ) 2>/dev/null || { say "  配置问题：日志不可写 $MC_LOG"; return 1; }
     return 0
 }
 
@@ -154,8 +154,15 @@ work() {
     STEP_N=0; FAILED=""
     say "===== mini-cloud 启动 ====="
 
-    # [1/4] 检测网络
-    step 4 "检测网络"
+    # [1/5] 检查本地文件（放在网络等待之前：缺文件不用白等 10 分钟）
+    step 5 "检查本地文件"
+    if ! preflight; then
+        fail "配置问题：见上方原因，修复后重试"; say "===== 启动失败（第 1 步）====="; return 1
+    fi
+    ok "文件与目录就绪"
+
+    # [2/5] 检测网络
+    step 5 "检测网络"
     _i=1; _net=1
     while [ "$_i" -le "$NET_WAIT_MAX" ]; do
         stop_requested && { ok "收到停止请求，中止"; FAILED="stopped"; say "===== 已中止 ====="; return 0; }
@@ -164,11 +171,11 @@ work() {
     done
     if [ "$_net" = "0" ]; then ok "第 $_i 次尝试"
     else
-        fail "环境问题：$((NET_WAIT_MAX*5)) 秒内未连上 $NET_PROBE，请检查宽带/网线后重试"; FAILED="1"; say "===== 启动失败（第 1 步）====="; return 1
+        fail "环境问题：$((NET_WAIT_MAX*5)) 秒内未连上 $NET_PROBE，请检查宽带/网线后重试"; say "===== 启动失败（第 2 步）====="; return 1
     fi
 
-    # [2/4] 检查系统时间（只报告，不负责同步）
-    step 4 "检查系统时间"
+    # [3/5] 检查系统时间（只报告，不负责同步）
+    step 5 "检查系统时间"
     _i=1; _okt=0
     while [ "$_i" -le 30 ]; do
         _now=$(date +%s 2>/dev/null)
@@ -177,15 +184,12 @@ work() {
     done
     if [ "$_okt" = "1" ]; then ok "$(date)"
     else
-        fail "系统时间不可用（可能影响 TLS）：路由器 NTP 同步后重启服务即可"; FAILED="2"; say "===== 启动失败（第 2 步）====="; return 1
+        fail "系统时间不可用（可能影响 TLS）：路由器 NTP 同步后重启服务即可"; say "===== 启动失败（第 3 步）====="; return 1
     fi
 
-    # [3/4] 启动 mini-cloud
-    step 4 "启动 mini-cloud"
-    if ! preflight; then
-        fail "配置问题：见上方日志行，修复后重试"; FAILED="3"; say "===== 启动失败（第 3 步）====="; return 1
-    fi
-    stop_requested && { ok "收到停止请求，中止"; FAILED="stopped"; say "===== 已中止 ====="; return 0; }
+    # [4/5] 启动 mini-cloud
+    step 5 "启动 mini-cloud"
+    stop_requested && { ok "收到停止请求，中止"; say "===== 已中止 ====="; return 0; }
     if mc_running; then
         ok "已在运行"
     else
@@ -195,11 +199,11 @@ work() {
         ok "已启动（PID $!）"
     fi
 
-    # [4/4] 等待 HTTP 就绪
-    step 4 "等待 mini-cloud 就绪"
+    # [5/5] 等待 HTTP 就绪
+    step 5 "等待 mini-cloud 就绪"
     load_auth
     if [ -z "$MC_USER" ] || [ -z "$MC_PASS" ]; then
-        fail "配置问题：读不到 server.username/password"; FAILED="4"; say "===== 启动失败（第 4 步）====="; return 1
+        fail "配置问题：读不到 server.username/password"; say "===== 启动失败（第 5 步）====="; return 1
     fi
     _i=1; _rdy=0
     while [ "$_i" -le 30 ]; do
@@ -210,7 +214,7 @@ work() {
     if [ "$_rdy" = "1" ]; then ok "HTTP 已响应（第 $_i 次尝试）"
     else
         fail "HTTP 未响应：请检查 $MC_LOG"; tail -n 5 "$MC_LOG" 2>/dev/null | sed 's/^/  mc: /' >> "$LOG"
-        FAILED="4"; say "===== 启动失败（第 4 步）====="; return 1
+        say "===== 启动失败（第 5 步）====="; return 1
     fi
 
     say "===== 启动完成 ====="
@@ -220,8 +224,12 @@ work() {
 # ============================================================
 # rc.common 入口
 # ============================================================
+# OpenWrt 18.06 的 rc.common 默认 boot() 不把参数传给 start()（boot() { start "$@" }），
+# 必须显式定义 boot() 转发，否则开机也会走人工前台模式（审核 P0，2026-11-27）
+boot() { start boot; }
+
 start() {
-    if [ "$1" = "boot" ]; then
+    if [ "${1:-}" = "boot" ]; then   # ${1:-}：手工调用时无参数，set -u 下也不会中止
         # 开机：后台执行，只写日志（boot 阶段主脚本会被 TERM，重活必须放子进程）
         MC_MODE=boot
         acquire_lock || return 1
@@ -276,13 +284,13 @@ stop() {
         fail "mini-cloud 未确认退出：请 ps 确认后手工处理"; _rc=1
     fi
 
-    # [3/3] 清理状态
+    # [3/3] 清理状态（只有全部确认退出才清理，否则保留停止旗标防 worker 继续拉服务）
     step 3 "清理状态"
-    rm -f "$WORK_PID" "$STOP_FLAG"
     if [ "$_rc" = "0" ]; then
+        rm -f "$WORK_PID" "$STOP_FLAG"
         ok "已清理"; say "===== 停止完成 ====="
     else
-        ok "已清理（但上一步有未确认退出）"; say "===== 停止失败 ====="
+        fail "存在未确认退出的进程，保留停止旗标与 PID 记录，请人工检查后重试"; say "===== 停止失败 ====="
     fi
 
     release_lock

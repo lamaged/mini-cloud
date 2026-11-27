@@ -139,11 +139,11 @@ wait_gone() {
 stop_requested() { [ -f "$STOP_FLAG" ]; }
 
 preflight() {
-    [ -d "$MC_DIR" ] || { log "配置问题：目录不存在 $MC_DIR"; return 1; }
-    [ -x "$MC_BIN" ] || { log "配置问题：二进制不存在或不可执行 $MC_BIN"; return 1; }
-    [ -f "$MC_CFG" ] || { log "配置问题：配置文件不存在 $MC_CFG"; return 1; }
+    [ -d "$MC_DIR" ] || { say "  配置问题：目录不存在 $MC_DIR"; return 1; }
+    [ -x "$MC_BIN" ] || { say "  配置问题：二进制不存在或不可执行 $MC_BIN"; return 1; }
+    [ -f "$MC_CFG" ] || { say "  配置问题：配置文件不存在 $MC_CFG"; return 1; }
     mkdir -p "$(dirname "$MC_LOG")" 2>/dev/null
-    ( : >> "$MC_LOG" ) 2>/dev/null || { log "配置问题：日志不可写 $MC_LOG"; return 1; }
+    ( : >> "$MC_LOG" ) 2>/dev/null || { say "  配置问题：日志不可写 $MC_LOG"; return 1; }
     return 0
 }
 
@@ -190,8 +190,15 @@ work() {
     STEP_N=0
     say "===== mini-cloud + mihomo 启动 ====="
 
-    # [1/7] 检测网络
-    step 7 "检测网络"
+    # [1/8] 检查本地文件（放在网络等待之前：缺文件不用白等 10 分钟）
+    step 8 "检查本地文件"
+    if ! preflight; then
+        fail "配置问题：见上方原因，修复后重试"; say "===== 启动失败（第 1 步）====="; return 1
+    fi
+    ok "文件与目录就绪"
+
+    # [2/8] 检测网络
+    step 8 "检测网络"
     _i=1; _net=1
     while [ "$_i" -le "$NET_WAIT_MAX" ]; do
         stop_requested && { ok "收到停止请求，中止"; say "===== 已中止 ====="; return 0; }
@@ -200,11 +207,11 @@ work() {
     done
     if [ "$_net" = "0" ]; then ok "第 $_i 次尝试"
     else
-        fail "环境问题：$((NET_WAIT_MAX*5)) 秒内未连上 $NET_PROBE，请检查宽带/网线后重试"; say "===== 启动失败（第 1 步）====="; return 1
+        fail "环境问题：$((NET_WAIT_MAX*5)) 秒内未连上 $NET_PROBE，请检查宽带/网线后重试"; say "===== 启动失败（第 2 步）====="; return 1
     fi
 
-    # [2/7] 检查系统时间（只报告，不负责同步）
-    step 7 "检查系统时间"
+    # [3/8] 检查系统时间（只报告，不负责同步）
+    step 8 "检查系统时间"
     _i=1; _okt=0
     while [ "$_i" -le 30 ]; do
         _now=$(date +%s 2>/dev/null)
@@ -213,14 +220,11 @@ work() {
     done
     if [ "$_okt" = "1" ]; then ok "$(date)"
     else
-        fail "系统时间不可用（可能影响 TLS）：路由器 NTP 同步后重启服务即可"; say "===== 启动失败（第 2 步）====="; return 1
+        fail "系统时间不可用（可能影响 TLS）：路由器 NTP 同步后重启服务即可"; say "===== 启动失败（第 3 步）====="; return 1
     fi
 
-    # [3/7] 启动 mini-cloud
-    step 7 "启动 mini-cloud"
-    if ! preflight; then
-        fail "配置问题：见上方日志行，修复后重试"; say "===== 启动失败（第 3 步）====="; return 1
-    fi
+    # [4/8] 启动 mini-cloud
+    step 8 "启动 mini-cloud"
     stop_requested && { ok "收到停止请求，中止"; say "===== 已中止 ====="; return 0; }
     if mc_running; then
         ok "已在运行"
@@ -231,11 +235,11 @@ work() {
         ok "已启动（PID $!）"
     fi
 
-    # [4/7] 等待 mini-cloud 就绪
-    step 7 "等待 mini-cloud 就绪"
+    # [5/8] 等待 mini-cloud 就绪
+    step 8 "等待 mini-cloud 就绪"
     load_auth
     if [ -z "$MC_USER" ] || [ -z "$MC_PASS" ]; then
-        fail "配置问题：读不到 server.username/password"; say "===== 启动失败（第 4 步）====="; return 1
+        fail "配置问题：读不到 server.username/password"; say "===== 启动失败（第 5 步）====="; return 1
     fi
     _i=1; _rdy=0
     while [ "$_i" -le 30 ]; do
@@ -246,10 +250,10 @@ work() {
     if [ "$_rdy" = "1" ]; then ok "HTTP 已响应（第 $_i 次尝试）"
     else
         fail "HTTP 未响应：请检查 $MC_LOG"; tail -n 5 "$MC_LOG" 2>/dev/null | sed 's/^/  mc: /' >> "$LOG"
-        say "===== 启动失败（第 4 步）====="; return 1
+        say "===== 启动失败（第 5 步）====="; return 1
     fi
 
-    # [5/7] 下载 mihomo（双云盘互备，有限重试）
+    # [6/8] 下载 mihomo（双云盘互备，有限重试）
     step 7 "下载 mihomo"
     _ok=0; _t=1
     while [ "$_t" -le "$FETCH_TRIES" ]; do
@@ -263,22 +267,22 @@ work() {
     done
     if [ "$_ok" = "1" ]; then ok "$(wc -c < /tmp/mihomo.tar.gz) 字节"
     else
-        fail "两个云盘都取不到包：请检查加密单元内 $CLOUD_SUBDIR/$MIHOMO_TGZ 是否存在且完整"; say "===== 启动失败（第 5 步）====="; return 1
+        fail "两个云盘都取不到包：请检查加密单元内 $CLOUD_SUBDIR/$MIHOMO_TGZ 是否存在且完整"; say "===== 启动失败（第 6 步）====="; return 1
     fi
 
-    # [6/7] 解压并启动 mihomo
-    step 7 "解压并启动 mihomo"
+    # [7/8] 解压并启动 mihomo
+    step 8 "解压并启动 mihomo"
     stop_requested && { ok "收到停止请求，中止"; say "===== 已中止 ====="; return 0; }
     rm -rf "$MIHOMO_DIR"
-    cd /tmp || { fail "cd /tmp 失败"; say "===== 启动失败（第 6 步）====="; return 1; }
+    cd /tmp || { fail "cd /tmp 失败"; say "===== 启动失败（第 7 步）====="; return 1; }
     if ! tar -zxvf mihomo.tar.gz >> "$LOG" 2>&1; then
         rm -rf "$MIHOMO_DIR"; rm -f mihomo.tar.gz
-        fail "解压失败（包损坏或磁盘满）：请重新上传完整包后重试"; say "===== 启动失败（第 6 步）====="; return 1
+        fail "解压失败（包损坏或磁盘满）：请重新上传完整包后重试"; say "===== 启动失败（第 7 步）====="; return 1
     fi
     rm -f mihomo.tar.gz
     if [ ! -s "$MIHOMO_BIN" ]; then
         rm -rf "$MIHOMO_DIR"
-        fail "解压后 $MIHOMO_BIN 不存在"; say "===== 启动失败（第 6 步）====="; return 1
+        fail "解压后 $MIHOMO_BIN 不存在"; say "===== 启动失败（第 7 步）====="; return 1
     fi
     "$MIHOMO_BIN" -d "$DATA_DIR" >> /dev/null 2>&1 &
     _mp=$!
@@ -296,24 +300,28 @@ work() {
         rm -f /tmp/mihomo_check
         kill "$_mp" 2>/dev/null; sleep 1
         kill -0 "$_mp" 2>/dev/null && kill -9 "$_mp" 2>/dev/null
-        fail "mihomo 未就绪（进程已退出或 API 无响应）：请检查 mihomo 配置与日志"; say "===== 启动失败（第 6 步）====="; return 1
+        fail "mihomo 未就绪（进程已退出或 API 无响应）：请检查 mihomo 配置与日志"; say "===== 启动失败（第 7 步）====="; return 1
     fi
 
-    # [7/7] 配置网络转发
-    step 7 "配置网络转发"
+    # [8/8] 配置网络转发（两项结果分别如实报告）
+    step 8 "配置网络转发"
     stop_requested && { ok "收到停止请求，中止"; say "===== 已中止 ====="; return 0; }
+    _fwd=0
     if echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null; then
-        log "ip_forward enabled"
-    else
-        log "警告：无法开启 ip_forward（继续尝试加规则）"
+        _fwd=1
     fi
     while iptables -t nat -D PREROUTING -s "$CLIENT_IP" -p tcp \
              -j REDIRECT --to-port "$MIHOMO_PORT" 2>/dev/null; do :; done
+    _ipt=0
     if iptables -t nat -A PREROUTING -s "$CLIENT_IP" -p tcp \
              -j REDIRECT --to-port "$MIHOMO_PORT" 2>>"$LOG"; then
-        ok "ip_forward 与 iptables 规则已就绪"
+        _ipt=1
+    fi
+    if [ "$_fwd" = "1" ] && [ "$_ipt" = "1" ]; then
+        ok "ip_forward 与 iptables 规则均已就绪"
     else
-        fail "iptables 规则添加失败（见上方日志）"; say "===== 启动失败（第 7 步）====="; return 1
+        fail "转发配置未完全成功（ip_forward=$_fwd iptables=$_ipt）：代理不可用，请检查系统转发设置后重试"
+        say "===== 启动失败（第 8 步）====="; return 1
     fi
 
     say "===== 启动完成 ====="
@@ -323,8 +331,12 @@ work() {
 # ============================================================
 # rc.common 入口
 # ============================================================
+# OpenWrt 18.06 的 rc.common 默认 boot() 不把参数传给 start()（boot() { start "$@" }），
+# 必须显式定义 boot() 转发，否则开机也会走人工前台模式（审核 P0，2026-11-27）
+boot() { start boot; }
+
 start() {
-    if [ "$1" = "boot" ]; then
+    if [ "${1:-}" = "boot" ]; then   # ${1:-}：手工调用时无参数，set -u 下也不会中止
         MC_MODE=boot
         acquire_lock || return 1
         rm -f "$STOP_FLAG"
@@ -397,15 +409,16 @@ stop() {
         fail "mihomo 未确认退出：请 ps 确认后手工处理"; _rc=1
     fi
 
-    # [5/5] 清理 iptables 规则 + 状态
+    # [5/5] 清理 iptables 规则 + 状态（只有全部确认退出才清状态，否则保留旗标防 worker 拉服务）
     step 5 "清理 iptables 规则"
     while iptables -t nat -D PREROUTING -s "$CLIENT_IP" -p tcp \
              -j REDIRECT --to-port "$MIHOMO_PORT" 2>/dev/null; do :; done
-    rm -f "$WORK_PID" "$STOP_FLAG"
     if [ "$_rc" = "0" ]; then
+        rm -f "$WORK_PID" "$STOP_FLAG"
         ok "规则已清理"; say "===== 停止完成 ====="
     else
-        ok "规则已清理（但上方有未确认退出）"; say "===== 停止失败 ====="
+        fail "存在未确认退出的进程，保留停止旗标与 PID 记录（iptables 规则已清理），请人工检查后重试"
+        say "===== 停止失败 ====="
     fi
 
     release_lock

@@ -79,11 +79,12 @@ case_service_refuse() {
     alive=no; kill -0 $svc 2>/dev/null && alive=yes
     kill -9 $svc 2>/dev/null
     failed_line=no; grep -q "未确认退出" "$LOG" 2>/dev/null && failed_line=yes
+    flag_kept=no; [ -f "$STOP_FLAG" ] && flag_kept=yes
     rm -rf "$W"
-    if [ "$rc" = "1" ] && [ "$alive" = "yes" ] && [ "$failed_line" = "yes" ]; then
-        pass_case "服务未退出 → 该步失败 + stop 失败（$(basename "$_path")）"
+    if [ "$rc" = "1" ] && [ "$alive" = "yes" ] && [ "$failed_line" = "yes" ] && [ "$flag_kept" = "yes" ]; then
+        pass_case "服务未退出 → 该步失败 + stop 失败 + 保留停止旗标（$(basename "$_path")）"
     else
-        fail_case "rc=$rc 存活=$alive 失败行=$failed_line（$(basename "$_path")）"
+        fail_case "rc=$rc 存活=$alive 失败行=$failed_line 旗标=$flag_kept（$(basename "$_path")）"
     fi
 }
 
@@ -152,8 +153,30 @@ for s in "$A" "$B"; do
     ( case_service_refuse "$s" )
     ( case_concurrent_stop "$s" )
 done
+# 6) P0 回归（RV-2026-11-27-01）：boot() 显式转发 start boot → 后台模式；
+#    手工 start（无参）→ 前台 cli 模式
+case_mode_dispatch() {
+    _path=$1
+    . "$_path" || { fail_case "source $_path"; return; }
+    common_env
+    work() { echo "MODE=$MC_MODE"; }   # 覆盖真实流程，只测模式分发
+    boot
+    sleep 0.5
+    boot_hit=$(grep -c "MODE=boot" "$LOG" 2>/dev/null)
+    cli_mode=$( start )
+    rm -rf "$W"
+    if [ "$boot_hit" -ge 1 ] && [ "$cli_mode" = "MODE=cli" ]; then
+        pass_case "boot→后台(boot) / start→前台(cli)（$(basename "$_path")）"
+    else
+        fail_case "模式分发 boot 命中=$boot_hit cli=[$cli_mode]（$(basename "$_path")）"
+    fi
+}
+
 ( case_wget_term "$B" )
 ( case_wget_stubborn "$B" )
+for s in "$A" "$B"; do
+    ( case_mode_dispatch "$s" )
+done
 
 echo
 if [ -s "$FAILFILE" ]; then
@@ -164,3 +187,4 @@ fi
 rm -f "$FAILFILE"
 echo "结果：全部通过"
 exit 0
+
