@@ -17,7 +17,7 @@
 
 | 日期 | 事项 |
 |---|---|
-| 2026-11-27 | **示例应用改名 mihomo→mihello（PM 拍板）**：范本 B 与全部文档中的 `mihomo` 统一改为 `mihello`（文件名 scripts/initd-mini-cloud-mihello.sh、变量 MIHOELLO_*、路径 /tmp/mihello 与 /data/mihello、包名 mihello.tar.gz、进程名 mihello-linux-arm64、健康检查与文档表述）；并在范本 B 头部与 scripts/README/README 补充「示例应用」说明——mihello 只是演示「开机从云盘加密目录取一个程序并启动」，实际加载什么应用由用户自己决定（包名/二进制名/启动参数/健康检查/token 均可替换）；本地回归 14 用例全过；**说明：PROGRESS 中此前的历史记录行保留当时的实际用名 mihomo（真机事实不重写）** |
+| 2026-11-27 | **示例应用改名 mihomo→mihello（PM 拍板）**：范本 B 与全部文档中的 `mihomo` 统一改为 `mihello`（文件名 scripts/initd-mini-cloud-mihello.sh、变量 MIHELLO_*、路径 /tmp/mihello 与 /data/mihello、包名 mihello.tar.gz、进程名 mihello-linux-arm64、健康检查与文档表述）；并在范本 B 头部与 scripts/README/README 补充「示例应用」说明——mihello 只是演示「开机从云盘加密目录取一个程序并启动」，实际加载什么应用由用户自己决定（包名/二进制名/启动参数/健康检查/token 均可替换）；本地回归 14 用例全过；**说明：PROGRESS 中此前的历史记录行保留当时的实际用名 mihomo（真机事实不重写）** |
 | 2026-11-27 | **README 启动指引同步（PM 指出旧小抄过时）**：快速开始第 5 步的「重启后自动运行」由内联旧版 init 脚本（RUN_FLAG/PID_FILE 版）改为指向正式模板（A/B 二选一、占位符填写、装/启用两道命令、手工 start 屏幕逐步状态 + 开机日志验证）；FAQ 同步——崩溃重启改「/etc/init.d/<服务名> restart」、清日志补自启脚本日志路径；变更记录 v1.3.0-beta 补「开机自启脚本模板」条目 |
 | 2026-11-27 | **scripts/README 补状态文件清单（PM 拍板，审核建议闭环）**：§3 新增「状态文件清单与清理时机」——A/B 状态文件对照表（日志 / worker 记录 / 锁目录 / 停止旗标 / B 取包临时文件）+ 四步清理顺序（先确认进程 → 再删 worker 记录与停止旗标（进程活着时勿删旗标）→ 锁目录确认无 start/stop 后删 → 日志与临时文件随时可清）；操作约定文档完整 |
 | 2026-11-27 | **双云盘互备真机故障演练通过 + 收尾拍板**：PM 故意删除其中一个云盘上的 mihomo 包——启动时第一个来源返回 HTTP 500，脚本自动切换备用来源取包成功（16,018,575 B），后续步骤全绿；**双云盘互备自愈路径获真机故障验证**；同轮 stop→check→start→check 再次确认 iptables 无残留（stop 空 / start 有）；PM 拍板：wget 错误信息入日志、iptables -C 反查防护两项小改**均不做**（现状已实测干净、保持精简）；启动脚本改造全部收口 |
